@@ -1,0 +1,20 @@
+research/
+target/
+bin/
+obj/
+*.log
+
+dist/
+packaging/*.pfx
+
+__pycache__/
+ui/bin/
+ui/obj/
+ui/AppPackages/
+ui/_screenshots/
+
+# Legal drafts (keep out of the repo; move to durable storage)
+docs/legal/
+
+# Agent worktrees
+.claude/worktrees/

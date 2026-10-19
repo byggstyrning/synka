@@ -1,0 +1,353 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="Synka.Views.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tk="using:CommunityToolkit.WinUI.Controls"
+    xmlns:loc="using:Synka.Views">
+
+    <ScrollViewer Padding="28,20"
+                  HorizontalScrollMode="Disabled"
+                  HorizontalScrollBarVisibility="Disabled"
+                  VerticalScrollBarVisibility="Auto">
+        <Grid>
+        <StackPanel Spacing="14" MaxWidth="900">
+            <TextBlock Text="{loc:T Sv='Inställningar', En='Settings'}"
+                       Style="{StaticResource TitleTextBlockStyle}" />
+
+            <!-- The account the engine syncs. Signing out stops the sync for it. -->
+            <tk:SettingsCard Header="{loc:T Sv='Konto', En='Account'}"
+                             Description="{loc:T Sv='Kontot som synkar ACC Docs-filerna. Logga ut stoppar synken.', En='The account that syncs the ACC Docs files. Signing out stops the sync.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE77B;" />
+                </tk:SettingsCard.HeaderIcon>
+                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <TextBlock x:Name="AccountText"
+                               VerticalAlignment="Center"
+                               MaxWidth="320"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <Button x:Name="SignInButton"
+                            Content="{loc:T Sv='Logga in', En='Sign in'}"
+                            Click="OnSignIn" />
+                    <Button x:Name="SignOutButton"
+                            Content="{loc:T Sv='Logga ut', En='Sign out'}"
+                            Click="OnSignOut" />
+                </StackPanel>
+            </tk:SettingsCard>
+
+
+            <!-- Optional public APS app override. Older engines omit the capability flag. -->
+            <tk:SettingsExpander x:Name="ApsClientIdExpander"
+                                 Visibility="Collapsed"
+                                 Header="{loc:T Sv='Autodesk APS-app', En='Autodesk APS app'}"
+                                 Description="{loc:T Sv='Avancerat och valfritt: använd en egen offentlig APS-app i stället för Synkas standardapp.', En='Advanced and optional: use your own public APS app instead of the Synka default.'}">
+                <tk:SettingsExpander.HeaderIcon>
+                    <FontIcon Glyph="&#xE943;" />
+                </tk:SettingsExpander.HeaderIcon>
+                <tk:SettingsExpander.Items>
+                    <tk:SettingsCard Header="{loc:T Sv='Egen APS-app', En='Your APS app'}"
+                                     Description="{loc:T Sv='Välj apptypen Desktop, Mobile, Single-Page App i Autodesk APS. Synka använder Authorization Code + PKCE.', En='Choose the Desktop, Mobile, Single-Page App type in Autodesk APS. Synka uses Authorization Code + PKCE.'}">
+                        <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
+                            <TextBlock Text="{loc:T Sv='Traditional Web App stöds inte: den kräver en client secret. Testa och spara öppnar webbläsaren och verifierar PKCE-inloggningen innan inställningen sparas.', En='Traditional Web App is not supported: it requires a client secret. Test and save opens your browser and verifies PKCE sign-in before saving the setting.'}"
+                                       TextWrapping="Wrap" />
+                            <TextBox x:Name="ApsClientIdBox"
+                                     Header="Client ID"
+                                     PlaceholderText="{loc:T Sv='Tomt använder Synkas standardapp', En='Leave blank to use the Synka default'}"
+                                     MaxLength="256"
+                                     AcceptsReturn="False"
+                                     IsSpellCheckEnabled="False"
+                                     IsTextPredictionEnabled="False"
+                                     AutomationProperties.Name="{loc:T Sv='Offentligt Autodesk APS Client ID', En='Public Autodesk APS Client ID'}"
+                                     AutomationProperties.HelpText="{loc:T Sv='Logga ut innan du ändrar appen. Ett tomt värde återställer Synkas standardapp.', En='Sign out before changing the app. A blank value restores the Synka default.'}"
+                                     TextChanged="OnApsClientIdChanged" />
+                            <TextBlock Text="{loc:T Sv='Registrera exakt denna callback-URL i APS-appen:', En='Register this exact callback URL in the APS app:'}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="http://localhost:47863/"
+                                       IsTextSelectionEnabled="True"
+                                       AutomationProperties.Name="{loc:T Sv='APS callback-URL: http://localhost:47863/', En='APS callback URL: http://localhost:47863/'}" />
+                            <TextBlock Text="{loc:T Sv='Testet kontrollerar APS-inloggningen. ACC-kontots administratör kan även behöva lägga till appen som en Custom Integration. Motorn startas om om appen ändras; logga sedan in i Synka för att synka.', En='The test checks APS sign-in. The ACC account administrator may also need to add the app as a Custom Integration. The engine restarts if the app changes; then sign in to Synka to sync.'}"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="ApsClientIdStatus"
+                                       TextWrapping="Wrap"
+                                       AutomationProperties.LiveSetting="Polite"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="ApsClientIdSaveButton"
+                                        Content="{loc:T Sv='Testa och spara', En='Test and save'}"
+                                        AutomationProperties.Name="{loc:T Sv='Testa och spara Autodesk APS Client ID', En='Test and save Autodesk APS Client ID'}"
+                                        Click="OnSaveApsClientId" />
+                                <Button x:Name="ApsClientIdDefaultButton"
+                                        Content="{loc:T Sv='Använd Synkas standard', En='Use Synka default'}"
+                                        AutomationProperties.Name="{loc:T Sv='Återställ Synkas standardapp för Autodesk APS', En='Restore the Synka default Autodesk APS app'}"
+                                        Click="OnUseDefaultApsClientId" />
+                                <Button x:Name="ApsClientIdCancelButton"
+                                        Visibility="Collapsed"
+                                        Content="{loc:T Sv='Avbryt test', En='Cancel test'}"
+                                        Click="OnCancelApsClientIdTest" />
+                                <ProgressRing x:Name="ApsClientIdProgress"
+                                              Width="16" Height="16"
+                                              IsActive="False"
+                                              AutomationProperties.Name="{loc:T Sv='Väntar på APS-inställningen', En='Waiting for the APS setting'}" />
+                            </StackPanel>
+                        </StackPanel>
+                    </tk:SettingsCard>
+                </tk:SettingsExpander.Items>
+            </tk:SettingsExpander>
+
+            <!--
+                Moving the folder is a full rebuild:
+                the engine checks the new place, restarts itself and builds every project
+                there. The path stands above the buttons, so three buttons fit beside the header.
+                Återställ standardplats shows only while the folder is somewhere else.
+            -->
+            <tk:SettingsCard Header="{loc:T Sv='Synkmapp', En='Sync folder'}"
+                             Description="{loc:T Sv='Mappen där ACC Docs-filerna synkas. Flyttar du den byggs alla projekt om på den nya platsen.', En='The folder where the ACC Docs files are synced. Moving it rebuilds every project in the new place.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE8B7;" />
+                </tk:SettingsCard.HeaderIcon>
+                <StackPanel Spacing="8" VerticalAlignment="Center">
+                    <TextBlock x:Name="FolderText"
+                               MaxWidth="360"
+                               TextWrapping="Wrap"
+                               IsTextSelectionEnabled="True"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="OpenFolderButton"
+                                Content="{loc:T Sv='Öppna', En='Open'}"
+                                AutomationProperties.Name="{loc:T Sv='Öppna synkmappen', En='Open the sync folder'}"
+                                Click="OnOpenFolder" />
+                        <Button x:Name="MoveFolderButton"
+                                Content="{loc:T Sv='Flytta…', En='Move…'}"
+                                AutomationProperties.Name="{loc:T Sv='Flytta synkmappen', En='Move the sync folder'}"
+                                Click="OnMoveFolder" />
+                        <Button x:Name="DefaultFolderButton"
+                                Visibility="Collapsed"
+                                Content="{loc:T Sv='Återställ standardplats', En='Use the default location'}"
+                                AutomationProperties.Name="{loc:T Sv='Flytta synkmappen till standardplatsen', En='Move the sync folder to the default location'}"
+                                Click="OnDefaultFolder" />
+                    </StackPanel>
+                </StackPanel>
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Starta vid inloggning', En='Start at sign-in'}"
+                             Description="{loc:T Sv='Motorn startar när du loggar in i Windows och synkar i bakgrunden.', En='The engine starts when you sign in to Windows and syncs in the background.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE7E8;" />
+                </tk:SettingsCard.HeaderIcon>
+                <ToggleSwitch x:Name="StartAtLoginSwitch"
+                              Toggled="OnStartAtLoginToggled"
+                              AutomationProperties.Name="{loc:T Sv='Starta vid inloggning', En='Start at sign-in'}" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Radera i ACC när du raderar lokalt', En='Delete in ACC when you delete locally'}"
+                             Description="{loc:T Sv='Av: en fil som raderas här ligger kvar i ACC. På: raderingen följer med till ACC.', En='Off: a file deleted here stays in ACC. On: the deletion is passed on to ACC.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE74D;" />
+                </tk:SettingsCard.HeaderIcon>
+                <ToggleSwitch x:Name="PropagateSwitch"
+                              Toggled="OnPropagateToggled"
+                              AutomationProperties.Name="{loc:T Sv='Radera i ACC', En='Delete in ACC'}" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Samtidiga nedladdningar', En='Simultaneous downloads'}"
+                             Description="{loc:T Sv='Hur många filer som hämtas samtidigt, 1–8. Gäller när motorn har startats om.', En='How many files are downloaded at the same time, 1–8. Takes effect once the engine has restarted.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE896;" />
+                </tk:SettingsCard.HeaderIcon>
+                <NumberBox x:Name="MaxDownloadsBox"
+                           Width="140"
+                           Minimum="1"
+                           Maximum="8"
+                           SmallChange="1"
+                           LargeChange="1"
+                           SpinButtonPlacementMode="Inline"
+                           AutomationProperties.Name="{loc:T Sv='Samtidiga nedladdningar', En='Simultaneous downloads'}"
+                           ValueChanged="OnMaxDownloadsChanged" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Samtidiga uppladdningar', En='Simultaneous uploads'}"
+                             Description="{loc:T Sv='Hur många filer som laddas upp samtidigt, 1–4. Gäller när motorn har startats om.', En='How many files are uploaded at the same time, 1–4. Takes effect once the engine has restarted.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE898;" />
+                </tk:SettingsCard.HeaderIcon>
+                <NumberBox x:Name="MaxUploadsBox"
+                           Width="140"
+                           Minimum="1"
+                           Maximum="4"
+                           SmallChange="1"
+                           LargeChange="1"
+                           SpinButtonPlacementMode="Inline"
+                           AutomationProperties.Name="{loc:T Sv='Samtidiga uppladdningar', En='Simultaneous uploads'}"
+                           ValueChanged="OnMaxUploadsChanged" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Hur ofta ACC kontrolleras', En='How often ACC is checked'}"
+                             Description="{loc:T Sv='Sekunder mellan kontrollerna medan du arbetar, 15–300. Motorn kontrollerar glesare när datorn inte används.', En='Seconds between the checks while you work, 15–300. The engine checks less often when the computer is idle.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE916;" />
+                </tk:SettingsCard.HeaderIcon>
+                <NumberBox x:Name="PollBox"
+                           Width="140"
+                           Minimum="15"
+                           Maximum="300"
+                           SmallChange="15"
+                           LargeChange="60"
+                           SpinButtonPlacementMode="Inline"
+                           AutomationProperties.Name="{loc:T Sv='Sekunder mellan kontrollerna', En='Seconds between the checks'}"
+                           ValueChanged="OnPollChanged" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Frigör utrymme', En='Free up space'}"
+                             Description="{loc:T Sv='Tar bort lokala kopior av synkade filer i alla projekt och avmarkerar Behåll alltid på den här enheten för dem och deras mappar. Osynkade ändringar behålls lokalt. Filerna finns kvar i ACC.', En='Removes local copies of synced files in all projects and clears Always keep on this device for them and their folders. Unsynced changes stay local. The files remain in ACC.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xEDA2;" />
+                </tk:SettingsCard.HeaderIcon>
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Button x:Name="FreeUpButton"
+                            Content="{loc:T Sv='Frigör i alla projekt', En='Free up in all projects'}"
+                            AutomationProperties.Name="{loc:T Sv='Frigör utrymme i alla synkade projekt', En='Free up space in all synced projects'}"
+                            Click="OnFreeUpSpace" />
+                    <ProgressRing x:Name="FreeUpProgress"
+                                  Width="16"
+                                  Height="16"
+                                  IsActive="False"
+                                  Visibility="Collapsed"
+                                  AutomationProperties.Name="{loc:T Sv='Frigör utrymme', En='Freeing up space'}" />
+                </StackPanel>
+            </tk:SettingsCard>
+
+            <!--
+                The tags are the names in AppLanguage. The description says what the
+                switch costs: the window is rebuilt with the new texts, and the choices on
+                the page go back to their starting state. The engine's work does not.
+            -->
+            <tk:SettingsCard Header="{loc:T Sv='Språk', En='Language'}"
+                             Description="{loc:T Sv='Språket i fönstret. Byter du språk laddas sidan om; det som synkas påverkas inte.', En='The language of the window. Changing it reloads the page; the sync is not affected.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE774;" />
+                </tk:SettingsCard.HeaderIcon>
+                <ComboBox x:Name="LanguageChoice"
+                          MinWidth="170"
+                          SelectionChanged="OnLanguageChanged"
+                          AutomationProperties.Name="{loc:T Sv='Språk', En='Language'}">
+                    <ComboBoxItem Content="Svenska" Tag="Swedish" />
+                    <ComboBoxItem Content="English" Tag="English" />
+                </ComboBox>
+            </tk:SettingsCard>
+
+            <!-- The tags are the names in ElementTheme. The accent colour comes from Windows. -->
+            <tk:SettingsCard Header="{loc:T Sv='Utseende', En='Appearance'}"
+                             Description="{loc:T Sv='Ljust eller mörkt utseende. Följ systemet betyder att appen byter när Windows byter. Accentfärgen kommer alltid från Windows.', En='Light or dark appearance. Follow system means the app switches when Windows does. The accent colour always comes from Windows.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE790;" />
+                </tk:SettingsCard.HeaderIcon>
+                <ComboBox x:Name="ThemeChoice"
+                          MinWidth="170"
+                          SelectionChanged="OnThemeChanged"
+                          AutomationProperties.Name="{loc:T Sv='Utseende', En='Appearance'}">
+                    <ComboBoxItem Content="{loc:T Sv='Ljust', En='Light'}" Tag="Light" />
+                    <ComboBoxItem Content="{loc:T Sv='Mörkt', En='Dark'}" Tag="Dark" />
+                    <ComboBoxItem Content="{loc:T Sv='Följ systemet', En='Follow system'}" Tag="Default" />
+                </ComboBox>
+            </tk:SettingsCard>
+
+            <!-- The one place in the window that asks for an update on request. The engine
+                 does the checking and the installing; an install is always a second click. -->
+            <!-- Collapsed unless the engine has an update channel (update_channel_configured). -->
+            <tk:SettingsCard x:Name="UpdateCard"
+                             Visibility="Collapsed"
+                             Header="{loc:T Sv='Uppdatering', En='Update'}"
+                             Description="{loc:T Sv='Söker efter en ny version i den inställda uppdateringskanalen, via motorn.', En='Looks for a new version in the configured update channel, through the engine.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE777;" />
+                </tk:SettingsCard.HeaderIcon>
+                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <TextBlock x:Name="UpdateStatus"
+                               VerticalAlignment="Center"
+                               MaxWidth="360"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <ProgressRing x:Name="UpdateSpinner" Width="16" Height="16" IsActive="False" />
+                    <Button x:Name="UpdateButton" Click="OnUpdateButton">
+                        <TextBlock x:Name="UpdateButtonLabel"
+                                   Text="{loc:T Sv='Sök efter uppdatering', En='Check for updates'}" />
+                    </Button>
+                </StackPanel>
+            </tk:SettingsCard>
+
+            <!-- Shown instead of the update controls when there is no update channel. -->
+            <tk:SettingsCard x:Name="UpdateInfoCard"
+                             Header="{loc:T Sv='Uppdateringar', En='Updates'}"
+                             Description="{loc:T Sv='Nya versioner av Synka delas via den interna OneDrive-mappen. Packa upp den nya zip-filen och kör Install.cmd; dina inställningar behålls.', En='New versions of Synka are shared through the internal OneDrive folder. Unpack the new zip and run Install.cmd; your settings are kept.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE777;" />
+                </tk:SettingsCard.HeaderIcon>
+            </tk:SettingsCard>
+
+            <!-- Only when the engine sends `auto_update` in its settings: an older engine
+                 has no such setting, and a switch that does nothing must not be shown. -->
+            <tk:SettingsCard x:Name="AutoUpdateCard"
+                             Visibility="Collapsed"
+                             Header="{loc:T Sv='Uppdatera automatiskt', En='Update automatically'}"
+                             Description="{loc:T Sv='Motorn installerar nya versioner själv när ingenting synkas.', En='The engine installs new versions by itself when nothing is syncing.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE895;" />
+                </tk:SettingsCard.HeaderIcon>
+                <ToggleSwitch x:Name="AutoUpdateSwitch"
+                              Toggled="OnAutoUpdateToggled"
+                              AutomationProperties.Name="{loc:T Sv='Uppdatera automatiskt', En='Update automatically'}" />
+            </tk:SettingsCard>
+
+            <tk:SettingsExpander Header="{loc:T Sv='Felsökning', En='Troubleshooting'}"
+                                 Description="{loc:T Sv='Loggen, hur mycket motorn skriver till den, omstart av motorn och ombyggnad av projekten.', En='The log, how much the engine writes to it, restarting the engine and rebuilding the projects.'}">
+                <tk:SettingsExpander.HeaderIcon>
+                    <FontIcon Glyph="&#xE9D9;" />
+                </tk:SettingsExpander.HeaderIcon>
+                <tk:SettingsExpander.Items>
+                    <tk:SettingsCard Header="{loc:T Sv='Logg', En='Log'}"
+                                     Description="{loc:T Sv='Motorns logg, i sin egen mapp.', En='The engine log, in its own folder.'}">
+                        <Button x:Name="OpenLogButton"
+                                Content="{loc:T Sv='Öppna loggmappen', En='Open log folder'}"
+                                Click="OnOpenLog" />
+                    </tk:SettingsCard>
+                    <!-- The engine writes the zip and says where in a notify. -->
+                    <tk:SettingsCard Header="{loc:T Sv='Exportera diagnostik', En='Export diagnostics'}"
+                                     Description="{loc:T Sv='Packar loggarna och en sammanfattning utan inloggningsuppgifter i en zip-fil på skrivbordet, att skicka till supporten.', En='Packs the logs and a summary without sign-in details into a zip file on the desktop, to send to support.'}">
+                        <Button x:Name="ExportDiagnosticsButton"
+                                Content="{loc:T Sv='Exportera', En='Export'}"
+                                AutomationProperties.Name="{loc:T Sv='Exportera diagnostik', En='Export diagnostics'}"
+                                Click="OnExportDiagnostics" />
+                    </tk:SettingsCard>
+                    <tk:SettingsCard Header="{loc:T Sv='Loggnivå', En='Log level'}"
+                                     Description="{loc:T Sv='Debug skriver mer. Behövs bara vid felsökning. Gäller när motorn har startats om.', En='Debug writes more. Only needed when troubleshooting. Takes effect once the engine has restarted.'}">
+                        <ComboBox x:Name="LogLevelChoice"
+                                  MinWidth="170"
+                                  SelectionChanged="OnLogLevelChanged"
+                                  AutomationProperties.Name="{loc:T Sv='Loggnivå', En='Log level'}">
+                            <ComboBoxItem Content="Info" Tag="info" />
+                            <ComboBoxItem Content="Debug" Tag="debug" />
+                        </ComboBox>
+                    </tk:SettingsCard>
+                    <tk:SettingsCard Header="{loc:T Sv='Starta om motorn', En='Restart the engine'}"
+                                     Description="{loc:T Sv='Stoppar synken en kort stund och startar motorn igen. Behövs för att ändrade nedladdningar, uppladdningar eller loggnivå ska gälla.', En='Stops the sync for a moment and starts the engine again. Needed for changed downloads, uploads or log level to take effect.'}">
+                        <Button x:Name="RestartEngineButton"
+                                Content="{loc:T Sv='Starta om', En='Restart'}"
+                                AutomationProperties.Name="{loc:T Sv='Starta om motorn', En='Restart the engine'}"
+                                Click="OnRestartEngine" />
+                    </tk:SettingsCard>
+                    <!-- The last resort: asks first. Each project reports in its own notify. -->
+                    <tk:SettingsCard Header="{loc:T Sv='Bygg om alla projekt från ACC', En='Rebuild all projects from ACC'}"
+                                     Description="{loc:T Sv='Varje projekt byggs om från ACC där det ligger. Hjälper när synken har kört fast.', En='Every project is rebuilt from ACC where it is. Helps when the sync is stuck.'}">
+                        <Button x:Name="RebuildAllButton"
+                                Content="{loc:T Sv='Bygg om…', En='Rebuild…'}"
+                                AutomationProperties.Name="{loc:T Sv='Bygg om alla projekt från ACC', En='Rebuild all projects from ACC'}"
+                                Click="OnRebuildAll" />
+                    </tk:SettingsCard>
+                </tk:SettingsExpander.Items>
+            </tk:SettingsExpander>
+        </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

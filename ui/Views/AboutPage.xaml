@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="Synka.Views.AboutPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tk="using:CommunityToolkit.WinUI.Controls"
+    xmlns:loc="using:Synka.Views">
+
+    <ScrollViewer Padding="28,20">
+        <Grid>
+        <StackPanel Spacing="14" MaxWidth="900">
+            <TextBlock Text="{loc:T Sv='Om Synka', En='About Synka'}"
+                       Style="{StaticResource TitleTextBlockStyle}" />
+
+            <!-- The app name is not translated: it is the name in the Start menu. -->
+            <tk:SettingsCard Header="Synka"
+                             Description="{loc:T Sv='Synkar ACC Docs-filer till en lokal mapp. Kan köras bredvid Autodesk Desktop Connector.', En='Syncs ACC Docs files to a local folder. Can run alongside Autodesk Desktop Connector.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE8B7;" />
+                </tk:SettingsCard.HeaderIcon>
+                <TextBlock x:Name="VersionText"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Motor', En='Engine'}"
+                             Description="{loc:T Sv='Synken körs i en egen process, som startar vid inloggning.', En='The sync runs in a process of its own, which starts at sign-in.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE950;" />
+                </tk:SettingsCard.HeaderIcon>
+                <TextBlock x:Name="EngineText"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Minne', En='Memory'}"
+                             Description="{loc:T Sv='Motorn är tyst när inget händer. Fönstret är bara öppet när du vill ha det, och att stänga det stoppar inte synken.', En='The engine stays quiet when nothing happens. The window is open only when you want it, and closing it does not stop the sync.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE9D9;" />
+                </tk:SettingsCard.HeaderIcon>
+            </tk:SettingsCard>
+
+            <tk:SettingsCard Header="{loc:T Sv='Integritet', En='Privacy'}"
+                             Description="{loc:T Sv='Synka skickar filinnehåll bara mellan den här datorn och Autodesk (developer.api.autodesk.com och Autodesks fillagring). Ingen telemetri. Uppdateringskontrollen via internet är avstängd; nya versioner delas internt.', En='Synka sends file content only between this PC and Autodesk (developer.api.autodesk.com and Autodesk file storage). No telemetry. The online update check is off; new versions are shared internally.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE72E;" />
+                </tk:SettingsCard.HeaderIcon>
+            </tk:SettingsCard>
+
+            <!-- Trademark notice (legal review). The text is fixed wording; keep it verbatim. -->
+            <tk:SettingsCard Header="{loc:T Sv='Varumärken', En='Trademarks'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE946;" />
+                </tk:SettingsCard.HeaderIcon>
+                <TextBlock TextWrapping="Wrap" MaxWidth="560"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Text="{loc:T Sv='Autodesk, Autodesk Construction Cloud, Autodesk Docs, Autodesk Forma och Revit är registrerade varumärken eller varumärken som tillhör Autodesk, Inc. och/eller dess dotter- eller närstående bolag. Synka är en fristående produkt från Byggstyrning och är inte ansluten till, godkänd av eller sponsrad av Autodesk.', En='Autodesk, Autodesk Construction Cloud, Autodesk Docs, Autodesk Forma and Revit are registered trademarks or trademarks of Autodesk, Inc., and/or its subsidiaries and/or affiliates. Synka is an independent product of Byggstyrning and is not affiliated with, endorsed by or sponsored by Autodesk.'}" />
+            </tk:SettingsCard>
+        </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

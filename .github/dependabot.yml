@@ -1,0 +1,26 @@
+# Weekly update pull requests. CI runs on each of them (no secrets needed).
+# NuGet is left out on purpose: Microsoft.WindowsAppSDK and the toolkit are pinned
+# as a pair with Koordinatverktyget (ui/Synka.csproj) and move together, by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Minor and patch updates in one pull request; majors one by one.
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps

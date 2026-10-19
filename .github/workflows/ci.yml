@@ -1,0 +1,144 @@
+# CI: tests and builds every pull request and every push to main on Windows, the only platform
+# Synka runs on. The engine job tests, lints and builds the Rust engine; the ui
+# job packs that engine into the MSIX with packaging/build_msix.ps1, the same
+# script a developer runs, unsigned. Nothing here needs a secret.
+#
+# The Release workflow (release.yml) refuses to bump a commit whose CI is not green.
+
+name: CI
+
+# Pushes to main (what Release checks) and pull requests. A branch push with an open pull
+# request runs once, as the pull request; workflow_dispatch runs any other branch by hand.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the run it supersedes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  NUGET_XMLDOC_MODE: skip
+  # The SDK the MSIX is built with. A temporary global.json pins it, because the
+  # runner has several SDKs and dotnet otherwise takes the newest.
+  DOTNET_SDK: '8.0.x'
+
+jobs:
+  engine:
+    name: Engine (test, clippy, release build)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_SDK }}
+
+      # One cache for CI and Release (shared-key). Saved from main only, so
+      # branch caches do not push main's out; every branch restores main's.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: engine
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Engine regression and resilience tests
+        shell: pwsh
+        run: ./tools/test-resilience.ps1 -Profile Quick -Seed 42
+
+      - name: Resilience reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resilience-quick
+          path: |
+            target/resilience/**/*.json
+            target/resilience/**/*.xml
+            target/resilience/**/*.log
+            target/ui-ipc-audit/**/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Warnings fail the build: dead code is removed or wired, never silenced.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: synka-engine
+          path: target/release/synka-engine.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  ui:
+    name: MSIX package (unsigned)
+    needs: engine
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The engine the job above built; build_msix.ps1 -SkipEngineBuild packs it.
+      - uses: actions/download-artifact@v8
+        with:
+          name: synka-engine
+          path: target/release
+
+      - name: Set up .NET
+        id: dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_SDK }}
+
+      - name: Pin the .NET SDK
+        env:
+          SDK_VERSION: ${{ steps.dotnet.outputs.dotnet-version }}
+        run: |
+          @{ sdk = @{ version = $env:SDK_VERSION } } | ConvertTo-Json | Set-Content -Path global.json -Encoding utf8NoBOM
+          dotnet --version
+          if ($LASTEXITCODE -ne 0) { throw "dotnet does not start with the pinned SDK $env:SDK_VERSION" }
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('ui/Synka.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Build the MSIX (packaging/build_msix.ps1)
+        run: |
+          & ./packaging/build_msix.ps1 -SkipTests -SkipEngineBuild
+          if ($LASTEXITCODE -ne 0) { throw "build_msix.ps1 failed (exit code $LASTEXITCODE)" }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: synka-msix-unsigned
+          path: ui/AppPackages/**/Synka_*_x64.msix
+          if-no-files-found: error
+          retention-days: 7
+          # An .msix is a zip already.
+          compression-level: 0

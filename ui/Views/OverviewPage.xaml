@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="Synka.Views.OverviewPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tk="using:CommunityToolkit.WinUI.Controls"
+    xmlns:local="using:Synka.Views"
+    xmlns:loc="using:Synka.Views"
+    Loaded="OnLoaded"
+    Unloaded="OnUnloaded">
+
+    <ScrollViewer Padding="28,20"
+                  HorizontalScrollMode="Disabled"
+                  HorizontalScrollBarVisibility="Disabled"
+                  VerticalScrollBarVisibility="Auto">
+        <Grid>
+        <StackPanel Spacing="14" MaxWidth="900" HorizontalAlignment="Stretch">
+
+            <TextBlock Text="{loc:T Sv='Översikt', En='Overview'}"
+                       Style="{StaticResource TitleTextBlockStyle}" />
+
+            <!--
+                The hero: what the engine says about the sync right now, in the
+                manner of the Windows Settings home and the OneDrive status. The
+                glyph carries the state (the text says it too, for screen readers).
+                Colour comes from the system brushes only, as theme resources, so it
+                follows the theme chosen in Inställningar.
+            -->
+            <Border Padding="24,20"
+                    CornerRadius="8"
+                    BorderThickness="1"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <Grid ColumnSpacing="20" RowSpacing="16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <!-- A fixed square, so the state can change without the text moving. -->
+                    <Grid x:Name="StateIcon" Width="56" Height="56" VerticalAlignment="Top">
+                        <FontIcon x:Name="NeutralGlyph"
+                                  FontSize="40"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Visibility="Collapsed" />
+                        <FontIcon x:Name="SuccessGlyph"
+                                  FontSize="40"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                  Visibility="Collapsed" />
+                        <FontIcon x:Name="CautionGlyph"
+                                  FontSize="40"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                                  Visibility="Collapsed" />
+                        <FontIcon x:Name="CriticalGlyph"
+                                  FontSize="40"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                  Visibility="Collapsed" />
+                        <ProgressRing x:Name="StateSpinner"
+                                      Width="48"
+                                      Height="48"
+                                      IsActive="False"
+                                      Visibility="Collapsed" />
+                    </Grid>
+
+                    <StackPanel Grid.Column="1" Spacing="4" VerticalAlignment="Center">
+                        <TextBlock x:Name="HeadlineText"
+                                   Style="{StaticResource SubtitleTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock x:Name="StatusText"
+                                   TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock x:Name="AccountText"
+                                   TextWrapping="Wrap"
+                                   Visibility="Collapsed"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock x:Name="ErrorText"
+                                   TextWrapping="Wrap"
+                                   IsTextSelectionEnabled="True"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="Collapsed" />
+                    </StackPanel>
+
+                    <StackPanel Grid.Row="1"
+                                Grid.Column="1"
+                                Orientation="Horizontal"
+                                Spacing="8">
+                        <Button x:Name="OpenFolderButton"
+                                Style="{StaticResource AccentButtonStyle}"
+                                Content="{loc:T Sv='Öppna mappen', En='Open folder'}"
+                                Click="OnOpenFolder" />
+                        <Button x:Name="SyncNowButton"
+                                Content="{loc:T Sv='Synka nu', En='Sync now'}"
+                                Click="OnSyncNow">
+                            <Button.KeyboardAccelerators>
+                                <KeyboardAccelerator Key="F5" />
+                            </Button.KeyboardAccelerators>
+                        </Button>
+                        <!-- Only while the engine is not running and nothing is starting it. -->
+                        <Button x:Name="StartEngineButton"
+                                Style="{StaticResource AccentButtonStyle}"
+                                Visibility="Collapsed"
+                                Content="{loc:T Sv='Starta motorn', En='Start the engine'}"
+                                Click="OnStartEngine" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Shown only while signed out. The browser does the sign-in. -->
+            <Border x:Name="SignInCard"
+                    Visibility="Collapsed"
+                    Padding="24,28"
+                    CornerRadius="8"
+                    BorderThickness="1"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <StackPanel Spacing="10" HorizontalAlignment="Center">
+                    <TextBlock Text="{loc:T Sv='Logga in för att börja synka', En='Sign in to start syncing'}"
+                               Style="{StaticResource SubtitleTextBlockStyle}"
+                               TextAlignment="Center"
+                               TextWrapping="Wrap"
+                               HorizontalAlignment="Center" />
+                    <Button x:Name="SignInButton"
+                            Style="{StaticResource AccentButtonStyle}"
+                            HorizontalAlignment="Center"
+                            Content="{loc:T Sv='Logga in med Autodesk', En='Sign in with Autodesk'}"
+                            Click="OnSignIn" />
+                    <TextBlock x:Name="SignInHint"
+                               Text="{loc:T Sv='Din webbläsare öppnas så att du kan logga in med ditt Autodesk-konto.', En='Your browser opens so that you can sign in with your Autodesk account.'}"
+                               TextAlignment="Center"
+                               TextWrapping="Wrap"
+                               HorizontalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+            </Border>
+
+            <!-- Transfers -->
+            <Grid Margin="0,8,0,0" ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{loc:T Sv='Överföringar', En='Transfers'}"
+                           Style="{StaticResource BodyStrongTextBlockStyle}" />
+                <TextBlock x:Name="TransfersSummary"
+                           Grid.Column="1"
+                           HorizontalAlignment="Right"
+                           TextTrimming="CharacterEllipsis"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Grid>
+            <!-- A steady-height slot keeps the cards below it still while short transfers start and finish. -->
+            <Border MinHeight="64"
+                    CornerRadius="8"
+                    BorderThickness="1"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <Grid Padding="16,6">
+                    <TextBlock x:Name="NoTransfersText"
+                               VerticalAlignment="Center"
+                               Text="{loc:T Sv='Inga pågående överföringar', En='No transfers in progress'}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <!-- One stable row represents the current transfer. The heading shows the total count. -->
+                    <Grid x:Name="ActiveTransferPanel"
+                          Visibility="Collapsed"
+                          ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <FontIcon x:Name="TransferGlyph"
+                                  FontSize="16"
+                                  VerticalAlignment="Center" />
+                        <Grid Grid.Column="1" RowSpacing="2">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Border x:Name="TransferTypeBadge"
+                                        Height="22" Padding="4,0"
+                                        CornerRadius="4" BorderThickness="1"
+                                        BorderBrush="{ThemeResource TextFillColorSecondaryBrush}"
+                                        VerticalAlignment="Center">
+                                    <StackPanel Orientation="Horizontal" Spacing="3"
+                                                VerticalAlignment="Center">
+                                        <FontIcon x:Name="TransferTypeGlyph"
+                                                  FontFamily="{StaticResource SymbolThemeFontFamily}"
+                                                  FontSize="16" />
+                                        <TextBlock x:Name="TransferTypeLabel"
+                                                   FontSize="10" FontWeight="SemiBold"
+                                                   VerticalAlignment="Center" />
+                                    </StackPanel>
+                                </Border>
+                                <TextBlock x:Name="TransferName"
+                                           TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <TextBlock x:Name="TransferSubtitle"
+                                       Grid.Row="1"
+                                       FontSize="12"
+                                       TextTrimming="CharacterEllipsis"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <ProgressBar x:Name="TransferProgress"
+                                         Grid.Row="2"
+                                         Minimum="0"
+                                         Maximum="100" />
+                        </Grid>
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <!-- Queue and failures -->
+            <tk:SettingsCard x:Name="QueueCard"
+                             Header="{loc:T Sv='Köade ändringar', En='Queued changes'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xE895;" />
+                </tk:SettingsCard.HeaderIcon>
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <!-- Only while jobs have failed: put them back in the queue. -->
+                    <Button x:Name="QueueRetryButton"
+                            Visibility="Collapsed"
+                            Content="{loc:T Sv='Försök igen', En='Retry'}"
+                            AutomationProperties.Name="{loc:T Sv='Försök igen med de misslyckade ändringarna', En='Retry the failed changes'}"
+                            Click="OnRetryFailed" />
+                    <Button x:Name="QueueLogButton"
+                            Visibility="Collapsed"
+                            Content="{loc:T Sv='Öppna loggen', En='Open the log'}"
+                            Click="OnOpenLog" />
+                    <HyperlinkButton x:Name="ActivityLink"
+                                     Content="{loc:T Sv='Visa aktivitet', En='Show activity'}"
+                                     Click="OnShowActivity" />
+                </StackPanel>
+            </tk:SettingsCard>
+
+            <!-- Local storage -->
+            <tk:SettingsCard x:Name="StorageCard"
+                             Header="{loc:T Sv='Lokal lagring', En='Local storage'}"
+                             Description="{loc:T Sv='Frigör utrymme tar bort lokala kopior av synkade filer och avmarkerar Behåll alltid på den här enheten för dem och deras mappar. Osynkade ändringar behålls lokalt. Filerna finns kvar i ACC och hämtas igen när du öppnar dem.', En='Free up space removes local copies of synced files and clears Always keep on this device for them and their folders. Unsynced changes stay local. The files remain in ACC and are fetched again when you open them.'}">
+                <tk:SettingsCard.HeaderIcon>
+                    <FontIcon Glyph="&#xEDA2;" />
+                </tk:SettingsCard.HeaderIcon>
+                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <ProgressRing x:Name="FreeUpSpinner"
+                                  Width="16"
+                                  Height="16"
+                                  IsActive="False"
+                                  Visibility="Collapsed" />
+                    <Button x:Name="FreeUpButton"
+                            Content="{loc:T Sv='Frigör utrymme', En='Free up space'}"
+                            Click="OnFreeUp" />
+                </StackPanel>
+            </tk:SettingsCard>
+
+            <!-- Quick list of the subscribed projects -->
+            <TextBlock Text="{loc:T Sv='Synkade projekt', En='Synced projects'}"
+                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                       Margin="0,8,0,0" />
+            <Border CornerRadius="8"
+                    BorderThickness="1"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                <StackPanel>
+                    <Grid x:Name="NoProjectsPanel" Padding="24,14" ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock VerticalAlignment="Center"
+                                   TextWrapping="Wrap"
+                                   Text="{loc:T Sv='Inga projekt synkas ännu.', En='No projects are synced yet.'}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <Button x:Name="ChooseProjectsButton"
+                                Grid.Column="1"
+                                Content="{loc:T Sv='Välj projekt', En='Choose projects'}"
+                                Click="OnChooseProjects" />
+                    </Grid>
+                    <ItemsControl x:Name="SyncedList" Visibility="Collapsed">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="local:SyncedProjectRow">
+                                <Grid Padding="24,12" ColumnSpacing="14">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel VerticalAlignment="Center">
+                                        <TextBlock Text="{x:Bind Name}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{x:Bind Hub}"
+                                                   FontSize="12"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    </StackPanel>
+                                    <Button Grid.Column="1"
+                                            Content="{loc:T Sv='Öppna', En='Open'}"
+                                            AutomationProperties.Name="{x:Bind OpenLabel}"
+                                            Tag="{x:Bind LocalPath}"
+                                            IsEnabled="{x:Bind CanOpen}"
+                                            Click="OnOpenProject" />
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

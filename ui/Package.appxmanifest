@@ -1,0 +1,75 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Ships INSIDE the package. Two applications:
+    * App     — the window (Synka.exe), in the Start menu.
+    * Engine  — the sync engine (engine\synka-engine.exe), started at sign-in by
+                the startup task below and associated with the Cloud Files extension.
+  Version is stamped by Synka.csproj from the engine's Cargo.toml.
+-->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10" xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10" xmlns:cloudFiles2="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10/2" IgnorableNamespaces="uap desktop desktop3 rescap com cloudFiles2">
+  <!-- TODO(cert): Publisher stays CN=FastADC until a new trusted signing certificate exists (packaging/README.md). -->
+  <Identity Name="Byggstyrning.Synka" Publisher="CN=FastADC" Version="0.1.16.0" />
+  <Properties>
+    <DisplayName>Synka</DisplayName>
+    <PublisherDisplayName>Byggstyrning</PublisherDisplayName>
+    <Description>Synka synkar ACC Docs-filer till en lokal mapp. Kan köras bredvid Autodesk Desktop Connector. / Synka syncs ACC Docs files to a local folder. Can run alongside Autodesk Desktop Connector.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <!-- Windows.Desktop only: a runFullTrust app is a Win32 app. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="sv-SE" />
+    <Resource Language="en-US" />
+  </Resources>
+  <Applications>
+    <Application Id="App" Executable="Synka.exe" EntryPoint="$targetentrypoint$">
+      <uap:VisualElements DisplayName="Synka" Description="Synkar ACC Docs-filer till en lokal mapp. / Syncs ACC Docs files to a local folder." BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+        <!-- Required for the splash image to be shown at all. -->
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+    <Application Id="Engine" Executable="engine\synka-engine.exe" EntryPoint="Windows.FullTrustApplication">
+      <!-- Windows associates this Cloud Files extension with the Engine app identity. -->
+      <uap:VisualElements DisplayName="Synka-motor" Description="Synkroniserar ACC Docs-filer i bakgrunden. / Syncs ACC Docs files in the background." BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <!-- Starts the engine at sign-in. -->
+        <desktop:Extension Category="windows.startupTask" Executable="engine\synka-engine.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="SynkaStartup" Enabled="true" DisplayName="Synka" />
+        </desktop:Extension>
+        <!-- Register the sync root with Explorer. Windows supplies native availability/status
+             and "Always keep on this device" / "Free up space" menu commands. Keep the
+             CloudFiles element empty: child handlers passed package validation but caused
+             Windows to omit this sync root and its native commands at runtime. -->
+        <desktop3:Extension Category="windows.cloudFiles">
+          <desktop3:CloudFiles />
+        </desktop3:Extension>
+        <!-- The engine contains COM command/state implementations for future Explorer
+             integration. These classes are packaged but not attached to CloudFiles above.
+             -Embedding marks a start by COM when no engine is already running. -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer Executable="engine\synka-engine.exe" Arguments="-Embedding" DisplayName="Synka">
+              <com:Class Id="2F892C05-5A3B-490A-8BD2-10C97FE767C2" DisplayName="Synka custom states" />
+              <com:Class Id="24C0680F-0816-4889-900C-43A8430704FE" DisplayName="Synka Visa i ACC" />
+              <com:Class Id="2E404B33-2DB0-4F72-A038-C543DFA8705D" DisplayName="Synka Kopiera ACC-länk" />
+              <com:Class Id="B813AFF2-7AAD-4D6C-BC11-E7BAD042A146" DisplayName="Synka Lås" />
+              <com:Class Id="6D483C5F-7570-4011-A737-AE4966D95986" DisplayName="Synka Lås upp" />
+              <com:Class Id="57A11603-CFD1-410A-822A-ADC029F82687" DisplayName="Synka: Synka nu" />
+              <com:Class Id="C087C0B2-BD8D-468E-BF4F-85320AD4E06D" DisplayName="Synka: Synka alltid" />
+              <com:Class Id="932783F8-3108-499B-A4B2-0D410D82C349" DisplayName="Synka Sluta behålla lokalt" />
+              <com:Class Id="DAD03286-009F-4F91-8289-E6FE77D813C7" DisplayName="Synka Bygg om från ACC" />
+              <com:Class Id="35B42230-10D2-4774-BC7B-D75C38279590" DisplayName="Synka status" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <Capability Name="internetClient" />
+  </Capabilities>
+</Package>

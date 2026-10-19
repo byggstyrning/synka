@@ -1,0 +1,137 @@
+<Project Sdk="Microsoft.NET.Sdk" InitialTargets="StampPackageVersion">
+
+  <!--
+    The WinUI 3 window of Synka. The window and nothing else: all sync work
+    lives in the Rust engine (synka-engine.exe), which the window talks to
+    over a named pipe (docs\IPC.md). The window is open only while the user
+    wants it; the engine runs at sign-in.
+
+    Builds from the command line without a Visual Studio workload: everything
+    needed comes as NuGet packages.
+
+    PACKAGED FROM THE START (single-project MSIX). The manifest is
+    Package.appxmanifest here in the project, and `dotnet publish` produces the
+    .msix directly.
+
+    NEVER put `WindowsPackageType=None` back. Then the app is built unpackaged,
+    an auto-initializer is generated that CALLS the bootstrapper, and the app
+    crashes the moment it runs with package identity. The symptom is E_FAIL out
+    of combase.dll and a stowed exception in Microsoft.UI.Xaml.dll, one second
+    after start. (Same rule as Koordinatverktyget.)
+  -->
+
+  <!--
+    The version has ONE source: the engine's Cargo.toml. The window and the
+    engine must never show different numbers, so the package version is
+    stamped from there before packaging (see StampPackageVersion below).
+  -->
+  <PropertyGroup>
+    <CargoTomlFile>$(MSBuildThisFileDirectory)..\Cargo.toml</CargoTomlFile>
+    <CargoTomlText>$([System.IO.File]::ReadAllText($(CargoTomlFile)))</CargoTomlText>
+    <Version>$([System.Text.RegularExpressions.Regex]::Replace($(CargoTomlText), '(?s).*?\[package\].*?version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)".*', '$1'))</Version>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!--
+      MaxVersionTested in the BUILT manifest comes from here, not from
+      Package.appxmanifest: WinAppSdkGenerateAppxManifest overwrites
+      TargetDeviceFamily with $(TargetPlatformVersion). The number has to go
+      into the TFM (measured in Koordinatverktyget's csproj).
+      TargetPlatformMinVersion stays at 19041 — the oldest Windows allowed.
+    -->
+    <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <RootNamespace>Synka</RootNamespace>
+    <AssemblyName>Synka</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishProfile>win-x64</PublishProfile>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <!--
+      FRAMEWORK-DEPENDENT Windows App SDK — the same model Store apps use. The
+      manifest gets a PackageDependency on Microsoft.WindowsAppRuntime. When
+      SIDELOADING the framework package is installed first (the generated
+      Install.ps1 takes it automatically).
+
+      The .NET runtime is SELF-CONTAINED: it travels along in the package.
+    -->
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <GenerateAppxPackageOnBuild>false</GenerateAppxPackageOnBuild>
+    <AppxBundle>Never</AppxBundle>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <DefaultLanguage>sv-SE</DefaultLanguage>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- The app never phones home. No telemetry from the build chain either. -->
+    <DotNetCliToolsTelemetryOptOut>true</DotNetCliToolsTelemetryOptOut>
+    <!--
+      DETERMINISTIC BUILD. Without this the build machine's path (and the user
+      name in it) is baked into the delivered binary via the pdb path.
+      ContinuousIntegrationBuild maps the source paths to /_/.
+    -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Pinned versions, the same pair as Koordinatverktyget. 1.7 does not build
+      with .NET SDK 10 (its PriGen looks in the wrong Visual Studio folder).
+    -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260710003" />
+    <!-- SettingsCard and SettingsExpander — the same controls Windows' own
+         Settings app uses. -->
+    <PackageReference Include="CommunityToolkit.WinUI.Controls.SettingsControls" Version="8.2.251219" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
+    <Manifest Include="$(ApplicationManifest)" />
+    <AppxManifest Include="Package.appxmanifest">
+      <SubType>Designer</SubType>
+    </AppxManifest>
+  </ItemGroup>
+
+  <!--
+    The engine is baked into the package under engine\. Only in Release, and only
+    when it has been built: in Debug the window finds the engine in the repo's
+    target\release folder instead (see Services\EngineClient.cs).
+
+    Included as a single file. The PRI generator would read the file name as a
+    resource qualifier, so it is excluded from indexing with the same list the
+    PriGen target uses (the mechanism is described in Koordinatverktyget's csproj).
+  -->
+  <PropertyGroup>
+    <EngineFile>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\target\release\synka-engine.exe'))</EngineFile>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Release' And Exists('$(EngineFile)')">
+    <Content Include="$(EngineFile)">
+      <Link>engine\synka-engine.exe</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <_AppxLayoutAssetPackageFiles Include="$(EngineFile)" />
+  </ItemGroup>
+
+  <!--
+    The version has ONE source (the engine's Cargo.toml). Stamped into the
+    manifest before packaging so the package, the window and the engine can never
+    show different numbers.
+
+    InitialTargets, not BeforeTargets: with BeforeTargets the stamping ran after
+    MSBuild had already read the manifest, and the package got the previous
+    build's number.
+  -->
+  <Target Name="StampPackageVersion">
+    <XmlPoke XmlInputPath="$(MSBuildThisFileDirectory)Package.appxmanifest"
+             Query="/pkg:Package/pkg:Identity/@Version"
+             Value="$(Version).0"
+             Namespaces="&lt;Namespace Prefix='pkg' Uri='http://schemas.microsoft.com/appx/manifest/foundation/windows10' /&gt;" />
+  </Target>
+
+</Project>

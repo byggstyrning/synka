@@ -1,0 +1,67 @@
+name: Resilience laboratory
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Test intensity
+        type: choice
+        options: [Stress, Soak, Quick]
+        default: Stress
+      seed:
+        description: Initial reproducible seed (unsigned 32-bit integer)
+        type: string
+        default: '42'
+      iterations:
+        description: Passes (0 uses the profile default)
+        type: string
+        default: '0'
+      duration_minutes:
+        description: Soak duration after build and baseline
+        type: string
+        default: '30'
+
+permissions:
+  contents: read
+
+jobs:
+  resilience:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: never
+      SYNKA_RUN_PROFILE: ${{ inputs.profile }}
+      SYNKA_RUN_SEED: ${{ inputs.seed }}
+      SYNKA_RUN_ITERATIONS: ${{ inputs.iterations }}
+      SYNKA_RUN_DURATION: ${{ inputs.duration_minutes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: engine
+          save-if: false
+      - name: Inject faults and stress the engine
+        shell: pwsh
+        run: |
+          if ([int]$env:SYNKA_RUN_DURATION -gt 60) { throw 'CI soak duration must be at most 60 minutes.' }
+          & ./tools/test-resilience.ps1 -Profile $env:SYNKA_RUN_PROFILE -Seed ([uint32]$env:SYNKA_RUN_SEED) -Iterations ([int]$env:SYNKA_RUN_ITERATIONS) -DurationMinutes ([int]$env:SYNKA_RUN_DURATION)
+      - name: Keep reproduction logs and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resilience-${{ inputs.profile }}-${{ inputs.seed }}
+          path: |
+            target/resilience/**/*.json
+            target/resilience/**/*.xml
+            target/resilience/**/*.log
+            target/ui-ipc-audit/**/*.json
+          if-no-files-found: warn
+          retention-days: 14

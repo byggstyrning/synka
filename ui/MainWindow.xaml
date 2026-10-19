@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="Synka.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <!-- Mica: the window background of Windows itself. Comes with the framework. -->
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <!--
+        The root element has a name so that the theme choice can set RequestedTheme
+        on it. Everything else in the window is its child and inherits the choice.
+    -->
+    <Grid x:Name="RootGrid">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!--
+            The app's own title bar. The TitleBar control draws the icon, title and
+            subtitle, reserves room for the system buttons and takes its colours
+            from the theme. ExtendsContentIntoTitleBar and SetTitleBar are set in
+            the constructor; XAML does not work for the first one.
+            The subtitle carries the engine's state.
+        -->
+        <TitleBar
+            x:Name="AppTitleBar"
+            Title="Synka"
+            IsPaneToggleButtonVisible="True"
+            PaneToggleRequested="OnPaneToggleRequested">
+            <TitleBar.IconSource>
+                <!-- ShowAsMonochrome: only the alpha channel of the image is used, and
+                     it is filled with the title bar's foreground brush, so the mark
+                     follows light, dark and high contrast by itself. -->
+                <BitmapIconSource
+                    UriSource="ms-appx:///Assets/TitleBarIcon.png"
+                    ShowAsMonochrome="True" />
+            </TitleBar.IconSource>
+        </TitleBar>
+
+        <!--
+            Auto: the framework's own rule — expanded when the window is wide, a strip of
+            icons when narrower, hidden when narrowest. The hamburger in the title bar
+            toggles it. The pages fold on their own width (WidthTrigger).
+        -->
+        <NavigationView
+            Grid.Row="1"
+            x:Name="Navigation"
+            IsBackButtonVisible="Collapsed"
+            IsPaneToggleButtonVisible="False"
+            IsSettingsVisible="True"
+            PaneDisplayMode="Auto"
+            OpenPaneLength="248"
+            SelectionChanged="OnNavigationSelectionChanged">
+
+            <!-- The texts of the navigation are set in ApplyLanguage(), not with loc:T:
+                 the window is never rebuilt on a language change, only its frame. -->
+            <NavigationView.MenuItems>
+                <NavigationViewItem x:Name="OverviewNavItem" Tag="overview" IsSelected="True">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE80F;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+
+                <NavigationViewItem x:Name="ProjectsNavItem" Tag="projects">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8B7;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+
+                <NavigationViewItem x:Name="ActivityNavItem" Tag="activity">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE81C;" />
+                    </NavigationViewItem.Icon>
+                    <!-- The number of failed jobs, when there are any. Its colour is set in
+                         code (UpdateBadge), where a missing style key cannot stop the window. -->
+                    <NavigationViewItem.InfoBadge>
+                        <InfoBadge x:Name="ActivityBadge" Visibility="Collapsed" />
+                    </NavigationViewItem.InfoBadge>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+
+            <NavigationView.FooterMenuItems>
+                <NavigationViewItem x:Name="AboutNavItem" Tag="about">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE946;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.FooterMenuItems>
+
+            <!-- The frame is named so that it can be REPLACED on a language change
+                 (see MainWindow.OnLanguageChanged). A new frame has no cache at all.
+                 The bars stand in their own row above the page, so they never cover the
+                 page's title or buttons; the row is collapsed while no bar is open. -->
+            <Grid x:Name="ContentHost">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <StackPanel x:Name="BarHost"
+                            Margin="28,12,28,0"
+                            MaxWidth="900"
+                            Spacing="8"
+                            Visibility="Collapsed">
+                    <!-- The engine is not reachable. Not closable: it comes back by itself,
+                         or the user starts it with the button. -->
+                    <InfoBar
+                        x:Name="EngineBar"
+                        Severity="Warning"
+                        IsOpen="False"
+                        IsClosable="False">
+                        <InfoBar.ActionButton>
+                            <Button x:Name="EngineBarStartButton"
+                                    Visibility="Collapsed"
+                                    Click="OnStartEngine" />
+                        </InfoBar.ActionButton>
+                    </InfoBar>
+
+                    <!-- Bursts of local deletes the engine holds back until the user
+                         confirms them (status.held_deletes), one bar per project, on every
+                         page. Built in code (UpdateHeldDeletes). -->
+                    <StackPanel x:Name="HeldDeletesPanel" Spacing="8" />
+
+                    <!-- The one-time question about a desktop shortcut. Its own bar, so
+                         it cannot overwrite an engine message. -->
+                    <InfoBar
+                        x:Name="ShortcutBar"
+                        Severity="Warning"
+                        IsOpen="False"
+                        IsClosable="True"
+                        Closed="OnBarClosed" />
+
+                    <!-- Messages from the engine (`notify`) and results of actions, newest
+                         on top, at most three. Built in code (ShowMessage). -->
+                    <StackPanel x:Name="NotifyPanel" Spacing="8" />
+                    <Button x:Name="ClearNoticesButton"
+                            Visibility="Collapsed"
+                            HorizontalAlignment="Right"
+                            Content="Rensa meddelanden"
+                            Click="OnClearNotices" />
+                </StackPanel>
+
+                <!-- A newer version exists: a small accent-coloured toast at the foot of
+                     the page, where it covers no heading. An OFFER, never a demand:
+                     closable, and Installera nu is the only action. -->
+                <Border x:Name="UpdateToast"
+                        Grid.RowSpan="2"
+                        Visibility="Collapsed"
+                        Canvas.ZIndex="2"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Bottom"
+                        Margin="24,0,24,24"
+                        CornerRadius="8"
+                        Padding="16,10"
+                        Translation="0,0,16">
+                    <Border.Shadow>
+                        <ThemeShadow />
+                    </Border.Shadow>
+                    <Border.Background>
+                        <SolidColorBrush Color="{ThemeResource SystemAccentColor}" Opacity="0.88" />
+                    </Border.Background>
+                    <StackPanel Orientation="Horizontal" Spacing="14" VerticalAlignment="Center">
+                        <FontIcon Glyph="&#xE777;" FontSize="16"
+                                  Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
+                        <TextBlock x:Name="UpdateToastText"
+                                   VerticalAlignment="Center"
+                                   MaxWidth="420"
+                                   TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
+                        <Button x:Name="UpdateToastButton"
+                                Click="OnUpdateToastUpdate" />
+                        <Button x:Name="UpdateToastCloseButton"
+                                Click="OnUpdateToastClose"
+                                Background="Transparent"
+                                BorderThickness="0"
+                                Padding="6">
+                            <FontIcon Glyph="&#xE711;" FontSize="12"
+                                      Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
+                        </Button>
+                    </StackPanel>
+                </Border>
+
+                <Frame x:Name="PageFrame" Grid.Row="1" />
+            </Grid>
+        </NavigationView>
+    </Grid>
+</Window>

@@ -1,0 +1,6 @@
+# The recipient's files are Windows files: cmd.exe and Notepad want CRLF. Checked
+# out with CRLF whatever core.autocrlf says on the machine that packs the zip, a
+# developer's or a GitHub Actions runner. Stored with LF, as they are now.
+delivery/*.cmd text eol=crlf
+delivery/*.ps1 text eol=crlf
+delivery/*.txt text eol=crlf

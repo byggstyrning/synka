@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Exercise the actual client and source-generated protocol serializer. -->
+    <Compile Include="../../ui/Services/EngineClient.cs" Link="Production/EngineClient.cs" />
+    <Compile Include="../../ui/Services/ErrorDisplay.cs" Link="Production/ErrorDisplay.cs" />
+    <Compile Include="../../ui/Services/Protocol.cs" Link="Production/Protocol.cs" />
+    <Compile Include="../../ui/Services/ApsClientIdEditState.cs" Link="Production/ApsClientIdEditState.cs" />
+  </ItemGroup>
+</Project>

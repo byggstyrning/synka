@@ -1,0 +1,30 @@
+// Embedded by build.rs (embed-resource). Icon id 1 is loaded by tray.rs via Icon::from_resource(1, None).
+1 ICON "app.ico"
+
+1 VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Byggstyrning"
+            VALUE "FileDescription", "Synka"
+            VALUE "FileVersion", "0.1.0.0"
+            VALUE "InternalName", "synka-engine"
+            VALUE "OriginalFilename", "synka-engine.exe"
+            VALUE "ProductName", "Synka"
+            VALUE "ProductVersion", "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
