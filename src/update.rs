@@ -126,7 +126,7 @@ pub async fn install(http: &reqwest::Client, u: &UpdateInfo) -> Result<()> {
         bail!("update version cannot be represented by an MSIX identity");
     }
     let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce).map_err(|e| anyhow!("creating update download name: {e}"))?;
+    getrandom::fill(&mut nonce).map_err(|e| anyhow!("creating update download name: {e}"))?;
     let path = std::env::temp_dir().join(format!(
         "synka-update-{:016x}.msix",
         u64::from_le_bytes(nonce)

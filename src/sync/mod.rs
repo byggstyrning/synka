@@ -3391,7 +3391,7 @@ fn jitter(d: Duration) -> Duration {
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    let _ = getrandom::getrandom(&mut b);
+    let _ = getrandom::fill(&mut b);
     b
 }
 

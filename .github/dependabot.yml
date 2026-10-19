@@ -24,3 +24,7 @@ updates:
         update-types: [minor, patch]
     commit-message:
       prefix: deps
+    ignore:
+      # Must stay on the versions the windows crate uses. Bumped by hand together with `windows`.
+      - dependency-name: "windows-core"
+      - dependency-name: "windows-collections"

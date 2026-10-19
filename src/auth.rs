@@ -737,7 +737,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn random_b64(n: usize) -> Result<String> {
     let mut b = vec![0u8; n];
-    getrandom::getrandom(&mut b).map_err(|e| anyhow!("slumpgenerator misslyckades: {e}"))?;
+    getrandom::fill(&mut b).map_err(|e| anyhow!("slumpgenerator misslyckades: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(b))
 }
 
