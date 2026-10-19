@@ -145,8 +145,7 @@ Everything marked **verified** was measured on this machine against the real ACC
   tests under Wine with a stub `cldapi.dll` (see `README.md`). The engine behaviour tests in
   `src/sync/mod.rs` (`fixture()`) run against a real temp folder and DB.
 - The UI test harness is manual (screenshots). Add a fake-engine pipe test runner.
-- Local files that must stay out of the repository (legal drafts, notes from earlier
-  investigations) are gitignored. Never commit any token.
+- Never commit any token, key or `.pfx`.
 
 ## Release checklist (before the next release)
 

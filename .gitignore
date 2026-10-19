@@ -1,4 +1,3 @@
-research/
 target/
 bin/
 obj/
@@ -12,9 +11,6 @@ ui/bin/
 ui/obj/
 ui/AppPackages/
 ui/_screenshots/
-
-# Legal drafts (keep out of the repo; move to durable storage)
-docs/legal/
 
 # Agent worktrees
 .claude/worktrees/
