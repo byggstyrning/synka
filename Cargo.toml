@@ -27,7 +27,7 @@ sha2 = "0.10"
 getrandom = "0.2"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-tray-icon = "0.25"
+tray-icon = "0.26"
 semver = "1"
 # Same versions the windows crate uses. `#[implement]` expands to `::windows_core` paths, and
 # windows 0.62 does not re-export `windows_collections` (IIterable<T>).
