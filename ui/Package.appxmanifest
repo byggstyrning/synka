@@ -8,7 +8,7 @@
 -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10" xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10" xmlns:cloudFiles2="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10/2" IgnorableNamespaces="uap desktop desktop3 rescap com cloudFiles2">
   <!-- TODO(cert): Publisher stays CN=FastADC until a new trusted signing certificate exists (packaging/README.md). -->
-  <Identity Name="Byggstyrning.Synka" Publisher="CN=FastADC" Version="0.1.16.0" />
+  <Identity Name="Byggstyrning.Synka" Publisher="CN=FastADC" Version="0.2.0.0" />
   <Properties>
     <DisplayName>Synka</DisplayName>
     <PublisherDisplayName>Byggstyrning</PublisherDisplayName>

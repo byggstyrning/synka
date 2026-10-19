@@ -325,7 +325,7 @@ fn retryable(status: StatusCode) -> bool {
 fn backoff(attempt: u32) -> Duration {
     let base = (1u64 << attempt.min(6)) as f64;
     let mut b = [0u8; 4];
-    let unit = match getrandom::getrandom(&mut b) {
+    let unit = match getrandom::fill(&mut b) {
         Ok(()) => u32::from_le_bytes(b) as f64 / u32::MAX as f64,
         Err(_) => 0.5,
     };
