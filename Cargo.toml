@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 tracing-appender = "0.2"
 base64 = "0.22"
 sha2 = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tray-icon = "0.25"
