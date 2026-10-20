@@ -31,10 +31,10 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 | cmd | fields | effect |
 |---|---|---|
 | `hello` | `version` (UI version string) | engine replies with `status`, `settings`, `projects` (cached, may be empty), `activity` |
-| `sign_in` | `provider?` (`acc` default, `streambim`, `interaxo`); StreamBIM also `region` (subdomain), `username`, `password` | ACC/Interaxo: browser sign-in. StreamBIM: password login, may ask for an MFA code. Progress arrives as `sign_in_progress`, the result as `status` |
-| `sign_in_mfa` | `provider` (`streambim`), `code` (6 digits) | answers a `sign_in_progress` `mfa_required` |
-| `cancel_sign_in` | `provider` | cancels a pending browser sign-in or MFA wait → `sign_in_progress` `cancelled` |
-| `sign_out` | `provider?` | signs out of that provider; without `provider`, of every provider |
+| `sign_in` | `provider?` (`acc` default, `streambim`, `interaxo`); StreamBIM also exactly one of `region` (subdomain) or `url` (custom `https://host`), plus `username`, `password` | ACC/Interaxo: browser sign-in. StreamBIM: password login, may ask for an MFA code. Progress arrives as `sign_in_progress`, the result as `status` |
+| `sign_in_mfa` | `provider` (`streambim`), `account` (the key from `sign_in_progress`), `code` (6 digits) | answers a `sign_in_progress` `mfa_required` |
+| `cancel_sign_in` | `provider`, `account?` (StreamBIM: the key; without it every pending StreamBIM sign-in) | cancels a pending browser sign-in or MFA wait → `sign_in_progress` `cancelled` |
+| `sign_out` | `provider?`, `account?` | signs out of one StreamBIM account (`account`), of every account of that provider (no `account`), or of everything (no `provider`) |
 | `streambim_regions` | | → `streambim_regions` event (live list, built-in fallback) |
 | `sync_now` | | |
 | `open_folder` | `path?` (absolute; default sync root) | opens Explorer |
@@ -60,10 +60,10 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 
 | type | fields |
 |---|---|
-| `status` | `signed_in` bool, `user` `{name,email}` or null, `state` one of `signed_out`,`synced`,`syncing`,`waiting`,`attention`,`offline`,`error`, `text` (Swedish one-liner), `error` string or null, `pending_jobs`, `failed_jobs`, `transfers` `[{name, project, direction:"down"\|"up", done, total}]` (bytes), `sync_root` (abs path), `held_deletes` `[{project_id, project, count}]` (delete bursts waiting for `confirm_deletes`; a folder counts its contents), `local_bytes` (bytes of file data on disk across projects, null until first counted), `engine_version`, `accounts` `[{provider, label, configured, signed_in, signing_in, user:{name,email}\|null, host}]` (always `acc`, `streambim`, `interaxo` in that order) |
+| `status` | `signed_in` bool, `user` `{name,email}` or null, `state` one of `signed_out`,`synced`,`syncing`,`waiting`,`attention`,`offline`,`error`, `text` (Swedish one-liner), `error` string or null, `pending_jobs`, `failed_jobs`, `transfers` `[{name, project, direction:"down"\|"up", done, total}]` (bytes), `sync_root` (abs path), `held_deletes` `[{project_id, project, count}]` (delete bursts waiting for `confirm_deletes`; a folder counts its contents), `local_bytes` (bytes of file data on disk across projects, null until first counted), `engine_version`, `accounts` `[{provider, account, label, configured, signed_in, signing_in, user:{name,email}\|null, host}]` (`acc` first, then one entry per StreamBIM account that is signed in or signing in, sorted by key, then `interaxo`; `account` is the StreamBIM account key, null for the others) |
 | `projects` | `loading` bool, `hubs` `[{id, name, provider, projects:[{id, name, subscribed, local_path}]}]` (sorted by name) |
 | `settings` | `propagate_deletes`, `max_downloads`, `max_uploads`, `poll_active_secs`, `log_level`, `start_at_login`, `auto_update`, `sync_root`, `client_id_configured`, `aps_client_id` (string or null), `aps_client_id_override_supported` (bool), `aps_client_id_validation_supported` (bool), `update_channel_configured` (bool; false = no update channel, the window hides update controls), `providers` (`["acc","streambim","interaxo"]`), `interaxo_client_id` (string or null), `interaxo_redirect_uri` (effective), `interaxo_redirect_uri_default`, `interaxo_client_secret_set` (bool) |
-| `sign_in_progress` | `provider`, `state` (`browser`\|`mfa_required`\|`signed_in`\|`failed`\|`cancelled`), `error` (Swedish text or null) |
+| `sign_in_progress` | `provider`, `account` (StreamBIM key or null), `state` (`browser`\|`mfa_required`\|`signed_in`\|`failed`\|`cancelled`), `error` (Swedish text or null) |
 | `streambim_regions` | `regions` `[{subdomain, title, is_default}]` |
 | `aps_client_id_validation` | `request_id`, `state` (`testing`\|`saved`\|`failed`\|`cancelled`), `error` (safe text or null). Recent per-request outcomes replay on hello/reconnect |
 | `activity` | `items` `[{ts_ms, kind, name, project, detail}]` newest first, at most 200. `kind`: `download`,`upload`,`new_version`,`rename`,`move`,`delete`,`conflict`,`error`,`unsupported` (ACC rejected a file type and will not retry),`remote_change`,`free_up`,`reset`,`restore`,`lock`,`unlock` (Explorer verbs Lås / Lås upp). Sent in full on `hello`, then as `activity_item` |
@@ -78,13 +78,20 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 
 See `docs/PROVIDERS.md`. Clarifications:
 
-- **One account per provider.** `status.signed_in` is true when any provider is signed in;
-  `status.user` is the first signed-in account in the order `acc`, `streambim`, `interaxo`.
+- **Accounts.** One ACC account, one Interaxo account, and one StreamBIM account per StreamBIM
+  server. A StreamBIM server is a region (`https://<subdomain>.streambim.com`) or a custom
+  address (`https://<host>`, https only, no port, path, query or user info). Its **account key**
+  is the subdomain for `*.streambim.com` (`app`, `japan`) and the lowercase host otherwise
+  (`streambim.example.com`); keys of regions never contain a dot. `status.signed_in` is true when
+  any account is signed in; `status.user` is the first signed-in account in `accounts` order.
   `accounts[].configured` is false when the provider cannot sign in yet (ACC without a client id,
-  Interaxo without `interaxo_client_id`). `host` is the StreamBIM region host or null.
-- **`sign_in`.** A new `sign_in` for a provider replaces a pending attempt for the same provider
-  (as the ACC rule: clicks within one second share it). StreamBIM requires `region`, `username`
-  and `password`; missing fields are refused in the ack. The password is used once and never
+  Interaxo without `interaxo_client_id`). `host` is the StreamBIM server's host, null otherwise.
+- **`sign_in`.** A new `sign_in` for an account replaces a pending attempt for the same account
+  (as the ACC rule: clicks within one second share it). StreamBIM requires exactly one of
+  `region` (matching `^[a-z0-9-]{1,32}$`) or `url` (a valid custom https address, see above),
+  plus `username` and `password`; anything else is refused in the ack. Signing in to a StreamBIM
+  server that already has a signed-in account is refused with a warning `notify` ("Du är redan
+  inloggad på … – logga ut först."). The password goes only to that server. The password is used once and never
   stored or logged. `sign_in_progress` reports `browser` (ACC/Interaxo, waiting for the browser),
   `mfa_required` (StreamBIM, send `sign_in_mfa` within five minutes), then `signed_in`, `failed`
   (with `error`) or `cancelled`. A failed MFA code gives `failed`; the user starts over.

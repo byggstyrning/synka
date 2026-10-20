@@ -7,7 +7,7 @@ first.
 | Provider | `Provider` | Sign-in | Client id | Hub (2nd path level) | Project (3rd level) |
 |---|---|---|---|---|---|
 | Autodesk ACC | `acc` | APS Authorization Code + PKCE (browser) | built-in, overridable (`aps_client_id`) | ACC account | ACC project |
-| StreamBIM | `streambim` | region + e-mail + password, optional TOTP (MFA) code | none: StreamBIM has no third-party OAuth client registration | one hub, `StreamBIM` | StreamBIM project |
+| StreamBIM | `streambim` | server (region or custom https address) + e-mail + password, optional TOTP (MFA) code | none: StreamBIM has no third-party OAuth client registration | one hub per server account: `StreamBIM` (region `app`), `StreamBIM <Region title>`, `StreamBIM (<host>)` | StreamBIM project |
 | Interaxo | `interaxo` | OIDC Authorization Code + PKCE (Auth0, browser) | **bring your own**: `interaxo_client_id` (+ optional secret, redirect URI) | `Interaxo – <community>` | room |
 
 API research behind this file, with every undocumented point listed, is in `docs/specs/streambim-endpoints.md` and `docs/specs/interaxo-endpoints.md`;
@@ -19,11 +19,15 @@ The on-disk layout is unchanged: `<sync root>\<hub>\<project>\<top folder>\…`.
 only decides what its hubs, projects and top folders are.
 
 - **Hub ids** are globally unique strings. ACC keeps its DM ids (`b.…`). Others are prefixed:
-  `streambim:<region>` and `interaxo:<community_id>`.
+  `streambim:<account key>` and `interaxo:<community_id>`. The StreamBIM account key is the region
+  subdomain for `*.streambim.com` (`app`, `japan`) and the lowercase host for a custom address
+  (`streambim.example.com`), so `streambim:app` is unchanged from the single-account version.
 - **Project ids** (`project.project_id`, unique in SQLite) are globally unique strings. ACC keeps
-  `b.…`. Others: `streambim:<region>:<projectId>` and `interaxo:<community_id>:<room_id>`.
+  `b.…`. Others: `streambim:<account key>:<projectId>` and `interaxo:<community_id>:<room_id>`.
 - **Hub names** of non-ACC providers carry the provider so they cannot collide with an ACC
-  account folder: `StreamBIM`, `Interaxo – <community name>`.
+  account folder: `StreamBIM` (region `app`, the default; unchanged so existing folders stay),
+  `StreamBIM <Region title>` (e.g. `StreamBIM Japan`), `StreamBIM (<host>)` for a custom address,
+  `Interaxo – <community name>`.
 - **Top folders**: non-ACC projects have exactly one top folder named `Dokument`, whose id is
   the provider's root folder id (StreamBIM `0`, Interaxo `room.content.root_id`).
 - **Item ids** are provider-native strings, unique per project, which is all the store needs
@@ -171,10 +175,10 @@ stays local. `Caps` lets the engine skip work it knows will be refused.
 ```rust
 pub auth: Arc<Auth>,                 // ACC (unchanged)
 pub api: Api,                        // ACC
-pub streambim: Arc<StreamBimAuth>,  pub streambim_api: Api,
+pub streambim: Arc<StreamBimAccounts>,   // one StreamBimAuth + Api per StreamBIM server
 pub interaxo: Arc<Auth>,             pub interaxo_api: Api,   // Auth with the Interaxo OIDC spec
 impl Ctx {
-    pub fn api_for(&self, p: Provider) -> &Api;
+    pub fn api_for(&self, p: Provider) -> &Api;      // ACC and Interaxo; StreamBIM goes per account
     pub fn signed_in(&self, p: Provider) -> bool;
     pub fn any_signed_in(&self) -> bool;
     pub fn user_for(&self, p: Provider) -> Option<UserInfo>;
@@ -189,7 +193,7 @@ Token files in the state dir (all refresh material DPAPI-protected, user profile
 | Provider | token | profile |
 |---|---|---|
 | ACC | `token.bin` (unchanged) | `user.json` (unchanged) |
-| StreamBIM | `token-streambim.bin` (JSON `{refresh_token, id_token}`) | `user-streambim.json` (adds `host`) |
+| StreamBIM (per account key) | `token-streambim-<key>.bin` (JSON `{refresh_token, id_token, expires_at}`) | `user-streambim-<key>.json` (adds `region`, `base`) |
 | Interaxo | `token-interaxo.bin` | `user-interaxo.json` |
 
 **Sync root.** The sync root is registered while *any* provider is signed in and unregistered
@@ -201,6 +205,13 @@ jobs wait as if offline) and leaves its folders in place.
 
 ### StreamBIM
 
+- **Several accounts**, one per StreamBIM server (account key: region subdomain, or the host of a
+  custom address). `StreamBimAccounts` (in `src/streambim_auth.rs`) loads every
+  `user-streambim-<key>.json` at start, hands out the account of a project (by the host of
+  `Project.meta.base`) or of a hub (`HubInfo.region` = the key), and adds an account on its first
+  sign-in. A single-account install's `token-streambim.bin` / `user-streambim.json` are renamed
+  to the keyed names once at start. A custom address must be `https://<host>` (DNS name, no port,
+  path, query or user info); its password goes only to that host, and so does its token.
 - Regions: `GET https://global.streambim.com/regions.json` (no auth); fallback list `app`
   (Europe, default), `sweden`, `japan`, `australia`, `spf`. Host `https://<subdomain>.streambim.com`.
   Both `distinctiveLanguages` and the misspelled `disctintiveLanguages` are optional.
