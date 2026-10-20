@@ -638,39 +638,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interaxo_calls_reach_their_stubs() {
-        let f = fixture("stubs");
-        for provider in [Provider::Interaxo] {
-            let p = project(provider);
-            let unsupported = |r: Result<(), ApiError>| {
-                assert!(
-                    matches!(r, Err(ApiError::Unsupported(_))),
-                    "{provider:?}: {r:?}"
-                )
-            };
-            let err = folder_contents(&f.ctx, &p, "0").await.unwrap_err();
-            assert!(
-                matches!(err, ApiError::Unsupported(_)),
-                "{provider:?}: {err}"
-            );
-            assert_eq!(err.status(), None);
-            assert!(matches!(
-                list_hubs(&f.ctx, provider).await,
-                Err(ApiError::Unsupported(_))
-            ));
-            assert!(matches!(
-                list_projects(&f.ctx, &hub(provider)).await,
-                Err(ApiError::Unsupported(_))
-            ));
-            unsupported(delete_file(&f.ctx, &p, "1").await);
-            unsupported(delete_folder(&f.ctx, &p, "2").await);
-            unsupported(move_file(&f.ctx, &p, "1", "2").await);
-            unsupported(patch_folder(&f.ctx, &p, "2", Some("x"), None).await);
-            assert!(matches!(
-                create_folder(&f.ctx, &p, "0", "new").await,
-                Err(ApiError::Unsupported(_))
-            ));
-        }
+    async fn interaxo_refuses_what_its_api_cannot_do() {
+        let f = fixture("interaxo");
+        let p = project(Provider::Interaxo);
+        let unsupported = |r: Result<(), ApiError>| {
+            assert!(matches!(r, Err(ApiError::Unsupported(_))), "{r:?}");
+        };
+        assert!(matches!(
+            create_folder(&f.ctx, &p, "root", "new").await,
+            Err(ApiError::Unsupported(_))
+        ));
+        unsupported(rename_file(&f.ctx, &p, "1", None, "new.pdf").await);
+        unsupported(move_file(&f.ctx, &p, "1", "2").await);
+        unsupported(patch_folder(&f.ctx, &p, "2", Some("x"), None).await);
+        assert!(matches!(
+            set_reserved(&f.ctx, &p, "1", true).await,
+            Err(ApiError::Unsupported(_))
+        ));
+        // Nothing to change is not an error.
+        assert!(patch_folder(&f.ctx, &p, "2", None, None).await.is_ok());
     }
 
     #[tokio::test]
