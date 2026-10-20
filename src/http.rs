@@ -12,6 +12,7 @@
 //! - Log at debug: method, path (no query), status, elapsed ms. Never log bodies or tokens.
 
 use crate::auth::Auth;
+use crate::streambim_auth::StreamBimAuth;
 use chrono::{DateTime, Utc};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::StatusCode;
@@ -38,6 +39,10 @@ pub enum ApiError {
     Auth(anyhow::Error),
     #[error("decode: {0}")]
     Decode(String),
+    /// The provider's API does not offer this operation. The text is user-facing (Swedish).
+    /// Not a transient or offline failure: retrying does not help.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 impl ApiError {
@@ -45,6 +50,32 @@ impl ApiError {
         match self {
             ApiError::Status { status, .. } => Some(*status),
             _ => None,
+        }
+    }
+}
+
+/// Where an `Api` gets its bearer token.
+#[derive(Clone)]
+pub enum TokenSource {
+    /// OAuth Authorization Code + PKCE (APS, Interaxo)
+    Aps(Arc<Auth>),
+    /// StreamBIM's own sign-in (region, e-mail, password, optional MFA code).
+    StreamBim(Arc<StreamBimAuth>),
+}
+
+impl TokenSource {
+    pub async fn access_token(&self) -> anyhow::Result<String> {
+        match self {
+            TokenSource::Aps(auth) => auth.access_token().await,
+            TokenSource::StreamBim(auth) => auth.access_token().await,
+        }
+    }
+
+    /// Force a refresh on the next `access_token()` (used after a 401).
+    pub async fn invalidate(&self) {
+        match self {
+            TokenSource::Aps(auth) => auth.invalidate().await,
+            TokenSource::StreamBim(auth) => auth.invalidate().await,
         }
     }
 }
@@ -61,7 +92,7 @@ pub enum Body {
 pub struct Api {
     client: reqwest::Client,
     transfer_client: reqwest::Client,
-    auth: Arc<Auth>,
+    source: TokenSource,
     #[cfg(test)]
     test_policy: Option<TestPolicy>,
 }
@@ -102,11 +133,17 @@ fn build_transfer_client() -> reqwest::Client {
 }
 
 impl Api {
+    /// An API authenticated with the OAuth (APS) session of `auth`.
     pub fn new(client: reqwest::Client, auth: Arc<Auth>) -> Api {
+        Api::with_source(client, TokenSource::Aps(auth))
+    }
+
+    /// An API that takes its bearer token from `source`.
+    pub fn with_source(client: reqwest::Client, source: TokenSource) -> Api {
         Api {
             client,
             transfer_client: build_transfer_client(),
-            auth,
+            source,
             #[cfg(test)]
             test_policy: None,
         }
@@ -139,7 +176,7 @@ impl Api {
         Self {
             client,
             transfer_client,
-            auth,
+            source: TokenSource::Aps(auth),
             test_policy: Some(TestPolicy {
                 origin: origin.to_string(),
                 timeout,
@@ -209,7 +246,7 @@ impl Api {
         let mut retries = 0u32;
         let mut reauthed = false;
         loop {
-            let token = self.auth.access_token().await.map_err(ApiError::Auth)?;
+            let token = self.source.access_token().await.map_err(ApiError::Auth)?;
             let mut rb = self
                 .client
                 .request(method.clone(), &full)
@@ -261,7 +298,7 @@ impl Api {
             }
             if status == StatusCode::UNAUTHORIZED && !reauthed {
                 reauthed = true;
-                self.auth.invalidate().await;
+                self.source.invalidate().await;
                 continue;
             }
             if retryable(status)

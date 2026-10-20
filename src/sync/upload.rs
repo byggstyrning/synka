@@ -298,6 +298,8 @@ fn is_transient(err: &anyhow::Error) -> bool {
     }
     match err.downcast_ref::<ApiError>() {
         Some(ApiError::Status { status, .. }) => *status == 408 || *status == 429 || *status >= 500,
+        // The provider does not offer this operation: the same request fails the same way.
+        Some(ApiError::Unsupported(_)) => false,
         // Transport, auth and decode problems are retried.
         Some(_) => true,
         // Local I/O and "parent folder not synced yet" are retried.
@@ -1952,6 +1954,9 @@ mod tests {
         assert!(is_transient(&st(429)));
         assert!(is_transient(&st(503)));
         assert!(!is_transient(&st(409)));
+        assert!(!is_transient(&anyhow::Error::from(ApiError::Unsupported(
+            "stöds inte".into()
+        ))));
         assert!(!is_transient(&st(403)));
         assert!(!is_transient(&perm("bad")));
         assert!(!is_transient(

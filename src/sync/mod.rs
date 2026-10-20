@@ -2221,6 +2221,8 @@ impl Engine {
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: Provider::Acc,
+            meta: None,
         };
         let pid = db(&self.ctx, move |s| s.upsert_project(&p)).await?;
         self.st().tops_at.insert(pid, Instant::now());
@@ -8437,7 +8439,7 @@ pub(crate) mod tests {
         let store = Arc::new(Store::open(&paths.db_file).unwrap());
         let http = crate::http::build_client();
         let auth = Arc::new(crate::auth::Auth::new("test".into(), http.clone(), &state));
-        let api = crate::http::Api::new(http, auth.clone());
+        let api = crate::http::Api::new(http.clone(), auth.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         let ui = crate::app::UiSender {
             tx,
@@ -8445,6 +8447,22 @@ pub(crate) mod tests {
             hub: Arc::new(crate::ipc::IpcHub::new(root.clone())),
         };
         let cfg = crate::config::Config::default();
+        let streambim = Arc::new(crate::streambim_auth::StreamBimAuth::new(
+            http.clone(),
+            &state,
+        ));
+        let streambim_api = crate::http::Api::with_source(
+            http.clone(),
+            crate::http::TokenSource::StreamBim(streambim.clone()),
+        );
+        let interaxo = Arc::new(crate::auth::Auth::with_files(
+            String::new(),
+            http.clone(),
+            &state,
+            "token-interaxo.bin",
+            "user-interaxo.json",
+        ));
+        let interaxo_api = crate::http::Api::new(http, interaxo.clone());
         let ctx = Arc::new(Ctx {
             settings: std::sync::RwLock::new(cfg.clone()),
             cfg,
@@ -8452,6 +8470,10 @@ pub(crate) mod tests {
             store,
             auth,
             api,
+            streambim,
+            streambim_api,
+            interaxo,
+            interaxo_api,
             ui,
         });
         let mut p = Project {
@@ -8471,6 +8493,8 @@ pub(crate) mod tests {
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: Provider::Acc,
+            meta: None,
         };
         p.pid = ctx.store.upsert_project(&p).unwrap();
         let pdir = project_dir(&root, &p);
@@ -9256,6 +9280,10 @@ pub(crate) mod tests {
             store: f.ctx.store.clone(),
             auth: f.ctx.auth.clone(),
             api: f.ctx.api.clone(),
+            streambim: f.ctx.streambim.clone(),
+            streambim_api: f.ctx.streambim_api.clone(),
+            interaxo: f.ctx.interaxo.clone(),
+            interaxo_api: f.ctx.interaxo_api.clone(),
             ui: f.ctx.ui.clone(),
         };
         assert_eq!(relocate::forget_old_root(&ctx2), None);

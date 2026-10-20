@@ -123,6 +123,9 @@ pub struct Auth {
     client_id: String,
     http: reqwest::Client,
     state_dir: PathBuf,
+    /// File names in `state_dir` (ACC: token.bin / user.json; other OAuth providers use their own).
+    token_file: &'static str,
+    user_file: &'static str,
     token: Mutex<TokenState>,
     user: RwLock<Option<UserInfo>>,
     #[cfg(test)]
@@ -135,13 +138,27 @@ impl Auth {
     /// `client_id` empty => `is_configured()` false; sign_in returns an error explaining the
     /// APS app must be configured.
     pub fn new(client_id: String, http: reqwest::Client, state_dir: &Path) -> Auth {
-        let user = std::fs::read(state_dir.join("user.json"))
+        Auth::with_files(client_id, http, state_dir, "token.bin", "user.json")
+    }
+
+    /// Like `new`, with the token and profile files named by the caller (one pair per OAuth
+    /// account). The endpoints and scopes are the APS ones; the Interaxo spec is wired later.
+    pub fn with_files(
+        client_id: String,
+        http: reqwest::Client,
+        state_dir: &Path,
+        token_file: &'static str,
+        user_file: &'static str,
+    ) -> Auth {
+        let user = std::fs::read(state_dir.join(user_file))
             .ok()
             .and_then(|b| serde_json::from_slice::<UserInfo>(&b).ok());
         Auth {
             client_id,
             http,
             state_dir: state_dir.to_path_buf(),
+            token_file,
+            user_file,
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(user),
             #[cfg(test)]
@@ -158,6 +175,8 @@ impl Auth {
             client_id: String::new(),
             http,
             state_dir: PathBuf::new(),
+            token_file: "token.bin",
+            user_file: "user.json",
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(None),
             test_access_token: Some("synka-loopback-test-token".to_string()),
@@ -203,6 +222,8 @@ impl Auth {
             client_id,
             http,
             state_dir: PathBuf::new(),
+            token_file: "token.bin",
+            user_file: "user.json",
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(None),
             #[cfg(test)]
@@ -379,11 +400,11 @@ impl Auth {
     // ---- internals -------------------------------------------------------------------------
 
     fn token_path(&self) -> PathBuf {
-        self.state_dir.join("token.bin")
+        self.state_dir.join(self.token_file)
     }
 
     fn user_path(&self) -> PathBuf {
-        self.state_dir.join("user.json")
+        self.state_dir.join(self.user_file)
     }
 
     /// Read and decrypt the stored refresh token. An unreadable blob (e.g. another Windows

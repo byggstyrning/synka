@@ -330,6 +330,7 @@ pub async fn list_hubs(api: &Api) -> Result<Vec<HubInfo>, ApiError> {
                 id: r.id.clone(),
                 name: r.attributes.name.clone().unwrap_or_default(),
                 region: r.attributes.region.clone(),
+                provider: Provider::Acc,
             });
         }
     })
@@ -352,6 +353,8 @@ pub async fn list_projects(api: &Api, hub_id: &str) -> Result<Vec<ProjectInfo>, 
                 name: r.attributes.name.clone().unwrap_or_default(),
                 root_folder_urn: Some(root.id.clone()),
                 scopes: r.attributes.scopes.clone().unwrap_or_default(),
+                provider: Provider::Acc,
+                meta: None,
             });
         }
     })
@@ -383,6 +386,8 @@ pub async fn get_project(
             .as_ref()
             .map(|d| d.id.clone()),
         scopes: s.data.attributes.scopes.clone().unwrap_or_default(),
+        provider: Provider::Acc,
+        meta: None,
     })
 }
 
@@ -460,6 +465,13 @@ pub(crate) struct UploadInfo {
 }
 
 impl UploadInfo {
+    /// Upload target without ACC's restrictions (no MIME type, not a cloud model): what a
+    /// provider without such metadata reports.
+    #[allow(dead_code)]
+    pub(crate) fn generic() -> Self {
+        Self::default()
+    }
+
     fn from_version(version: &Resource) -> Self {
         let attrs = &version.attributes;
         let mime_type = attrs
@@ -920,6 +932,8 @@ mod tests {
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: Provider::Acc,
+            meta: None,
         }
     }
 

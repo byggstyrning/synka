@@ -4,9 +4,10 @@ use crate::auth::{Auth, UserInfo};
 use crate::config::Config;
 use crate::http::Api;
 use crate::ipc::IpcHub;
-use crate::model::{now_ms, HubInfo, ProjectInfo};
+use crate::model::{now_ms, HubInfo, ProjectInfo, Provider};
 use crate::paths::Paths;
 use crate::store::Store;
+use crate::streambim_auth::StreamBimAuth;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -18,8 +19,15 @@ pub struct Ctx {
     pub settings: RwLock<Config>,
     pub paths: Paths,
     pub store: Arc<Store>,
+    /// ACC account (APS OAuth).
     pub auth: Arc<Auth>,
     pub api: Api,
+    /// StreamBIM account (its own login, see `crate::streambim_auth`).
+    pub streambim: Arc<StreamBimAuth>,
+    pub streambim_api: Api,
+    /// Interaxo account: an `Auth` with the Interaxo OIDC spec (empty client id until configured).
+    pub interaxo: Arc<Auth>,
+    pub interaxo_api: Api,
     pub ui: UiSender,
 }
 
@@ -30,6 +38,42 @@ impl Ctx {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The API client of one provider's account.
+    #[allow(dead_code)]
+    pub fn api_for(&self, p: Provider) -> &Api {
+        match p {
+            Provider::Acc => &self.api,
+            Provider::StreamBim => &self.streambim_api,
+            Provider::Interaxo => &self.interaxo_api,
+        }
+    }
+
+    /// True when that provider's account has a usable session.
+    #[allow(dead_code)]
+    pub fn signed_in(&self, p: Provider) -> bool {
+        match p {
+            Provider::Acc => self.auth.is_signed_in(),
+            Provider::StreamBim => self.streambim.is_signed_in(),
+            Provider::Interaxo => self.interaxo.is_signed_in(),
+        }
+    }
+
+    /// True when at least one provider is signed in.
+    #[allow(dead_code)]
+    pub fn any_signed_in(&self) -> bool {
+        Provider::ALL.into_iter().any(|p| self.signed_in(p))
+    }
+
+    /// The signed-in user of one provider, if any.
+    #[allow(dead_code)]
+    pub fn user_for(&self, p: Provider) -> Option<UserInfo> {
+        match p {
+            Provider::Acc => self.auth.user(),
+            Provider::StreamBim => self.streambim.user(),
+            Provider::Interaxo => self.interaxo.user(),
+        }
     }
 }
 
