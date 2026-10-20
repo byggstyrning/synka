@@ -751,7 +751,7 @@ All `GET` operations on collections accept:
 | `skip` | number | `?skip=1000` | Offset |
 | `sort` | string | `?sort=-name` | Sort field. A `-` prefix means descending |
 
-- Collections return a **bare JSON array** with no total count, no `next` link and no `Link` header documented. Page until a page returns fewer than `limit` items.
+- Collections return a **bare JSON array** with no total count, no `next` link and no `Link` header documented. A page shorter than `limit` does not prove the end if the server caps `limit` lower; Synka pages until an empty page and de-duplicates by `id`.
 - Exception: activities return `{ "items": [...], "has_more": bool }`. [DOC #activities-list-activities-response]
 - Default `limit` and maximum `limit`: [UNDOCUMENTED]. The docs' own example uses `limit=1000`. The mentionable-authorities endpoint documents a default of 100. Always pass an explicit `limit` (e.g. 500) and a stable `sort` (e.g. `sort=id`) so offset paging is deterministic.
 - Offset paging over a changing folder can skip or duplicate items. Reconcile by `id`.

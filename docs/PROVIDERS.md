@@ -26,9 +26,10 @@ only decides what its hubs, projects and top folders are.
   account folder: `StreamBIM`, `Interaxo – <community name>`.
 - **Top folders**: non-ACC projects have exactly one top folder named `Dokument`, whose id is
   the provider's root folder id (StreamBIM `0`, Interaxo `room.content.root_id`).
-- **Item ids** stay provider-native strings (StreamBIM folder/document ids such as `"7"`/`"1002"`,
-  Interaxo content UUIDs). They are unique per project, which is all the store needs
-  (`PRIMARY KEY(pid, id)`). Temporary ids keep the `local-` prefix.
+- **Item ids** are provider-native strings, unique per project, which is all the store needs
+  (`PRIMARY KEY(pid, id)`): StreamBIM folder ids as the server gives them (`"7"`, root `"0"`)
+  and document ids with a `d` prefix (`"d1002"`, because folders and documents are numbered
+  separately), Interaxo content UUIDs. Temporary ids keep the `local-` prefix.
 - The identity blob, sync root and Cloud Files code do not change.
 
 ## Data model additions (`src/model.rs`)
@@ -133,10 +134,13 @@ arguments of `create_item`/`create_version`.
 
 Non-ACC providers cannot separate "bytes stored" from "item committed" the way OSS does, so:
 
-- `create_storage` returns the marker `"<provider>:pending"` without a network call;
+- `create_storage` returns a marker `"<provider>:pending:<random>"`, unique per attempt, without
+  a network call (`remote::intent_proves_commit` is false for these providers: the marker never
+  counts as proof that a version was committed);
 - `upload_file` is a no-op;
 - `create_item` / `create_version` upload the bytes from `path` and commit, reporting
-  `progress`, and return the new item / `(remote_version, storage_urn)`.
+  `progress`, and return the new item / `(remote_version, storage_urn)`; the engine stores that
+  handle in `storage_urn` and leaves `version_urn` empty.
 
 A lost commit reply cannot be matched to the intent marker on these providers (the listing
 never returns `<provider>:pending`), so a retry after a crash in that window can create one
@@ -155,7 +159,7 @@ stays local. `Caps` lets the engine skip work it knows will be refused.
 | new file / new version | yes | yes | yes |
 | create folder | yes | yes | **no** (API has none) |
 | rename / move | yes | yes | **no** (API has none) |
-| delete | yes (soft) | yes (`is-deleted` PATCH, soft) | yes (`DELETE`) |
+| delete | yes (soft) | yes (`is-deleted` PATCH, soft) | yes (`DELETE`); a folder holding registers, entries or links is refused |
 | lock (reserve) | yes | no | no (read-only `lock_info`) |
 | web link | yes | project link | room link (unofficial route) |
 | ranged download | yes | no (undocumented) | no (undocumented) |
@@ -233,6 +237,10 @@ jobs wait as if offline) and leaves its folders in place.
 - `projects.hubs[].provider`.
 - Settings: `interaxo_client_id`, `interaxo_redirect_uri`, `interaxo_client_secret_set`,
   `providers` (`["acc","streambim","interaxo"]`).
+
+Listings of both providers page until an empty page (StreamBIM: until `meta.total` when
+present), drop repeated ids and stop at 1000 pages, so a server that caps the page size cannot
+silently truncate a folder.
 
 ## What is not supported (yet)
 
