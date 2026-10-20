@@ -4,7 +4,7 @@
 //!
 //! A room's calls go to its own API base (`Meta::base`, one of `HOSTS`). Bodies are plain
 //! JSON, not JSON:API. Listings take `limit`, `skip` and `sort=id` and answer a bare array with
-//! no total: a page shorter than `PAGE` is the last one.
+//! no total. A listing is read until an empty page: a server may cap `limit` below `PAGE`.
 //!
 //! Interaxo's public API has no folder create, rename or move, and no file locks. Those calls
 //! return `ApiError::Unsupported`; the engine checks `remote::caps` before it asks.
@@ -19,15 +19,19 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
 /// The two API hosts. One token works on both, and a community lives on one of them.
 const HOSTS: [&str; 2] = ["https://api.interaxo.com/v1", "https://api.interaxo.se/v1"];
-/// Page size of every listing. A shorter page is the last one.
+/// Page size asked for in every listing. The server may send fewer; only an empty page ends one.
 const PAGE: usize = 500;
+/// Pages one listing may take before it is refused (at most `MAX_PAGES * PAGE` items).
+const MAX_PAGES: usize = 1000;
 /// Prefix of hub ids, project ids and storage handles.
 const PREFIX: &str = "interaxo:";
 /// What `create_storage` returns: the bytes travel with the commit (docs/PROVIDERS.md).
@@ -36,6 +40,12 @@ const PENDING: &str = "interaxo:pending";
 const TOP_NAME: &str = "Dokument";
 /// Bytes per read while a file is sent; progress is reported once per read.
 const UPLOAD_CHUNK: usize = 256 * 1024;
+/// Overall cap of one download: the same as `api::oss` uses for its downloads (private there).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// An upload gets this much time, plus the time its bytes take at `UPLOAD_MIN_RATE`.
+const UPLOAD_BASE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The slowest rate an upload is planned for: 256 KiB/s.
+const UPLOAD_MIN_RATE: u64 = 256 * 1024;
 const META_ERROR: &str =
     "Interaxo-projektets uppgifter saknas eller är ogiltiga. Ta bort projektet och lägg till det igen.";
 
@@ -158,17 +168,113 @@ struct Content {
     lock_info: Option<LockInfo>,
 }
 
-/// Every item of a collection, page by page. `skip` is the number of items read so far.
-async fn list_all<T: DeserializeOwned>(api: &Api, url: &str) -> Result<Vec<T>, ApiError> {
+impl Listed for Community {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Listed for Room {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Listed for Content {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// A listed object, told apart from the others by its id.
+trait Listed {
+    fn id(&self) -> &str;
+}
+
+/// Every item of a collection, page by page (see `list_pages`).
+async fn list_all<T: Listed + DeserializeOwned>(api: &Api, url: &str) -> Result<Vec<T>, ApiError> {
+    list_pages(url, move |page_url: String| async move {
+        api.json::<Vec<T>>(Method::GET, &page_url, None)
+            .await
+            .map_err(scrub)
+    })
+    .await
+}
+
+/// Reads a listing until a page comes back empty. A server may cap `limit` below `PAGE`, so a
+/// short page is not the last one. `skip` counts the raw items the server has sent, which keeps
+/// it on the server's offsets when an item repeats across pages; repeats are dropped by `id`.
+async fn list_pages<T, F, Fut>(url: &str, fetch: F) -> Result<Vec<T>, ApiError>
+where
+    T: Listed,
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Vec<T>, ApiError>>,
+{
     let mut out = Vec::new();
-    loop {
-        let page_url = format!("{url}?limit={PAGE}&skip={}&sort=id", out.len());
-        let page: Vec<T> = api.json(Method::GET, &page_url, None).await?;
-        let n = page.len();
-        out.extend(page);
-        if n < PAGE {
+    let mut seen = HashSet::new();
+    let mut skip = 0usize;
+    for _ in 0..MAX_PAGES {
+        let page = fetch(format!("{url}?limit={PAGE}&skip={skip}&sort=id")).await?;
+        if page.is_empty() {
             return Ok(out);
         }
+        skip += page.len();
+        for item in page {
+            if seen.insert(item.id().to_string()) {
+                out.push(item);
+            }
+        }
+    }
+    Err(ApiError::Message(
+        "Interaxo: för många sidor i listningen".into(),
+    ))
+}
+
+/// Read timeout of one metadata call: the same as `http::REQUEST_TIMEOUT` (private there).
+const METADATA_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// `list_all` through `get_no_reauth`, for the hub probe.
+async fn probe_all<T: Listed + DeserializeOwned>(api: &Api, url: &str) -> Result<Vec<T>, ApiError> {
+    list_pages(url, move |page_url: String| async move {
+        get_no_reauth::<Vec<T>>(api, &page_url).await
+    })
+    .await
+}
+
+/// One GET with the current bearer token, and no sign-in refresh on 401. The hub probe uses it:
+/// a host that does not know the user answers 401, and a refresh would not change that answer.
+async fn get_no_reauth<T: DeserializeOwned>(api: &Api, url: &str) -> Result<T, ApiError> {
+    let token = api.bearer().await?;
+    let resp = api
+        .client()
+        .get(url)
+        .bearer_auth(&token)
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .await
+        .map_err(transport)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(ApiError::Status {
+            status: status.as_u16(),
+            body: crate::http::error_body(resp).await,
+        });
+    }
+    let bytes = resp.bytes().await.map_err(transport)?;
+    serde_json::from_slice(&bytes).map_err(|e| ApiError::Decode(e.to_string()))
+}
+
+/// Drops the URL from a reqwest error. Request URLs are the place a token could end up, so
+/// nothing that reaches an error text or a log keeps one.
+fn transport(e: reqwest::Error) -> ApiError {
+    ApiError::Transport(e.without_url())
+}
+
+/// `transport` for an error that already is an `ApiError` (from `Api`, whose errors carry the URL).
+fn scrub(e: ApiError) -> ApiError {
+    match e {
+        ApiError::Transport(e) => transport(e),
+        other => other,
     }
 }
 
@@ -180,28 +286,30 @@ async fn room_root(
     room_id: &str,
 ) -> Result<Option<String>, ApiError> {
     let url = format!("{base}/{}/rooms/{}", dm::pct(community), dm::pct(room_id));
-    let room: Room = api.json(Method::GET, &url, None).await?;
+    let room: Room = api.json(Method::GET, &url, None).await.map_err(scrub)?;
     Ok(room.root())
 }
 
 // ---- hubs and projects ------------------------------------------------------------------------
 
 /// The user's communities on both hosts. A community is listed under the host it lives on.
-/// A 401, 403 or 404 from a host means that host does not know the community, not that the
-/// sign-in failed.
+/// A 403 or 404 from a host means that host does not know the community. A 401 means the host
+/// refused the sign-in; when both hosts do, the sign-in has expired and the error says so.
 pub async fn list_hubs(api: &Api) -> Result<Vec<HubInfo>, ApiError> {
     list_hubs_on(api, &HOSTS).await
 }
 
 /// `list_hubs` over the given API bases, in order: a community on two hosts is kept once,
-/// under the first host.
+/// under the first host. A host that answers 401 is not asked again with a refreshed token. When
+/// every host answers 401, the sign-in has expired and that is the error.
 async fn list_hubs_on(api: &Api, bases: &[&str]) -> Result<Vec<HubInfo>, ApiError> {
     let mut hubs = Vec::new();
     let mut seen = HashSet::new();
     let mut answered = false;
+    let mut refused = 0usize;
     let mut failure = None;
     for base in bases {
-        match list_all::<Community>(api, &format!("{base}/communities")).await {
+        match probe_all::<Community>(api, &format!("{base}/communities")).await {
             Ok(communities) => {
                 answered = true;
                 for community in communities {
@@ -223,9 +331,12 @@ async fn list_hubs_on(api: &Api, bases: &[&str]) -> Result<Vec<HubInfo>, ApiErro
                     });
                 }
             }
+            Err(ApiError::Status { status: 401, .. }) => {
+                refused += 1;
+                debug!(host = %base, "inloggningen godtas inte på den här värden");
+            }
             Err(ApiError::Status {
-                status: 401 | 403 | 404,
-                ..
+                status: 403 | 404, ..
             }) => debug!(host = %base, "inga gemenskaper på den här värden"),
             Err(e) => {
                 warn!(host = %base, status = ?e.status(), "kunde inte lista gemenskaper");
@@ -235,6 +346,9 @@ async fn list_hubs_on(api: &Api, bases: &[&str]) -> Result<Vec<HubInfo>, ApiErro
     }
     match failure {
         Some(e) if !answered => Err(e),
+        _ if !answered && refused > 0 && refused == bases.len() => Err(ApiError::Auth(
+            anyhow::anyhow!("Interaxo-inloggningen har gått ut – logga in igen. (Session expired)"),
+        )),
         _ => Ok(hubs),
     }
 }
@@ -336,12 +450,7 @@ pub async fn folder_contents(
     folder_id: &str,
 ) -> Result<Vec<Item>, ApiError> {
     let meta = meta_of(p)?;
-    let url = format!(
-        "{}/content/{}/children",
-        meta.room_url(),
-        dm::pct(folder_id)
-    );
-    let children: Vec<Content> = list_all(api, &url).await?;
+    let children: Vec<Content> = list_all(api, &children_url(&meta, folder_id)).await?;
     Ok(children
         .into_iter()
         .filter_map(|c| content_item(p.pid, c, Some(folder_id.to_string())))
@@ -442,7 +551,7 @@ pub(crate) async fn get_item_upload_info(
 ) -> Result<(Item, UploadInfo), ApiError> {
     let meta = meta_of(p)?;
     let url = format!("{}/content/{}", meta.room_url(), dm::pct(id));
-    let content: Content = api.json(Method::GET, &url, None).await?;
+    let content: Content = api.json(Method::GET, &url, None).await.map_err(scrub)?;
     let parent = content.parent_id.clone();
     let item = content_item(p.pid, content, parent)
         .filter(|item| matches!(item.kind, Kind::File))
@@ -497,7 +606,9 @@ pub async fn open_download(
         ));
     }
     let url = d.url.as_str();
-    api.send_custom(|client| Ok(client.get(url))).await
+    api.send_custom(|client| Ok(client.get(url).timeout(DOWNLOAD_TIMEOUT)))
+        .await
+        .map_err(scrub)
 }
 
 pub async fn open_range(
@@ -536,7 +647,10 @@ pub async fn upload_file(
     Ok(())
 }
 
-/// A new file in `parent_id`: the bytes of `path` are sent as the multipart part `file`.
+/// A new file in `parent_id`: the bytes of `path` are sent as the multipart part `file`. A file of
+/// the same name (ignoring case) that is already there is refused before the bytes are sent, with
+/// the 409 the engine treats as a name collision. Interaxo would otherwise store the new file under
+/// another name.
 pub async fn create_item(
     api: &Api,
     p: &Project,
@@ -548,14 +662,20 @@ pub async fn create_item(
 ) -> Result<Item, ApiError> {
     check_name(name)?;
     let meta = meta_of(p)?;
-    let url = format!(
-        "{}/content/{}/children",
-        meta.room_url(),
-        dm::pct(parent_id)
-    );
+    let url = children_url(&meta, parent_id);
+    let siblings: Vec<Content> = list_all(api, &url).await?;
+    if siblings
+        .iter()
+        .any(|c| c.kind == "file" && same_name(&c.name, name))
+    {
+        return Err(ApiError::Status {
+            status: 409,
+            body: "name exists".into(),
+        });
+    }
     let created = upload(api, &url, name, path, progress).await?;
     if created.name != name {
-        info!(sent = %name, stored = %created.name, "Interaxo gav filen ett annat namn");
+        warn!(sent = %name, stored = %created.name, "Interaxo gav filen ett annat namn");
     }
     content_item(p.pid, created, Some(parent_id.to_string()))
         .ok_or_else(|| ApiError::Decode("svaret från Interaxo är inte en fil".into()))
@@ -584,6 +704,16 @@ pub async fn create_version(
         .filter(|label| !label.is_empty())
         .ok_or_else(|| ApiError::Message("Interaxo returnerade ingen version.".into()))?;
     Ok((version_number(&label), format!("{PREFIX}{id}:{label}")))
+}
+
+/// The overall timeout of an upload of `bytes`: the base time, plus the time at the planned rate.
+fn upload_timeout(bytes: u64) -> Duration {
+    UPLOAD_BASE_TIMEOUT + Duration::from_secs(bytes / UPLOAD_MIN_RATE)
+}
+
+/// Two names of one folder are the same when they differ only in case.
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// Interaxo's file-name rule: no leading dot, and none of ' ; < > " \ | / * ? :
@@ -635,12 +765,13 @@ async fn upload(
             .post(url)
             .header(CONTENT_TYPE, content_type.as_str())
             .header(CONTENT_LENGTH, length.to_string())
-            .body(body))
+            .body(body)
+            .timeout(upload_timeout(total)))
     });
     tokio::pin!(send);
     let resp = loop {
         tokio::select! {
-            resp = &mut send => break resp?,
+            resp = &mut send => break resp.map_err(scrub)?,
             Some(sent) = sent_rx.recv() => progress(sent, total),
         }
     };
@@ -648,7 +779,7 @@ async fn upload(
         progress(sent, total);
     }
     progress(total, total);
-    let bytes = resp.bytes().await?;
+    let bytes = resp.bytes().await.map_err(transport)?;
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Decode(e.to_string()))
 }
 
@@ -750,8 +881,78 @@ pub async fn delete_file(api: &Api, p: &Project, id: &str) -> Result<(), ApiErro
     delete_content(api, p, id).await
 }
 
+/// Bounds of the walk a folder delete makes first: the items it reads and the folder levels.
+const WALK_MAX_ITEMS: usize = 20_000;
+const WALK_MAX_DEPTH: usize = 64;
+
+/// What the walk of a folder found.
+enum Walk {
+    /// Only files and simple folders, within the bounds: the folder may be deleted.
+    Synced,
+    /// An item Synka does not show (register, entry, link, active or workflow folder).
+    Unsynced,
+    /// More items or folder levels than the walk reads.
+    TooLarge,
+}
+
+/// Deletes a folder with everything in it, but only when Synka shows all of it. Interaxo deletes
+/// a folder with its content, and the content of active and workflow folders, entries and links
+/// is not synced, so a folder holding any of those is refused. A folder already gone is done.
 pub async fn delete_folder(api: &Api, p: &Project, folder_id: &str) -> Result<(), ApiError> {
-    delete_content(api, p, folder_id).await
+    let meta = meta_of(p)?;
+    // The name is for the refusal text.
+    let url = format!("{}/content/{}", meta.room_url(), dm::pct(folder_id));
+    let folder: Content = match api.json(Method::GET, &url, None).await {
+        Ok(folder) => folder,
+        Err(ApiError::Status { status: 404, .. }) => return Ok(()),
+        Err(e) => return Err(scrub(e)),
+    };
+    let name = if folder.name.trim().is_empty() {
+        folder_id
+    } else {
+        folder.name.as_str()
+    };
+    match walk(api, &meta, folder_id).await? {
+        Walk::Synced => delete_content(api, p, folder_id).await,
+        Walk::Unsynced => Err(ApiError::Unsupported(format!(
+            "Interaxo-mappen {name} innehåller register, poster eller länkar som inte synkas. Ta bort den i Interaxo."
+        ))),
+        Walk::TooLarge => Err(ApiError::Unsupported(format!(
+            "Interaxo-mappen {name} är för stor för att kontrolleras. Ta bort den i Interaxo."
+        ))),
+    }
+}
+
+/// The raw children of `folder_id` and of every folder below it, of any type. Stops at the first
+/// item that is not a file or a simple folder, or when a bound is passed.
+async fn walk(api: &Api, meta: &Meta, folder_id: &str) -> Result<Walk, ApiError> {
+    let mut pending = vec![(folder_id.to_string(), 0usize)];
+    let mut items = 0usize;
+    while let Some((folder, depth)) = pending.pop() {
+        let children: Vec<Content> = list_all(api, &children_url(meta, &folder)).await?;
+        for child in children {
+            items += 1;
+            if items > WALK_MAX_ITEMS {
+                return Ok(Walk::TooLarge);
+            }
+            match child.kind.as_str() {
+                "file" => {}
+                "simple-folder" if depth < WALK_MAX_DEPTH => pending.push((child.id, depth + 1)),
+                "simple-folder" => return Ok(Walk::TooLarge),
+                _ => return Ok(Walk::Unsynced),
+            }
+        }
+    }
+    Ok(Walk::Synced)
+}
+
+/// `.../content/{id}/children` of the room: the children of one folder.
+fn children_url(meta: &Meta, folder_id: &str) -> String {
+    format!(
+        "{}/content/{}/children",
+        meta.room_url(),
+        dm::pct(folder_id)
+    )
 }
 
 /// `DELETE .../content/{id}` (204). A 404 means the item is already gone.
@@ -761,7 +962,7 @@ async fn delete_content(api: &Api, p: &Project, id: &str) -> Result<(), ApiError
     match api.request(Method::DELETE, &url, None).await {
         Ok(_) => Ok(()),
         Err(ApiError::Status { status: 404, .. }) => Ok(()),
-        Err(e) => Err(e),
+        Err(e) => Err(scrub(e)),
     }
 }
 
@@ -816,7 +1017,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::Duration;
 
     /// The bearer the loopback tests receive (see `Auth::for_test`).
     const TOKEN: &str = "Bearer synka-loopback-test-token";
@@ -960,11 +1160,14 @@ mod tests {
 
     #[tokio::test]
     async fn list_hubs_skips_a_host_that_does_not_know_the_community() {
-        let com = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
-        let se = Server::scripted(vec![json_reply(json!([
-            {"id": "example-corp", "name": "Example Corp"},
-            {"id": "other", "name": "Other"}
-        ]))])
+        let com = Server::scripted(vec![Fault::reply(401, "")]).await;
+        let se = Server::scripted(vec![
+            json_reply(json!([
+                {"id": "example-corp", "name": "Example Corp"},
+                {"id": "other", "name": "Other"}
+            ])),
+            json_reply(json!([])),
+        ])
         .await;
         let (com_base, se_base) = (format!("{}/v1", com.origin), format!("{}/v1", se.origin));
         let hubs = list_hubs_on(
@@ -980,10 +1183,10 @@ mod tests {
         assert_eq!(hubs[0].region.as_deref(), Some(se_base.as_str()));
         assert_eq!(hubs[0].provider, Provider::Interaxo);
         assert_eq!(hubs[1].id, "interaxo:other");
-        // The 401 is retried once with a fresh token, then counts as "not on this host".
-        assert_eq!(com.requests().len(), 2);
+        // A 401 is not retried with a refreshed token: it counts as "not on this host".
+        assert_eq!(com.requests().len(), 1);
         let se_requests = se.requests();
-        assert_eq!(se_requests.len(), 1);
+        assert_eq!(se_requests.len(), 2);
         assert_eq!(
             se_requests[0].target,
             "/v1/communities?limit=500&skip=0&sort=id"
@@ -993,8 +1196,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_hubs_lists_a_community_on_both_hosts_once_under_the_first() {
-        let com = Server::scripted(vec![json_reply(json!([{"id": "c1", "name": "Com"}]))]).await;
-        let se = Server::scripted(vec![json_reply(json!([{"id": "c1", "name": "Se"}]))]).await;
+        let com = Server::scripted(vec![
+            json_reply(json!([{"id": "c1", "name": "Com"}])),
+            json_reply(json!([])),
+        ])
+        .await;
+        let se = Server::scripted(vec![
+            json_reply(json!([{"id": "c1", "name": "Se"}])),
+            json_reply(json!([])),
+        ])
+        .await;
         let (com_base, se_base) = (format!("{}/v1", com.origin), format!("{}/v1", se.origin));
         let hubs = list_hubs_on(
             &api_for(&com.origin),
@@ -1010,7 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn list_hubs_is_empty_when_no_host_knows_the_user_but_reports_a_real_failure() {
         let api = api_for("http://127.0.0.1:9");
-        let a = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
+        let a = Server::scripted(vec![Fault::reply(401, "")]).await;
         let b = Server::scripted(vec![Fault::reply(404, "")]).await;
         let (a_base, b_base) = (format!("{}/v1", a.origin), format!("{}/v1", b.origin));
         let hubs = list_hubs_on(&api, &[a_base.as_str(), b_base.as_str()])
@@ -1019,12 +1230,27 @@ mod tests {
         assert!(hubs.is_empty());
 
         let c = Server::scripted(vec![Fault::reply(400, "{\"code\":\"validation_error\"}")]).await;
-        let d = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
+        let d = Server::scripted(vec![Fault::reply(401, "")]).await;
         let (c_base, d_base) = (format!("{}/v1", c.origin), format!("{}/v1", d.origin));
         let err = list_hubs_on(&api, &[c_base.as_str(), d_base.as_str()])
             .await
             .unwrap_err();
         assert_eq!(err.status(), Some(400));
+    }
+
+    #[tokio::test]
+    async fn list_hubs_asks_the_user_to_sign_in_again_when_every_host_refuses_the_token() {
+        let api = api_for("http://127.0.0.1:9");
+        let a = Server::scripted(vec![Fault::reply(401, "")]).await;
+        let b = Server::scripted(vec![Fault::reply(401, "")]).await;
+        let (a_base, b_base) = (format!("{}/v1", a.origin), format!("{}/v1", b.origin));
+        let err = list_hubs_on(&api, &[a_base.as_str(), b_base.as_str()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Auth(_)), "{err:?}");
+        // One request per host: no refresh and no second attempt.
+        assert_eq!(a.count(), 1);
+        assert_eq!(b.count(), 1);
     }
 
     #[tokio::test]
@@ -1051,6 +1277,7 @@ mod tests {
             "/v1/example-corp/rooms?limit=500&skip=500&sort=id" => {
                 Fault::reply(200, last_body.clone())
             }
+            "/v1/example-corp/rooms?limit=500&skip=502&sort=id" => Fault::reply(200, "[]"),
             "/v1/example-corp/rooms/nofix" => json_reply(
                 json!({"id": "nofix", "name": "No Fix", "content": {"root_id": "root-nofix"}}),
             ),
@@ -1094,6 +1321,7 @@ mod tests {
             [
                 "/v1/example-corp/rooms?limit=500&skip=0&sort=id",
                 "/v1/example-corp/rooms?limit=500&skip=500&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=502&sort=id",
                 "/v1/example-corp/rooms/nofix",
             ]
         );
@@ -1107,6 +1335,7 @@ mod tests {
         ]);
         let server = Server::scripted(vec![
             json_reply(rooms),
+            json_reply(json!([])),
             Fault::reply(403, "{\"code\":\"forbidden\"}"),
         ])
         .await;
@@ -1119,6 +1348,110 @@ mod tests {
         let projects = list_projects(&api_for(&server.origin), &hub).await.unwrap();
         let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["interaxo:example-corp:open"]);
+    }
+
+    /// The number of query parameter `key` in a request target (`skip=100` gives 100).
+    fn query_number(target: &str, key: &str) -> Option<usize> {
+        let prefix = format!("{key}=");
+        target
+            .split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(prefix.as_str())?.parse().ok())
+    }
+
+    /// The page a server answers for `target` when it caps `limit` at `cap`: from `skip`, at
+    /// most `cap` items.
+    fn capped_page(target: &str, items: &[Value], cap: usize) -> Fault {
+        let skip = query_number(target, "skip").unwrap_or(0);
+        let limit = query_number(target, "limit").unwrap_or(usize::MAX).min(cap);
+        let page: Vec<Value> = items.iter().skip(skip).take(limit).cloned().collect();
+        json_reply(Value::Array(page))
+    }
+
+    fn listed_room(id: &str) -> Value {
+        json!({"id": id, "name": id, "content": {"root_id": format!("root-{id}")}})
+    }
+
+    fn hub_at(base: &str) -> HubInfo {
+        HubInfo {
+            id: "interaxo:example-corp".into(),
+            name: "Interaxo – Example Corp".into(),
+            region: Some(base.to_string()),
+            provider: Provider::Interaxo,
+        }
+    }
+
+    #[tokio::test]
+    async fn listings_read_past_a_server_that_caps_the_page_size() {
+        let rooms: Vec<Value> = (0..250).map(|i| listed_room(&format!("r{i}"))).collect();
+        let server =
+            Server::new(move |req: &Request, _| capped_page(&req.target, &rooms, 100)).await;
+        let hub = hub_at(&format!("{}/v1", server.origin));
+        let projects = list_projects(&api_for(&server.origin), &hub).await.unwrap();
+
+        assert_eq!(projects.len(), 250);
+        assert_eq!(projects[0].id, "interaxo:example-corp:r0");
+        assert_eq!(projects[249].id, "interaxo:example-corp:r249");
+        let targets: Vec<String> = server.requests().into_iter().map(|r| r.target).collect();
+        assert_eq!(
+            targets,
+            [
+                "/v1/example-corp/rooms?limit=500&skip=0&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=100&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=200&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=250&sort=id",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn listings_drop_an_item_repeated_across_pages() {
+        let server = Server::new(|req: &Request, _| match req.target.as_str() {
+            "/v1/example-corp/rooms?limit=500&skip=0&sort=id" => json_reply(json!([
+                listed_room("r0"),
+                listed_room("r1"),
+                listed_room("r2")
+            ])),
+            // r2 moved from the end of the first page to the start of this one.
+            "/v1/example-corp/rooms?limit=500&skip=3&sort=id" => {
+                json_reply(json!([listed_room("r2"), listed_room("r3")]))
+            }
+            "/v1/example-corp/rooms?limit=500&skip=5&sort=id" => json_reply(json!([])),
+            _ => Fault::reply(404, ""),
+        })
+        .await;
+        let hub = hub_at(&format!("{}/v1", server.origin));
+        let projects = list_projects(&api_for(&server.origin), &hub).await.unwrap();
+
+        let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "interaxo:example-corp:r0",
+                "interaxo:example-corp:r1",
+                "interaxo:example-corp:r2",
+                "interaxo:example-corp:r3",
+            ]
+        );
+        // The offset follows the raw items sent, so the repeat does not shift the next page.
+        let targets: Vec<String> = server.requests().into_iter().map(|r| r.target).collect();
+        assert_eq!(targets.len(), 3);
+        assert!(targets[2].contains("skip=5&"), "{targets:?}");
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_ends_is_refused() {
+        let page = json_reply(json!([listed_room("r0")]));
+        let server = Server::new(move |_, _| page.clone()).await;
+        let hub = hub_at(&format!("{}/v1", server.origin));
+        let err = list_projects(&api_for(&server.origin), &hub)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Message(text) if text == "Interaxo: för många sidor i listningen"),
+            "{err:?}"
+        );
+        assert_eq!(server.count(), MAX_PAGES);
     }
 
     #[tokio::test]
@@ -1215,11 +1548,12 @@ mod tests {
             {"type": "external-link", "id": "l-2", "parent_id": "root-1", "name": "Extern",
              "url": "https://example.com"}
         ]);
-        let server = Server::scripted(vec![json_reply(children)]).await;
+        let server = Server::scripted(vec![json_reply(children), json_reply(json!([]))]).await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let items = folder_contents(&api_for(&server.origin), &p, "root-1")
             .await
             .unwrap();
+        assert_eq!(server.count(), 2, "a listing ends on an empty page");
 
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["Ritningar", "Plan.pdf", "Notes.txt", "Lock.txt"]);
@@ -1314,12 +1648,15 @@ mod tests {
         let dir = TempDir::new("create");
         let path = dir.0.join("abc.txt");
         std::fs::write(&path, b"hello interaxo").unwrap();
-        let server = Server::scripted(vec![json_reply(json!({
-            "type": "file", "id": "new-1", "parent_id": "folder-1", "name": "abc.txt",
-            "original_name": "abc.txt", "created": "2026-04-01T10:00:00.000Z",
-            "last_modified": "2026-04-01T10:00:00.000Z", "version": "1.0",
-            "mime_type": "text/plain", "file_size": 14
-        }))])
+        let server = Server::scripted(vec![
+            json_reply(json!([])),
+            json_reply(json!({
+                "type": "file", "id": "new-1", "parent_id": "folder-1", "name": "abc.txt",
+                "original_name": "abc.txt", "created": "2026-04-01T10:00:00.000Z",
+                "last_modified": "2026-04-01T10:00:00.000Z", "version": "1.0",
+                "mime_type": "text/plain", "file_size": 14
+            })),
+        ])
         .await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let calls = Mutex::new(Vec::new());
@@ -1346,8 +1683,9 @@ mod tests {
         assert_eq!(item.size, 14);
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET", "the folder is listed first");
+        let request = &requests[1];
         assert_eq!(request.method, "POST");
         assert_eq!(
             request.target,
@@ -1376,10 +1714,13 @@ mod tests {
         let dir = TempDir::new("renamed");
         let path = dir.0.join("abc.txt");
         std::fs::write(&path, b"x").unwrap();
-        let server = Server::scripted(vec![json_reply(json!({
-            "type": "file", "id": "new-2", "parent_id": "folder-1", "name": "abc (1).txt",
-            "version": "1.0", "file_size": 1
-        }))])
+        let server = Server::scripted(vec![
+            json_reply(json!([])),
+            json_reply(json!({
+                "type": "file", "id": "new-2", "parent_id": "folder-1", "name": "abc (1).txt",
+                "version": "1.0", "file_size": 1
+            })),
+        ])
         .await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let item = create_item(
@@ -1395,6 +1736,135 @@ mod tests {
         .unwrap();
         assert_eq!(item.name, "abc (1).txt");
         assert_eq!(item.id, "new-2");
+    }
+
+    #[tokio::test]
+    async fn create_item_refuses_a_name_a_file_already_has_before_sending_bytes() {
+        let dir = TempDir::new("taken");
+        let path = dir.0.join("abc.txt");
+        std::fs::write(&path, b"x").unwrap();
+        // A folder of the same name does not count; a file of it in another case does.
+        let server = Server::scripted(vec![
+            json_reply(json!([
+                {"type": "simple-folder", "id": "f-9", "name": "Abc.txt"},
+                {"type": "file", "id": "d-9", "name": "ABC.TXT", "version": "1.0", "file_size": 1}
+            ])),
+            json_reply(json!([])),
+        ])
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let err = create_item(
+            &api_for(&server.origin),
+            &p,
+            "folder-1",
+            "abc.txt",
+            "interaxo:pending",
+            &path,
+            &|_: u64, _: u64| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status(), Some(409));
+        assert!(
+            matches!(&err, ApiError::Status { body, .. } if body == "name exists"),
+            "{err:?}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "only the listing is read");
+        assert!(requests.iter().all(|r| r.method == "GET"));
+    }
+
+    #[tokio::test]
+    async fn create_item_is_not_blocked_by_a_folder_of_the_same_name() {
+        let dir = TempDir::new("folder-name");
+        let path = dir.0.join("abc.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let server = Server::scripted(vec![
+            json_reply(json!([{"type": "simple-folder", "id": "f-9", "name": "abc.txt"}])),
+            json_reply(json!([])),
+            json_reply(json!({
+                "type": "file", "id": "new-4", "parent_id": "folder-1", "name": "abc.txt",
+                "version": "1.0", "file_size": 1
+            })),
+        ])
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let item = create_item(
+            &api_for(&server.origin),
+            &p,
+            "folder-1",
+            "abc.txt",
+            "interaxo:pending",
+            &path,
+            &|_: u64, _: u64| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.id, "new-4");
+        assert_eq!(server.requests()[2].method, "POST");
+    }
+
+    #[test]
+    fn transfers_have_an_overall_timeout_that_grows_with_the_size() {
+        // A download has the same cap as api::oss (2 h).
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        assert_eq!(upload_timeout(0), Duration::from_secs(120));
+        assert_eq!(upload_timeout(256 * 1024 * 100), Duration::from_secs(220));
+        // 2 GiB at 256 KiB/s takes 8192 s, on top of the base time.
+        assert_eq!(upload_timeout(2 << 30), Duration::from_secs(120 + 8192));
+        assert!(upload_timeout(u64::MAX) > upload_timeout(1 << 30));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_carry_the_request_url() {
+        // Every request is cut off: a listing, a download and the hub probe all fail on the wire.
+        let cut = Server::new(|_, _| Fault::Disconnect).await;
+        let p = project(&format!("{}/v1", cut.origin), Some("root-1"));
+        let api = api_for(&cut.origin);
+        let d = download_url(&api, &p, "d-1", "interaxo:d-1:2.1")
+            .await
+            .unwrap();
+        let base = format!("{}/v1", cut.origin);
+        let mut errors = vec![
+            folder_contents(&api, &p, "folder-1").await.unwrap_err(),
+            open_download(&api, &p, &d, 0).await.unwrap_err(),
+            list_hubs_on(&api, &[base.as_str()]).await.unwrap_err(),
+        ];
+
+        // An upload is cut off after its listing has answered.
+        let dir = TempDir::new("cut-upload");
+        let path = dir.0.join("abc.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let answering = Server::new(|req: &Request, _| {
+            if req.method == "GET" {
+                json_reply(json!([]))
+            } else {
+                Fault::Disconnect
+            }
+        })
+        .await;
+        let p = project(&format!("{}/v1", answering.origin), Some("root-1"));
+        errors.push(
+            create_item(
+                &api_for(&answering.origin),
+                &p,
+                "folder-1",
+                "abc.txt",
+                "interaxo:pending",
+                &path,
+                &|_: u64, _: u64| {},
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        for err in &errors {
+            assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+            let text = format!("{err} {err:?}");
+            assert!(!text.contains("/v1/"), "{text}");
+            assert!(!text.contains("rooms"), "{text}");
+        }
     }
 
     #[tokio::test]
@@ -1519,23 +1989,163 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_the_item_and_a_missing_one_counts_as_deleted() {
-        let server = Server::scripted(vec![Fault::reply(204, ""), Fault::reply(404, "")]).await;
+        // d-1: DELETE 204. f-1: already gone (GET 404). f-2: empty, but its DELETE answers 404.
+        let server = Server::scripted(vec![
+            Fault::reply(204, ""),
+            Fault::reply(404, ""),
+            json_reply(json!({"type": "simple-folder", "id": "f-2", "name": "Tom"})),
+            json_reply(json!([])),
+            Fault::reply(404, ""),
+        ])
+        .await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let api = api_for(&server.origin);
         delete_file(&api, &p, "d-1").await.unwrap();
         delete_folder(&api, &p, "f-1").await.unwrap();
+        delete_folder(&api, &p, "f-2").await.unwrap();
 
         let requests = server.requests();
+        assert_eq!(requests.len(), 5);
         assert_eq!(requests[0].method, "DELETE");
         assert_eq!(
             requests[0].target,
             "/v1/example-corp/rooms/room-1/content/d-1"
         );
-        assert_eq!(requests[1].method, "DELETE");
+        assert_eq!(requests[1].method, "GET");
         assert_eq!(
             requests[1].target,
             "/v1/example-corp/rooms/room-1/content/f-1"
         );
+        assert_eq!(requests[4].method, "DELETE");
+        assert_eq!(
+            requests[4].target,
+            "/v1/example-corp/rooms/room-1/content/f-2"
+        );
+    }
+
+    const ROOM_CONTENT: &str = "/v1/example-corp/rooms/room-1/content";
+
+    #[tokio::test]
+    async fn delete_folder_deletes_a_folder_of_files_and_simple_folders() {
+        let server = Server::new(|req: &Request, _| {
+            match (req.method.as_str(), req.target.as_str()) {
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1") => {
+                    json_reply(json!({"type": "simple-folder", "id": "f-1", "name": "Ritningar"}))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([
+                        {"type": "file", "id": "d-1", "name": "Plan.pdf", "version": "1.0", "file_size": 1},
+                        {"type": "simple-folder", "id": "f-2", "name": "Bilagor"}
+                    ]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=2&sort=id") => {
+                    json_reply(json!([]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([
+                        {"type": "file", "id": "d-2", "name": "Bild.png", "version": "1.0", "file_size": 1}
+                    ]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=1&sort=id") => {
+                    json_reply(json!([]))
+                }
+                ("DELETE", "/v1/example-corp/rooms/room-1/content/f-1") => Fault::reply(204, ""),
+                _ => Fault::reply(404, ""),
+            }
+        })
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        delete_folder(&api_for(&server.origin), &p, "f-1")
+            .await
+            .unwrap();
+
+        // The folder and its subfolder were read; only the top folder is deleted.
+        let deletes: Vec<String> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.target)
+            .collect();
+        assert_eq!(deletes, [format!("{ROOM_CONTENT}/f-1")]);
+    }
+
+    #[tokio::test]
+    async fn delete_folder_refuses_a_folder_holding_content_synka_does_not_show() {
+        // An active folder sits in the subfolder f-2, so the top folder is refused.
+        let server = Server::new(|req: &Request, _| {
+            match (req.method.as_str(), req.target.as_str()) {
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1") => {
+                    json_reply(json!({"type": "simple-folder", "id": "f-1", "name": "Ritningar"}))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([
+                        {"type": "file", "id": "d-1", "name": "Plan.pdf", "version": "1.0", "file_size": 1},
+                        {"type": "simple-folder", "id": "f-2", "name": "Bilagor"}
+                    ]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=2&sort=id") => {
+                    json_reply(json!([]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([{"type": "active-folder", "id": "a-1", "name": "Ärenden"}]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=1&sort=id") => {
+                    json_reply(json!([]))
+                }
+                _ => Fault::reply(599, "no delete expected"),
+            }
+        })
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let err = delete_folder(&api_for(&server.origin), &p, "f-1")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Unsupported(text) if text == "Interaxo-mappen Ritningar innehåller register, poster eller länkar som inte synkas. Ta bort den i Interaxo."),
+            "{err:?}"
+        );
+        assert!(server.requests().iter().all(|r| r.method != "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn delete_folder_refuses_a_tree_deeper_than_the_walk_reads() {
+        // f-0 holds f-1, which holds f-2, and so on: the walk stops below 64 levels.
+        let mut routes = std::collections::HashMap::new();
+        for i in 0..=70usize {
+            let folder = format!("{ROOM_CONTENT}/f-{i}");
+            routes.insert(
+                folder.clone(),
+                json_reply(
+                    json!({"type": "simple-folder", "id": format!("f-{i}"), "name": "Djupt"}),
+                ),
+            );
+            routes.insert(
+                format!("{folder}/children?limit=500&skip=0&sort=id"),
+                json_reply(json!([{"type": "simple-folder", "id": format!("f-{}", i + 1), "name": "Mapp"}])),
+            );
+            routes.insert(
+                format!("{folder}/children?limit=500&skip=1&sort=id"),
+                json_reply(json!([])),
+            );
+        }
+        let server = Server::new(move |req: &Request, _| {
+            routes
+                .get(&req.target)
+                .cloned()
+                .unwrap_or_else(|| Fault::reply(404, ""))
+        })
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let err = delete_folder(&api_for(&server.origin), &p, "f-0")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Unsupported(text) if text == "Interaxo-mappen Djupt är för stor för att kontrolleras. Ta bort den i Interaxo."),
+            "{err:?}"
+        );
+        assert!(server.requests().iter().all(|r| r.method != "DELETE"));
     }
 
     #[tokio::test]
