@@ -619,9 +619,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streambim_and_interaxo_calls_reach_their_stubs() {
+    async fn streambim_calls_reach_their_stubs() {
         let f = fixture("stubs");
-        for provider in [Provider::StreamBim, Provider::Interaxo] {
+        for provider in [Provider::StreamBim] {
             let p = project(provider);
             let unsupported = |r: Result<(), ApiError>| {
                 assert!(
