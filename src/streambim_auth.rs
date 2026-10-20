@@ -32,7 +32,8 @@ const JSON_API: &str = "application/vnd.api+json";
 const NOT_SIGNED_IN: &str = "Inte inloggad på StreamBIM – logga in igen.";
 const SESSION_EXPIRED: &str = "StreamBIM-sessionen har gått ut – logga in igen. (Session expired)";
 const CODE_EXPIRED: &str = "Koden har gått ut – logga in igen.";
-const REFRESH_RETRY: &str = "StreamBIM-sessionen kunde inte förnyas: inget giltigt svar. Försök igen.";
+const REFRESH_RETRY: &str =
+    "StreamBIM-sessionen kunde inte förnyas: inget giltigt svar. Försök igen.";
 
 /// What a password login leads to.
 #[derive(Debug)]
@@ -1144,7 +1145,8 @@ mod tests {
     #[tokio::test]
     async fn temporary_refresh_failures_keep_the_session() {
         for status in [404u16, 408, 429, 500, 502, 503] {
-            let server = refresh_server(move || reply_json(status, json!({"error": "later"}))).await;
+            let server =
+                refresh_server(move || reply_json(status, json!({"error": "later"}))).await;
             let dir = TestDir::new("temporary");
             let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
             auth.login("app", "ada@example.com", "pw").await.unwrap();
@@ -1188,7 +1190,10 @@ mod tests {
             ("403", Fault::reply(403, "bad")),
             (
                 "challenge",
-                reply_json(200, json!({"result": "CHALLENGE_REQUESTED", "session": "s"})),
+                reply_json(
+                    200,
+                    json!({"result": "CHALLENGE_REQUESTED", "session": "s"}),
+                ),
             ),
         ];
         for (name, answer) in answers {
