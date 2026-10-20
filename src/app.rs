@@ -5,7 +5,7 @@ use crate::auth::{Auth, UserInfo};
 use crate::config::Config;
 use crate::http::Api;
 use crate::ipc::IpcHub;
-use crate::model::{now_ms, HubInfo, ProjectInfo, Provider};
+use crate::model::{now_ms, HubInfo, Project, ProjectInfo, Provider};
 use crate::paths::Paths;
 use crate::store::Store;
 use crate::streambim_auth::StreamBimAuth;
@@ -72,6 +72,42 @@ impl Ctx {
             Provider::Interaxo => self.interaxo.user(),
         }
     }
+
+    /// True when the provider can serve this project now: its account is signed in and, for
+    /// StreamBIM, the signed-in account is in the project's own region. A project of another
+    /// region (or of an account that was signed out) is paused like one of a signed-out provider.
+    pub fn project_connected(&self, p: &Project) -> bool {
+        if !self.signed_in(p.provider) {
+            return false;
+        }
+        match p.provider {
+            Provider::StreamBim => {
+                project_region(p).is_some() && self.streambim.region() == project_region(p)
+            }
+            Provider::Acc | Provider::Interaxo => true,
+        }
+    }
+
+    /// What the user signs in to for this project, in the words of the sign-in messages: the
+    /// provider, or "StreamBIM (<region>)" when the signed-in StreamBIM account is elsewhere.
+    pub fn sign_in_target(&self, p: &Project) -> String {
+        match project_region(p) {
+            Some(region)
+                if p.provider == Provider::StreamBim
+                    && self.signed_in(p.provider)
+                    && self.streambim.region().as_deref() != Some(region.as_str()) =>
+            {
+                format!("StreamBIM ({region})")
+            }
+            _ => p.provider.label().to_string(),
+        }
+    }
+}
+
+/// The StreamBIM region a project was made under: `meta` is `{"region":..}` (docs/PROVIDERS.md).
+pub fn project_region(p: &Project) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(p.meta.as_deref()?).ok()?;
+    meta.get("region")?.as_str().map(str::to_string)
 }
 
 /// Snapshot shown in the tray tooltip and sent as the `status` event.

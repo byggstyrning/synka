@@ -183,13 +183,23 @@ enum Step {
     Locked,
 }
 
-/// Run all due jobs (respecting concurrency). Returns the number processed.
+/// Run all due jobs with every provider connected (the engine calls `process_due_except`).
+#[cfg(test)]
 pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
+    process_due_except(ctx, &HashSet::new()).await
+}
+
+/// `process_due` for an engine in which the providers in `offline` have no connection: their
+/// jobs wait without a request and without an attempt, and the other providers' jobs run.
+pub async fn process_due_except(
+    ctx: &CtxRef,
+    offline: &HashSet<Provider>,
+) -> anyhow::Result<usize> {
     let jobs: Vec<OutboxJob> = ctx
         .store
         .due_jobs(now_ms(), BATCH)?
         .into_iter()
-        .filter(|job| !waits_for_sign_in(ctx, job))
+        .filter(|job| !waits_for_sign_in(ctx, job) && !waits_while_offline(ctx, job, offline))
         .collect();
     if jobs.is_empty() {
         return Ok(0);
@@ -218,20 +228,47 @@ pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
     Ok(processed)
 }
 
-/// A job of a signed-out provider waits like offline work: it is postponed without a request and
-/// without spending an attempt. True when it waits.
-fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
-    let provider = ctx
-        .store
+/// The provider of a job's project (ACC when the project is gone).
+fn job_provider(ctx: &CtxRef, job: &OutboxJob) -> Provider {
+    ctx.store
         .project(job.pid)
         .ok()
         .flatten()
         .map(|p| p.provider)
-        .unwrap_or_default();
-    if ctx.signed_in(provider) {
+        .unwrap_or_default()
+}
+
+/// A job whose project cannot be served (its provider is signed out, or StreamBIM is signed in to
+/// another region) waits like offline work: it is postponed without a request and without spending
+/// an attempt. True when it waits.
+fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
+    let project = ctx.store.project(job.pid).ok().flatten();
+    let connected = match &project {
+        Some(p) => ctx.project_connected(p),
+        None => ctx.signed_in(Provider::Acc),
+    };
+    if connected {
         return false;
     }
-    let waiting = format!("Logga in på {} för att synka.", provider.label());
+    let target = match &project {
+        Some(p) => ctx.sign_in_target(p),
+        None => Provider::Acc.label().to_string(),
+    };
+    let waiting = format!("Logga in på {target} för att synka.");
+    let _ = ctx
+        .store
+        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
+    true
+}
+
+/// A job of a provider without a connection waits like offline work (see `handle_failure`): no
+/// request, no attempt. The other providers' jobs are not affected. True when it waits.
+fn waits_while_offline(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
+    let provider = job_provider(ctx, job);
+    if !offline.contains(&provider) {
+        return false;
+    }
+    let waiting = format!("Ingen anslutning till {}.", provider.label());
     let _ = ctx
         .store
         .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
@@ -837,7 +874,7 @@ fn bind_created_file(
     loc: &Located,
     stale: Option<Item>,
     created: Item,
-    storage: String,
+    storage: Option<String>,
     snapshot: &UploadedSnapshot<'_>,
 ) -> anyhow::Result<(Item, bool)> {
     let _guard = sync::local_lock();
@@ -870,7 +907,7 @@ fn bind_created_file(
         .store
         .item(loc.project.pid, &created.id)?
         .filter(|target| {
-            target.storage_urn.as_deref() != Some(storage.as_str())
+            target.storage_urn != storage
                 && target.remote_version.unwrap_or_default()
                     >= created.remote_version.unwrap_or_default()
         });
@@ -896,7 +933,7 @@ fn bind_created_file(
             ctime_ms(snapshot.meta)
         },
         mtime_ms: snapshot.mtime,
-        storage_urn: Some(storage),
+        storage_urn: storage,
         locked_by: None,
         local_state: LocalState::Clean,
         populated: false,
@@ -1074,6 +1111,9 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
 
     let mut existing = loc.existing.clone().filter(|e| e.kind == Kind::File);
     let saved_intent = CreateIntent::from_payload(&fields)?;
+    // Only ACC's listing can show that a saved intent's object is our committed version. Elsewhere
+    // the saved marker proves nothing, so a resumed intent always uploads again.
+    let intent_commits = remote::intent_proves_commit(p.provider);
     let (mut checked_tip, upload_info) =
         if let Some(remote) = existing.as_ref().filter(|item| !is_local_id(&item.id)) {
             let (tip, info) = remote::get_item_upload_info(ctx, p, &remote.id).await?;
@@ -1084,7 +1124,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         } else {
             (None, None)
         };
-    if let (Some(intent), Some(remote)) = (&saved_intent, existing.as_mut()) {
+    if let (Some(intent), Some(remote), true) = (&saved_intent, existing.as_mut(), intent_commits) {
         if intent.version
             && !is_local_id(&remote.id)
             && remote.storage_urn.as_deref() != Some(intent.storage.as_str())
@@ -1100,7 +1140,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             }
         }
     }
-    if let (Some(intent), Some(remote)) = (&saved_intent, existing.as_ref()) {
+    if let (Some(intent), Some(remote), true) = (&saved_intent, existing.as_ref(), intent_commits) {
         if !is_local_id(&remote.id)
             && remote.remote_version.is_some()
             && remote.storage_urn.as_deref() == Some(intent.storage.as_str())
@@ -1264,11 +1304,19 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
                     return Err(error);
                 }
             };
+            // ACC returns the version URN and we keep the OSS object we uploaded. The other
+            // providers return the storage handle of the version they committed, and have no
+            // version URN.
+            let (storage_urn, version_urn) = if p.provider == Provider::Acc {
+                (Some(storage), Some(vurn))
+            } else {
+                (Some(vurn), None)
+            };
             let row = Item {
                 remote_version: Some(ver),
                 base_version: Some(ver),
-                version_urn: Some(vurn),
-                storage_urn: Some(storage),
+                version_urn,
+                storage_urn,
                 size,
                 mtime_ms: mtime,
                 local_state: state,
@@ -1319,8 +1367,15 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
                 usn: uploaded_usn,
                 intent: saved_intent.as_ref(),
             };
+            // ACC binds the OSS object we uploaded. The other providers bind the handle their
+            // commit returned: the marker only named the attempt.
+            let committed = if p.provider == Provider::Acc {
+                Some(storage)
+            } else {
+                created.storage_urn.clone()
+            };
             let (row, changed) =
-                bind_created_file(ctx, job, &loc, stale, created, storage, &snapshot)?;
+                bind_created_file(ctx, job, &loc, stale, created, committed, &snapshot)?;
             if changed {
                 return Ok(Step::Locked);
             }
@@ -2268,7 +2323,7 @@ mod tests {
             &loc,
             Some(local.clone()),
             created,
-            storage.into(),
+            Some(storage.into()),
             &snapshot,
         )
         .unwrap();
@@ -2362,7 +2417,7 @@ mod tests {
             &loc,
             Some(local.clone()),
             created,
-            "our-storage".into(),
+            Some("our-storage".into()),
             &snapshot,
         )
         .unwrap();
@@ -2380,6 +2435,86 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].item.as_deref(), Some("LIN-rapid"));
         assert!(payload(&jobs[0]).unwrap().get("intent_storage").is_none());
+    }
+
+    #[test]
+    fn non_acc_create_binds_its_own_row_the_poll_already_inserted() {
+        // Interaxo/StreamBIM: a poll listed our committed file under its ID before the create's
+        // reply was bound. The committed handle identifies it; the attempt marker never does.
+        let f = crate::sync::tests::fixture("non-acc-bind-own-poll");
+        let path = f.dir.join("ritning.pdf");
+        std::fs::write(&path, b"our bytes").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mut local = crate::sync::tests::row(
+            &f.p,
+            "local-ritning",
+            Some("co.ROOT"),
+            "ritning.pdf",
+            Kind::File,
+        );
+        local.remote_version = None;
+        local.base_version = None;
+        local.local_state = LocalState::New;
+        f.ctx.store.upsert_item(&local).unwrap();
+        let job_id = f
+            .ctx
+            .store
+            .enqueue(
+                f.p.pid,
+                "upload",
+                Some(&local.id),
+                &serde_json::json!({ "path": path }).to_string(),
+            )
+            .unwrap();
+        let job = f
+            .ctx
+            .store
+            .due_jobs(i64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .unwrap();
+        let committed = "interaxo:I-900:1.0";
+        let mut created =
+            crate::sync::tests::row(&f.p, "I-900", Some("co.ROOT"), "ritning.pdf", Kind::File);
+        created.remote_version = Some(1000);
+        created.base_version = Some(1000);
+        created.storage_urn = Some(committed.into());
+        f.ctx.store.upsert_item(&created).unwrap();
+        let loc = Located {
+            project: f.p.clone(),
+            existing: Some(local.clone()),
+            parent: "co.ROOT".into(),
+            name: "ritning.pdf".into(),
+        };
+        let snapshot = UploadedSnapshot {
+            path: &path,
+            meta: &meta,
+            mtime: mtime_ms(&meta),
+            size: meta.len() as i64,
+            usn: available_usn(&path),
+            intent: None,
+        };
+        let (bound, changed) = bind_created_file(
+            &f.ctx,
+            &job,
+            &loc,
+            Some(local.clone()),
+            created,
+            Some(committed.into()),
+            &snapshot,
+        )
+        .unwrap();
+        assert!(
+            !changed,
+            "our own commit is not a colleague's newer version"
+        );
+        assert_eq!(bound.id, "I-900");
+        assert_eq!(bound.remote_version, Some(1000));
+        assert_eq!(bound.base_version, Some(1000));
+        assert_eq!(bound.storage_urn.as_deref(), Some(committed));
+        assert_eq!(bound.version_urn, None);
+        assert!(f.ctx.store.item(f.p.pid, &local.id).unwrap().is_none());
     }
 
     #[test]
@@ -2446,7 +2581,7 @@ mod tests {
             &loc,
             Some(local.clone()),
             created,
-            "our-storage".into(),
+            Some("our-storage".into()),
             &snapshot,
         )
         .unwrap();

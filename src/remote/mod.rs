@@ -61,7 +61,7 @@ pub fn caps(provider: Provider) -> Caps {
 }
 
 /// A download handle for one version: where to read its bytes from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DownloadUrl {
     pub url: String,
     pub size: u64,
@@ -69,6 +69,20 @@ pub struct DownloadUrl {
     pub bearer: Option<String>,
     /// The server answers Range requests, so the download may run in parallel segments.
     pub ranges: bool,
+}
+
+/// Logs show the handle without its secrets: the bearer is redacted, and the URL loses its query
+/// (a presigned URL carries its signature there).
+impl std::fmt::Debug for DownloadUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url = self.url.split('?').next().unwrap_or_default();
+        f.debug_struct("DownloadUrl")
+            .field("url", &url)
+            .field("size", &self.size)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("ranges", &self.ranges)
+            .finish()
+    }
 }
 
 /// What `subscribe` needs to build a `model::Project` from a listed project.
@@ -252,7 +266,16 @@ pub(crate) async fn get_item_upload_info(
     }
 }
 
-/// Reserve storage for the bytes of a new file. ACC answers a storage URN.
+/// True when a storage handle saved in an upload intent proves that the provider committed the
+/// bytes. Only ACC can tell: its OSS object is listed with the version. The other providers
+/// commit inside `create_item` / `create_version`, and their intent marker never appears in a
+/// listing, so a saved marker is never evidence of a commit.
+pub fn intent_proves_commit(provider: Provider) -> bool {
+    provider == Provider::Acc
+}
+
+/// Reserve storage for the bytes of a new file. ACC answers a storage URN. The other providers
+/// answer a marker that is unique per call, so two attempts never share one.
 pub async fn create_storage(
     ctx: &Ctx,
     p: &Project,
@@ -262,9 +285,24 @@ pub async fn create_storage(
     let api = ctx.api_for(p.provider);
     match p.provider {
         Provider::Acc => dm::create_storage(api, p, parent_id, name).await,
-        Provider::StreamBim => streambim::create_storage(api, p, parent_id, name).await,
-        Provider::Interaxo => interaxo::create_storage(api, p, parent_id, name).await,
+        Provider::StreamBim => {
+            let marker = streambim::create_storage(api, p, parent_id, name).await?;
+            unique_marker(&marker)
+        }
+        Provider::Interaxo => {
+            let marker = interaxo::create_storage(api, p, parent_id, name).await?;
+            unique_marker(&marker)
+        }
     }
+}
+
+/// `marker` with 128 random bits appended (`<provider>:pending:<hex>`).
+fn unique_marker(marker: &str) -> Result<String, ApiError> {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw)
+        .map_err(|e| ApiError::Message(format!("slumpgenerator misslyckades: {e}")))?;
+    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{marker}:{hex}"))
 }
 
 /// Put the bytes of `path` into the storage from `create_storage` (ACC only; other providers
@@ -646,6 +684,45 @@ mod tests {
         ));
         // Nothing to change is not an error.
         assert!(patch_folder(&f.ctx, &p, "2", None, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn non_acc_storage_markers_are_unique_and_never_prove_a_commit() {
+        let f = fixture("markers");
+        let mut sb = project(Provider::StreamBim);
+        sb.meta =
+            Some(r#"{"region":"app","base":"https://app.streambim.com","project":"1552"}"#.into());
+        let mut ix = project(Provider::Interaxo);
+        ix.meta = None;
+        for p in [&sb, &ix] {
+            let first = create_storage(&f.ctx, p, "0", "a.pdf").await.unwrap();
+            let second = create_storage(&f.ctx, p, "0", "a.pdf").await.unwrap();
+            let prefix = format!("{}:pending:", p.provider.as_str());
+            assert!(first.starts_with(&prefix), "{first}");
+            assert_ne!(first, second, "every attempt gets its own marker");
+            assert!(!intent_proves_commit(p.provider));
+        }
+        assert!(intent_proves_commit(Provider::Acc));
+    }
+
+    #[test]
+    fn a_download_handle_never_logs_its_bearer_or_its_signature() {
+        let d = DownloadUrl {
+            url: "https://files.example.invalid/object?X-Amz-Signature=abc123".into(),
+            size: 14,
+            bearer: Some("secret-bearer-token".into()),
+            ranges: true,
+        };
+        let text = format!("{d:?}");
+        assert!(!text.contains("secret-bearer-token"), "{text}");
+        assert!(!text.contains("abc123"), "{text}");
+        assert!(text.contains("bearer: Some(\"<redacted>\")"), "{text}");
+        assert!(
+            text.contains("https://files.example.invalid/object"),
+            "{text}"
+        );
+        let open = DownloadUrl { bearer: None, ..d };
+        assert!(format!("{open:?}").contains("bearer: None"));
     }
 
     #[tokio::test]
