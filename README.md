@@ -72,14 +72,16 @@ double-click `Install.cmd`. See `packaging/delivery/README.txt`.
 
 ## Platforms
 
-One account per platform; sign in under **Inställningar → Konton**. Projects of every
-signed-in platform appear on the Projects page, grouped by hub. Architecture and limits:
+Sign in on the **Konton** page: one ACC account, one Interaxo account, and one StreamBIM
+account per StreamBIM server (a region such as Europe or Japan, or a custom `https://` address).
+The page lists every account with its server, status and synced projects, with sign-out next to
+each. Projects of every signed-in account appear on the Projects page, grouped by hub. Architecture and limits:
 [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 | Platform | Sign-in | What syncs | Not supported |
 |---|---|---|---|
 | ACC | Autodesk browser sign-in (PKCE), built-in or own APS Client ID | everything in Docs | — |
-| StreamBIM | region, e-mail, password, authenticator code if MFA is on | the project's document library (folders and documents, with revisions) | SSO-only accounts; files over 5 GB; locks |
+| StreamBIM | server (region or custom https address), e-mail, password, authenticator code if MFA is on; several servers at once | the project's document library (folders and documents, with revisions) | SSO-only accounts; files over 5 GB; locks |
 | Interaxo | Interaxo browser sign-in (PKCE) with the organisation's own Client ID | simple folders and files of each room you are a member of | creating folders, renaming and moving (the public API has none: such changes stay on this PC with a notice); registers, entries and links; locks |
 
 ### Set up Interaxo (bring your own Client ID)
@@ -89,7 +91,7 @@ client with Authorization Code + PKCE and refresh tokens, access to the API audi
 `https://api.interaxo.com/v1/` with offline access, and the redirect URI
 `http://localhost:47864/` registered exactly (or another loopback URI you then enter in Synka).
 Enter the Client ID (and the client secret only if Interaxo insists on a confidential client)
-under **Inställningar → Konton → Interaxo**, save, and sign in. The secret is stored
+under **Konton → Interaxo → Avancerat**, save, and sign in. The secret is stored
 DPAPI-protected and never shown again.
 
 ## Build

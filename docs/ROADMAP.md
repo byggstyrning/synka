@@ -27,9 +27,9 @@ accounts"; API research with every gap: `docs/specs/streambim-endpoints.md`,
 | Area | State |
 |---|---|
 | Engine | One account per provider (ACC, StreamBIM, Interaxo). The sync root stays registered while any account is signed in (its id is kept in kv `sync_root_uid`; an existing ACC install keeps its id). Signing out of one provider pauses only its projects. Every API call goes through `src/remote/`. |
-| StreamBIM | Region from `regions.json` (built-in fallback), e-mail + password, TOTP MFA. Listing of populated folders, downloads via `downloadlink`, uploads via upload ticket → S3 PUT → document / document-revision. Folder create, rename, move and soft delete. No locks, no SSO-only accounts, no uploads over 5 GB. |
+| StreamBIM | One account per server: regions from `regions.json` (built-in fallback) or a custom https address; e-mail + password, TOTP MFA. Listing of populated folders, downloads via `downloadlink`, uploads via upload ticket → S3 PUT → document / document-revision. Folder create, rename, move and soft delete. No locks, no SSO-only accounts, no uploads over 5 GB. |
 | Interaxo | Bring-your-own OIDC client (Auth0, PKCE, optional secret, configurable loopback redirect). Communities on `api.interaxo.com` and `api.interaxo.se`, rooms as projects, simple folders and files. Download (pinned to the listed version), new files, new versions, delete. Folder create, rename and move stay local with a notice (no API). |
-| Window | Settings → Konton: one card per provider; StreamBIM MFA dialog; Interaxo client settings. Projects show the provider per hub. |
+| Window | A Konton page: every account with its server, status, synced projects and sign-out; sign-in dialogs (StreamBIM server + MFA code, browser sign-in for ACC and Interaxo); APS and Interaxo client settings under Avancerat. Projects show the provider per hub and can be filtered to one account. |
 | Tests | Loopback tests for both clients, multi-account engine and IPC tests, the IPC audit scenario and the resilience lab Quick profile. Nothing has run against a real StreamBIM or Interaxo tenant yet. |
 
 ### Verify against real accounts (first thing for these providers)
