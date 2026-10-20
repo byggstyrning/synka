@@ -459,15 +459,28 @@ pub async fn download_url(
     api: &Api,
     p: &Project,
     item_id: &str,
-    _storage_urn: &str,
+    storage_urn: &str,
 ) -> Result<DownloadUrl, ApiError> {
     let meta = meta_of(p)?;
+    let mut url = format!("{}/files/{}/content", meta.room_url(), dm::pct(item_id));
+    // Ask for exactly the listed version, so the bytes match `remote_version`.
+    if let Some(version) = pinned_version(item_id, storage_urn) {
+        url.push_str("?version=");
+        url.push_str(&dm::pct(version));
+    }
     Ok(DownloadUrl {
-        url: format!("{}/files/{}/content", meta.room_url(), dm::pct(item_id)),
+        url,
         size: 0,
         bearer: Some(api.bearer().await?),
         ranges: false,
     })
+}
+
+/// The version in a storage handle `interaxo:<id>:<version>` written for this item, if any.
+fn pinned_version<'a>(item_id: &str, storage_urn: &'a str) -> Option<&'a str> {
+    let rest = storage_urn.strip_prefix("interaxo:")?;
+    let (id, version) = rest.rsplit_once(':')?;
+    (id == item_id && !version.is_empty()).then_some(version)
 }
 
 /// Stream the file from its start. Range support is undocumented, so `ranges` is false and the
@@ -1243,6 +1256,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn downloads_pin_the_listed_version() {
+        assert_eq!(pinned_version("d-1", "interaxo:d-1:2.1"), Some("2.1"));
+        assert_eq!(pinned_version("d-1", "interaxo:other:2.1"), None);
+        assert_eq!(pinned_version("d-1", "interaxo:pending"), None);
+        assert_eq!(pinned_version("d-1", "interaxo:d-1:"), None);
+    }
+
     #[tokio::test]
     async fn download_url_has_the_file_route_and_the_stream_sends_the_bearer() {
         let server = Server::scripted(vec![Fault::reply(200, "hello from interaxo")]).await;
@@ -1255,7 +1276,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             d.url,
-            format!("{base}/example-corp/rooms/room-1/files/d-1/content")
+            format!("{base}/example-corp/rooms/room-1/files/d-1/content?version=2.1")
         );
         assert_eq!(d.size, 0);
         assert!(!d.ranges);
@@ -1275,7 +1296,7 @@ mod tests {
         assert_eq!(requests[0].method, "GET");
         assert_eq!(
             requests[0].target,
-            "/v1/example-corp/rooms/room-1/files/d-1/content"
+            "/v1/example-corp/rooms/room-1/files/d-1/content?version=2.1"
         );
         assert_eq!(requests[0].header("authorization"), Some(TOKEN));
 

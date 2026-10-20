@@ -569,15 +569,6 @@ mod tests {
         }
     }
 
-    fn hub(provider: Provider) -> HubInfo {
-        HubInfo {
-            id: "hub".into(),
-            name: "Hub".into(),
-            region: None,
-            provider,
-        }
-    }
-
     #[test]
     fn caps_table_matches_the_contract() {
         assert_eq!(
