@@ -40,6 +40,12 @@ const PENDING: &str = "interaxo:pending";
 const TOP_NAME: &str = "Dokument";
 /// Bytes per read while a file is sent; progress is reported once per read.
 const UPLOAD_CHUNK: usize = 256 * 1024;
+/// Overall cap of one download: the same as `api::oss` uses for its downloads (private there).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// An upload gets this much time, plus the time its bytes take at `UPLOAD_MIN_RATE`.
+const UPLOAD_BASE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The slowest rate an upload is planned for: 256 KiB/s.
+const UPLOAD_MIN_RATE: u64 = 256 * 1024;
 const META_ERROR: &str =
     "Interaxo-projektets uppgifter saknas eller är ogiltiga. Ta bort projektet och lägg till det igen.";
 
@@ -600,7 +606,8 @@ pub async fn open_download(
         ));
     }
     let url = d.url.as_str();
-    api.send_custom(|client| Ok(client.get(url))).await
+    api.send_custom(|client| Ok(client.get(url).timeout(DOWNLOAD_TIMEOUT)))
+        .await
 }
 
 pub async fn open_range(
@@ -639,7 +646,10 @@ pub async fn upload_file(
     Ok(())
 }
 
-/// A new file in `parent_id`: the bytes of `path` are sent as the multipart part `file`.
+/// A new file in `parent_id`: the bytes of `path` are sent as the multipart part `file`. A file of
+/// the same name (ignoring case) that is already there is refused before the bytes are sent, with
+/// the 409 the engine treats as a name collision. Interaxo would otherwise store the new file under
+/// another name.
 pub async fn create_item(
     api: &Api,
     p: &Project,
@@ -651,14 +661,20 @@ pub async fn create_item(
 ) -> Result<Item, ApiError> {
     check_name(name)?;
     let meta = meta_of(p)?;
-    let url = format!(
-        "{}/content/{}/children",
-        meta.room_url(),
-        dm::pct(parent_id)
-    );
+    let url = children_url(&meta, parent_id);
+    let siblings: Vec<Content> = list_all(api, &url).await?;
+    if siblings
+        .iter()
+        .any(|c| c.kind == "file" && same_name(&c.name, name))
+    {
+        return Err(ApiError::Status {
+            status: 409,
+            body: "name exists".into(),
+        });
+    }
     let created = upload(api, &url, name, path, progress).await?;
     if created.name != name {
-        info!(sent = %name, stored = %created.name, "Interaxo gav filen ett annat namn");
+        warn!(sent = %name, stored = %created.name, "Interaxo gav filen ett annat namn");
     }
     content_item(p.pid, created, Some(parent_id.to_string()))
         .ok_or_else(|| ApiError::Decode("svaret från Interaxo är inte en fil".into()))
@@ -687,6 +703,16 @@ pub async fn create_version(
         .filter(|label| !label.is_empty())
         .ok_or_else(|| ApiError::Message("Interaxo returnerade ingen version.".into()))?;
     Ok((version_number(&label), format!("{PREFIX}{id}:{label}")))
+}
+
+/// The overall timeout of an upload of `bytes`: the base time, plus the time at the planned rate.
+fn upload_timeout(bytes: u64) -> Duration {
+    UPLOAD_BASE_TIMEOUT + Duration::from_secs(bytes / UPLOAD_MIN_RATE)
+}
+
+/// Two names of one folder are the same when they differ only in case.
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// Interaxo's file-name rule: no leading dot, and none of ' ; < > " \ | / * ? :
@@ -738,7 +764,8 @@ async fn upload(
             .post(url)
             .header(CONTENT_TYPE, content_type.as_str())
             .header(CONTENT_LENGTH, length.to_string())
-            .body(body))
+            .body(body)
+            .timeout(upload_timeout(total)))
     });
     tokio::pin!(send);
     let resp = loop {
@@ -1620,12 +1647,15 @@ mod tests {
         let dir = TempDir::new("create");
         let path = dir.0.join("abc.txt");
         std::fs::write(&path, b"hello interaxo").unwrap();
-        let server = Server::scripted(vec![json_reply(json!({
-            "type": "file", "id": "new-1", "parent_id": "folder-1", "name": "abc.txt",
-            "original_name": "abc.txt", "created": "2026-04-01T10:00:00.000Z",
-            "last_modified": "2026-04-01T10:00:00.000Z", "version": "1.0",
-            "mime_type": "text/plain", "file_size": 14
-        }))])
+        let server = Server::scripted(vec![
+            json_reply(json!([])),
+            json_reply(json!({
+                "type": "file", "id": "new-1", "parent_id": "folder-1", "name": "abc.txt",
+                "original_name": "abc.txt", "created": "2026-04-01T10:00:00.000Z",
+                "last_modified": "2026-04-01T10:00:00.000Z", "version": "1.0",
+                "mime_type": "text/plain", "file_size": 14
+            })),
+        ])
         .await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let calls = Mutex::new(Vec::new());
@@ -1652,8 +1682,9 @@ mod tests {
         assert_eq!(item.size, 14);
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET", "the folder is listed first");
+        let request = &requests[1];
         assert_eq!(request.method, "POST");
         assert_eq!(
             request.target,
@@ -1682,10 +1713,13 @@ mod tests {
         let dir = TempDir::new("renamed");
         let path = dir.0.join("abc.txt");
         std::fs::write(&path, b"x").unwrap();
-        let server = Server::scripted(vec![json_reply(json!({
-            "type": "file", "id": "new-2", "parent_id": "folder-1", "name": "abc (1).txt",
-            "version": "1.0", "file_size": 1
-        }))])
+        let server = Server::scripted(vec![
+            json_reply(json!([])),
+            json_reply(json!({
+                "type": "file", "id": "new-2", "parent_id": "folder-1", "name": "abc (1).txt",
+                "version": "1.0", "file_size": 1
+            })),
+        ])
         .await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let item = create_item(
@@ -1701,6 +1735,84 @@ mod tests {
         .unwrap();
         assert_eq!(item.name, "abc (1).txt");
         assert_eq!(item.id, "new-2");
+    }
+
+    #[tokio::test]
+    async fn create_item_refuses_a_name_a_file_already_has_before_sending_bytes() {
+        let dir = TempDir::new("taken");
+        let path = dir.0.join("abc.txt");
+        std::fs::write(&path, b"x").unwrap();
+        // A folder of the same name does not count; a file of it in another case does.
+        let server = Server::scripted(vec![
+            json_reply(json!([
+                {"type": "simple-folder", "id": "f-9", "name": "Abc.txt"},
+                {"type": "file", "id": "d-9", "name": "ABC.TXT", "version": "1.0", "file_size": 1}
+            ])),
+            json_reply(json!([])),
+        ])
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let err = create_item(
+            &api_for(&server.origin),
+            &p,
+            "folder-1",
+            "abc.txt",
+            "interaxo:pending",
+            &path,
+            &|_: u64, _: u64| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status(), Some(409));
+        assert!(
+            matches!(&err, ApiError::Status { body, .. } if body == "name exists"),
+            "{err:?}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "only the listing is read");
+        assert!(requests.iter().all(|r| r.method == "GET"));
+    }
+
+    #[tokio::test]
+    async fn create_item_is_not_blocked_by_a_folder_of_the_same_name() {
+        let dir = TempDir::new("folder-name");
+        let path = dir.0.join("abc.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let server = Server::scripted(vec![
+            json_reply(json!([{"type": "simple-folder", "id": "f-9", "name": "abc.txt"}])),
+            json_reply(json!([])),
+            json_reply(json!({
+                "type": "file", "id": "new-4", "parent_id": "folder-1", "name": "abc.txt",
+                "version": "1.0", "file_size": 1
+            })),
+        ])
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let item = create_item(
+            &api_for(&server.origin),
+            &p,
+            "folder-1",
+            "abc.txt",
+            "interaxo:pending",
+            &path,
+            &|_: u64, _: u64| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.id, "new-4");
+        assert_eq!(server.requests()[2].method, "POST");
+    }
+
+    #[test]
+    fn transfers_have_an_overall_timeout_that_grows_with_the_size() {
+        // A download has the same cap as api::oss (2 h).
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        assert_eq!(upload_timeout(0), Duration::from_secs(120));
+        assert_eq!(upload_timeout(256 * 1024 * 100), Duration::from_secs(220));
+        // 2 GiB at 256 KiB/s takes 8192 s, on top of the base time.
+        assert_eq!(upload_timeout(2 << 30), Duration::from_secs(120 + 8192));
+        assert!(upload_timeout(u64::MAX) > upload_timeout(1 << 30));
     }
 
     #[tokio::test]
