@@ -444,12 +444,7 @@ pub async fn folder_contents(
     folder_id: &str,
 ) -> Result<Vec<Item>, ApiError> {
     let meta = meta_of(p)?;
-    let url = format!(
-        "{}/content/{}/children",
-        meta.room_url(),
-        dm::pct(folder_id)
-    );
-    let children: Vec<Content> = list_all(api, &url).await?;
+    let children: Vec<Content> = list_all(api, &children_url(&meta, folder_id)).await?;
     Ok(children
         .into_iter()
         .filter_map(|c| content_item(p.pid, c, Some(folder_id.to_string())))
@@ -858,8 +853,78 @@ pub async fn delete_file(api: &Api, p: &Project, id: &str) -> Result<(), ApiErro
     delete_content(api, p, id).await
 }
 
+/// Bounds of the walk a folder delete makes first: the items it reads and the folder levels.
+const WALK_MAX_ITEMS: usize = 20_000;
+const WALK_MAX_DEPTH: usize = 64;
+
+/// What the walk of a folder found.
+enum Walk {
+    /// Only files and simple folders, within the bounds: the folder may be deleted.
+    Synced,
+    /// An item Synka does not show (register, entry, link, active or workflow folder).
+    Unsynced,
+    /// More items or folder levels than the walk reads.
+    TooLarge,
+}
+
+/// Deletes a folder with everything in it, but only when Synka shows all of it. Interaxo deletes
+/// a folder with its content, and the content of active and workflow folders, entries and links
+/// is not synced, so a folder holding any of those is refused. A folder already gone is done.
 pub async fn delete_folder(api: &Api, p: &Project, folder_id: &str) -> Result<(), ApiError> {
-    delete_content(api, p, folder_id).await
+    let meta = meta_of(p)?;
+    // The name is for the refusal text.
+    let url = format!("{}/content/{}", meta.room_url(), dm::pct(folder_id));
+    let folder: Content = match api.json(Method::GET, &url, None).await {
+        Ok(folder) => folder,
+        Err(ApiError::Status { status: 404, .. }) => return Ok(()),
+        Err(e) => return Err(scrub(e)),
+    };
+    let name = if folder.name.trim().is_empty() {
+        folder_id
+    } else {
+        folder.name.as_str()
+    };
+    match walk(api, &meta, folder_id).await? {
+        Walk::Synced => delete_content(api, p, folder_id).await,
+        Walk::Unsynced => Err(ApiError::Unsupported(format!(
+            "Interaxo-mappen {name} innehåller register, poster eller länkar som inte synkas. Ta bort den i Interaxo."
+        ))),
+        Walk::TooLarge => Err(ApiError::Unsupported(format!(
+            "Interaxo-mappen {name} är för stor för att kontrolleras. Ta bort den i Interaxo."
+        ))),
+    }
+}
+
+/// The raw children of `folder_id` and of every folder below it, of any type. Stops at the first
+/// item that is not a file or a simple folder, or when a bound is passed.
+async fn walk(api: &Api, meta: &Meta, folder_id: &str) -> Result<Walk, ApiError> {
+    let mut pending = vec![(folder_id.to_string(), 0usize)];
+    let mut items = 0usize;
+    while let Some((folder, depth)) = pending.pop() {
+        let children: Vec<Content> = list_all(api, &children_url(meta, &folder)).await?;
+        for child in children {
+            items += 1;
+            if items > WALK_MAX_ITEMS {
+                return Ok(Walk::TooLarge);
+            }
+            match child.kind.as_str() {
+                "file" => {}
+                "simple-folder" if depth < WALK_MAX_DEPTH => pending.push((child.id, depth + 1)),
+                "simple-folder" => return Ok(Walk::TooLarge),
+                _ => return Ok(Walk::Unsynced),
+            }
+        }
+    }
+    Ok(Walk::Synced)
+}
+
+/// `.../content/{id}/children` of the room: the children of one folder.
+fn children_url(meta: &Meta, folder_id: &str) -> String {
+    format!(
+        "{}/content/{}/children",
+        meta.room_url(),
+        dm::pct(folder_id)
+    )
 }
 
 /// `DELETE .../content/{id}` (204). A 404 means the item is already gone.
@@ -1760,23 +1825,163 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_the_item_and_a_missing_one_counts_as_deleted() {
-        let server = Server::scripted(vec![Fault::reply(204, ""), Fault::reply(404, "")]).await;
+        // d-1: DELETE 204. f-1: already gone (GET 404). f-2: empty, but its DELETE answers 404.
+        let server = Server::scripted(vec![
+            Fault::reply(204, ""),
+            Fault::reply(404, ""),
+            json_reply(json!({"type": "simple-folder", "id": "f-2", "name": "Tom"})),
+            json_reply(json!([])),
+            Fault::reply(404, ""),
+        ])
+        .await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let api = api_for(&server.origin);
         delete_file(&api, &p, "d-1").await.unwrap();
         delete_folder(&api, &p, "f-1").await.unwrap();
+        delete_folder(&api, &p, "f-2").await.unwrap();
 
         let requests = server.requests();
+        assert_eq!(requests.len(), 5);
         assert_eq!(requests[0].method, "DELETE");
         assert_eq!(
             requests[0].target,
             "/v1/example-corp/rooms/room-1/content/d-1"
         );
-        assert_eq!(requests[1].method, "DELETE");
+        assert_eq!(requests[1].method, "GET");
         assert_eq!(
             requests[1].target,
             "/v1/example-corp/rooms/room-1/content/f-1"
         );
+        assert_eq!(requests[4].method, "DELETE");
+        assert_eq!(
+            requests[4].target,
+            "/v1/example-corp/rooms/room-1/content/f-2"
+        );
+    }
+
+    const ROOM_CONTENT: &str = "/v1/example-corp/rooms/room-1/content";
+
+    #[tokio::test]
+    async fn delete_folder_deletes_a_folder_of_files_and_simple_folders() {
+        let server = Server::new(|req: &Request, _| {
+            match (req.method.as_str(), req.target.as_str()) {
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1") => {
+                    json_reply(json!({"type": "simple-folder", "id": "f-1", "name": "Ritningar"}))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([
+                        {"type": "file", "id": "d-1", "name": "Plan.pdf", "version": "1.0", "file_size": 1},
+                        {"type": "simple-folder", "id": "f-2", "name": "Bilagor"}
+                    ]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=2&sort=id") => {
+                    json_reply(json!([]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([
+                        {"type": "file", "id": "d-2", "name": "Bild.png", "version": "1.0", "file_size": 1}
+                    ]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=1&sort=id") => {
+                    json_reply(json!([]))
+                }
+                ("DELETE", "/v1/example-corp/rooms/room-1/content/f-1") => Fault::reply(204, ""),
+                _ => Fault::reply(404, ""),
+            }
+        })
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        delete_folder(&api_for(&server.origin), &p, "f-1")
+            .await
+            .unwrap();
+
+        // The folder and its subfolder were read; only the top folder is deleted.
+        let deletes: Vec<String> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.target)
+            .collect();
+        assert_eq!(deletes, [format!("{ROOM_CONTENT}/f-1")]);
+    }
+
+    #[tokio::test]
+    async fn delete_folder_refuses_a_folder_holding_content_synka_does_not_show() {
+        // An active folder sits in the subfolder f-2, so the top folder is refused.
+        let server = Server::new(|req: &Request, _| {
+            match (req.method.as_str(), req.target.as_str()) {
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1") => {
+                    json_reply(json!({"type": "simple-folder", "id": "f-1", "name": "Ritningar"}))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([
+                        {"type": "file", "id": "d-1", "name": "Plan.pdf", "version": "1.0", "file_size": 1},
+                        {"type": "simple-folder", "id": "f-2", "name": "Bilagor"}
+                    ]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-1/children?limit=500&skip=2&sort=id") => {
+                    json_reply(json!([]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=0&sort=id") => {
+                    json_reply(json!([{"type": "active-folder", "id": "a-1", "name": "Ärenden"}]))
+                }
+                ("GET", "/v1/example-corp/rooms/room-1/content/f-2/children?limit=500&skip=1&sort=id") => {
+                    json_reply(json!([]))
+                }
+                _ => Fault::reply(599, "no delete expected"),
+            }
+        })
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let err = delete_folder(&api_for(&server.origin), &p, "f-1")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Unsupported(text) if text == "Interaxo-mappen Ritningar innehåller register, poster eller länkar som inte synkas. Ta bort den i Interaxo."),
+            "{err:?}"
+        );
+        assert!(server.requests().iter().all(|r| r.method != "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn delete_folder_refuses_a_tree_deeper_than_the_walk_reads() {
+        // f-0 holds f-1, which holds f-2, and so on: the walk stops below 64 levels.
+        let mut routes = std::collections::HashMap::new();
+        for i in 0..=70usize {
+            let folder = format!("{ROOM_CONTENT}/f-{i}");
+            routes.insert(
+                folder.clone(),
+                json_reply(
+                    json!({"type": "simple-folder", "id": format!("f-{i}"), "name": "Djupt"}),
+                ),
+            );
+            routes.insert(
+                format!("{folder}/children?limit=500&skip=0&sort=id"),
+                json_reply(json!([{"type": "simple-folder", "id": format!("f-{}", i + 1), "name": "Mapp"}])),
+            );
+            routes.insert(
+                format!("{folder}/children?limit=500&skip=1&sort=id"),
+                json_reply(json!([])),
+            );
+        }
+        let server = Server::new(move |req: &Request, _| {
+            routes
+                .get(&req.target)
+                .cloned()
+                .unwrap_or_else(|| Fault::reply(404, ""))
+        })
+        .await;
+        let p = project(&format!("{}/v1", server.origin), Some("root-1"));
+        let err = delete_folder(&api_for(&server.origin), &p, "f-0")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Unsupported(text) if text == "Interaxo-mappen Djupt är för stor för att kontrolleras. Ta bort den i Interaxo."),
+            "{err:?}"
+        );
+        assert!(server.requests().iter().all(|r| r.method != "DELETE"));
     }
 
     #[tokio::test]
