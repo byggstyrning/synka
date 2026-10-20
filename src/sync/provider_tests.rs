@@ -9,6 +9,7 @@ use crate::config::protect_secret;
 use crate::http::ApiError;
 use crate::model::{ChangeSourceKind, Delta, TopFolder};
 use serde_json::json;
+use std::os::windows::fs::MetadataExt;
 
 fn user(id: &str) -> UserInfo {
     UserInfo {
@@ -368,4 +369,199 @@ async fn a_code_without_a_pending_mfa_wait_is_refused() {
         .await;
     assert!(live.sign_ins.is_empty());
     assert_eq!(notices(&f, "Ingen kod väntas"), 1);
+}
+
+/// An Interaxo project whose API is the loopback `origin`, signed in with the test bearer.
+fn interaxo_loopback(f: &mut Fixture, origin: &str) {
+    let mut p = f.p.clone();
+    p.provider = Provider::Interaxo;
+    p.meta = Some(
+        json!({
+            "base": format!("{origin}/v1"),
+            "community": "example-corp",
+            "room": "room-1",
+            "root": "co.ROOT",
+        })
+        .to_string(),
+    );
+    f.ctx.store.upsert_project(&p).unwrap();
+    f.p = p;
+    interaxo_signed_in(f);
+    let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+    ctx.interaxo_api = crate::http::Api::for_test(origin, std::time::Duration::from_secs(5));
+}
+
+fn interaxo_reply(version: &str) -> crate::test_support::Fault {
+    let body = json!({
+        "type": "file", "id": "I-1", "parent_id": "co.ROOT", "name": "a.pdf",
+        "version": version, "file_size": 14
+    });
+    crate::test_support::Fault::reply(200, serde_json::to_vec(&body).unwrap())
+        .header("Content-Type", "application/json")
+}
+
+/// Stores `a.pdf` (remote I-1 at version 1.0, the bytes already on disk) and queues its upload
+/// with `payload_extra` merged into the job payload.
+fn queue_interaxo_version(f: &Fixture, storage: &str, payload_extra: serde_json::Value) -> PathBuf {
+    let path = f.dir.join("a.pdf");
+    let mut item = row(&f.p, "I-1", Some("co.ROOT"), "a.pdf", Kind::File);
+    item.remote_version = Some(1000);
+    item.base_version = Some(1000);
+    item.storage_urn = Some(storage.to_string());
+    item.size = 14;
+    f.ctx.store.upsert_item(&item).unwrap();
+    let mut payload = json!({ "path": path });
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(payload_extra.as_object().unwrap().clone());
+    f.ctx
+        .store
+        .enqueue(f.p.pid, "upload", Some("I-1"), &payload.to_string())
+        .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn a_committed_non_acc_version_keeps_the_handle_it_returned() {
+    use crate::test_support::Server;
+    let server = Server::scripted(vec![
+        interaxo_reply("1.0"),
+        interaxo_reply("1.0"),
+        interaxo_reply("2.0"),
+    ])
+    .await;
+    let mut f = fixture("interaxo-commit");
+    interaxo_loopback(&mut f, &server.origin);
+    std::fs::write(f.dir.join("a.pdf"), b"new bytes here").unwrap();
+    queue_interaxo_version(&f, "interaxo:I-1:1.0", json!({}));
+
+    // The commit is accepted; turning the file into a placeholder fails outside a sync root,
+    // so the job then waits for its finalization (`finalize`), as it does after any commit.
+    upload::process_due(&f.ctx).await.unwrap();
+    assert_eq!(server.count(), 3, "two checks and one commit");
+    assert_eq!(server.requests()[2].method, "POST");
+    let row = f.ctx.store.item(f.p.pid, "I-1").unwrap().unwrap();
+    assert_eq!(row.remote_version, Some(2000));
+    assert_eq!(
+        row.storage_urn.as_deref(),
+        Some("interaxo:I-1:2.0"),
+        "the handle the provider returned, not the marker"
+    );
+    assert_eq!(
+        row.version_urn, None,
+        "non-ACC providers have no version URN"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_non_acc_version_intent_never_counts_as_committed() {
+    use crate::test_support::Server;
+    let server = Server::scripted(vec![
+        interaxo_reply("1.0"),
+        interaxo_reply("1.0"),
+        interaxo_reply("2.0"),
+    ])
+    .await;
+    let mut f = fixture("interaxo-resumed");
+    interaxo_loopback(&mut f, &server.origin);
+    std::fs::write(f.dir.join("a.pdf"), b"new bytes here").unwrap();
+    let meta = std::fs::metadata(f.dir.join("a.pdf")).unwrap();
+    // The row carries the pending marker of an earlier attempt and the version intent names
+    // that same marker. On ACC this would prove a commit; here the bytes must go up again.
+    let marker = "interaxo:pending:0123456789abcdef0123456789abcdef";
+    queue_interaxo_version(
+        &f,
+        marker,
+        json!({
+            "intent_storage": marker,
+            "intent_size": meta.len(),
+            "intent_mtime_ms": 0,
+            "intent_mtime_ticks": meta.last_write_time(),
+            "intent_usn": null,
+            "intent_kind": "version",
+        }),
+    );
+
+    upload::process_due(&f.ctx).await.unwrap();
+    assert_eq!(
+        server.count(),
+        3,
+        "the version is uploaded again instead of taken as committed"
+    );
+    let row = f.ctx.store.item(f.p.pid, "I-1").unwrap().unwrap();
+    assert_eq!(row.storage_urn.as_deref(), Some("interaxo:I-1:2.0"));
+}
+
+#[test]
+fn a_same_name_file_listed_while_our_upload_runs_is_not_a_conflict() {
+    let f = fixture("interaxo-own-create");
+    make_interaxo(&f);
+    let mut local = row(&f.p, "local-1", Some("co.ROOT"), "ritning.pdf", Kind::File);
+    local.remote_version = None;
+    local.base_version = None;
+    local.local_state = LocalState::New;
+    f.ctx.store.upsert_item(&local).unwrap();
+    let job = f
+        .ctx
+        .store
+        .enqueue(f.p.pid, "upload", Some("local-1"), "{}")
+        .unwrap();
+    // The poll sees our committed file before the job binds the local row to its ID.
+    let mut delta = Delta {
+        upserts: vec![row(
+            &f.p,
+            "I-900",
+            Some("co.ROOT"),
+            "ritning.pdf",
+            Kind::File,
+        )],
+        ..Default::default()
+    };
+    keep_pending_local(&f.ctx.store, f.p.pid, &mut delta).unwrap();
+    assert!(
+        delta.upserts.is_empty(),
+        "no conflict copy and no second row for our own upload"
+    );
+
+    // Once that upload has finished, a same-name file is a remote file again.
+    f.ctx.store.job_done(job).unwrap();
+    let mut other = Delta {
+        upserts: vec![row(
+            &f.p,
+            "I-901",
+            Some("co.ROOT"),
+            "ritning.pdf",
+            Kind::File,
+        )],
+        ..Default::default()
+    };
+    keep_pending_local(&f.ctx.store, f.p.pid, &mut other).unwrap();
+    assert_eq!(other.upserts.len(), 1);
+}
+
+#[test]
+fn acc_keeps_its_own_matching_rules_for_a_same_name_listing() {
+    let f = fixture("acc-same-name");
+    let mut local = row(&f.p, "local-1", Some("co.ROOT"), "ritning.pdf", Kind::File);
+    local.remote_version = None;
+    local.base_version = None;
+    local.local_state = LocalState::New;
+    f.ctx.store.upsert_item(&local).unwrap();
+    f.ctx
+        .store
+        .enqueue(f.p.pid, "upload", Some("local-1"), "{}")
+        .unwrap();
+    let mut remote = row(&f.p, "urn-900", Some("co.ROOT"), "ritning.pdf", Kind::File);
+    remote.storage_urn = Some("urn:adsk.objects:os.object:bucket/colleague".into());
+    let mut delta = Delta {
+        upserts: vec![remote],
+        ..Default::default()
+    };
+    keep_pending_local(&f.ctx.store, f.p.pid, &mut delta).unwrap();
+    assert_eq!(
+        delta.upserts.len(),
+        1,
+        "a foreign ACC object stays a remote file"
+    );
 }

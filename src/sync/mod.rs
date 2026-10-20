@@ -5089,6 +5089,31 @@ fn exists(p: &Path) -> bool {
     p.symlink_metadata().is_ok()
 }
 
+/// A same-name file in a listing of a non-ACC provider is our own create while a local-only row of
+/// that name still waits for its upload job (`uploading`: items with a live upload job). The job
+/// binds the row to the committed ID when its create returns, so the poll leaves the file out and
+/// the next poll sees one consistent item.
+fn own_named_create(
+    store: &Store,
+    pid: Pid,
+    remote: &Item,
+    uploading: &HashSet<String>,
+) -> Result<bool> {
+    let Some(parent) = remote.parent.as_deref() else {
+        return Ok(false);
+    };
+    let name = sanitize_name(&remote.name);
+    Ok(store
+        .children_named(pid, parent, &name)?
+        .into_iter()
+        .any(|local| {
+            (is_local_id(&local.id) || local.local_state == LocalState::New)
+                && local.local_state != LocalState::Deleted
+                && uploading.contains(&local.id)
+                && naming::same_name(&name, &local.name)
+        }))
+}
+
 /// Local intent wins over a poll that has not seen it yet: items with a queued rename or move
 /// keep their local name and parent, and items with a queued delete are not re-created by a
 /// remote update (they are still deleted locally).
@@ -5127,6 +5152,19 @@ fn keep_pending_local(store: &Store, pid: Pid, delta: &mut Delta) -> Result<()> 
             own_creates.insert(remote.id.clone());
         }
     }
+    // The other providers never list the marker of our own create: their listing shows the
+    // committed file under its new ID, so it is recognised by name instead.
+    if store
+        .project(pid)?
+        .is_some_and(|p| p.provider != Provider::Acc)
+    {
+        let uploading = store.pending_items(pid, &["upload"])?;
+        for remote in delta.upserts.iter().filter(|it| it.kind == Kind::File) {
+            if own_named_create(store, pid, remote, &uploading)? {
+                own_creates.insert(remote.id.clone());
+            }
+        }
+    }
     delta.upserts.retain(|up| !own_creates.contains(&up.id));
     // A reset enumerates every surviving remote ID. Keep our existing row in
     // that enumeration while its exact cloud version is being bound; otherwise
@@ -5142,13 +5180,19 @@ fn keep_pending_local(store: &Store, pid: Pid, delta: &mut Delta) -> Result<()> 
     // The exact storage marker identifies our accepted version, so keep its
     // local row until the upload/finalize job has reconciled it.
     delta.deletes.retain(|id| !own_creates.contains(id));
+    // A move or rename still queued, or refused by the provider, keeps the item where the user put
+    // it. The listing of its remote place (the old or the new parent) does not show it there, and
+    // must not delete it: that would re-create it at the other place on every poll.
+    let mut moved_locally = store.pending_items(pid, &["rename", "move"])?;
+    moved_locally.extend(store.refused_renames(pid)?);
+    delta.deletes.retain(|id| !moved_locally.contains(id));
     if delta.upserts.is_empty() {
         return Ok(());
     }
     // A rename or move the provider refused (its job is parked) keeps the local name too: a
     // poll that still reports the old remote name must not move the file back.
     let mut pending = store.pending_items(pid, &["rename", "move", "delete"])?;
-    pending.extend(store.refused_renames(pid)?);
+    pending.extend(moved_locally);
     if pending.is_empty() {
         return Ok(());
     }
