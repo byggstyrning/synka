@@ -286,7 +286,7 @@ async fn room_root(
     room_id: &str,
 ) -> Result<Option<String>, ApiError> {
     let url = format!("{base}/{}/rooms/{}", dm::pct(community), dm::pct(room_id));
-    let room: Room = api.json(Method::GET, &url, None).await?;
+    let room: Room = api.json(Method::GET, &url, None).await.map_err(scrub)?;
     Ok(room.root())
 }
 
@@ -551,7 +551,7 @@ pub(crate) async fn get_item_upload_info(
 ) -> Result<(Item, UploadInfo), ApiError> {
     let meta = meta_of(p)?;
     let url = format!("{}/content/{}", meta.room_url(), dm::pct(id));
-    let content: Content = api.json(Method::GET, &url, None).await?;
+    let content: Content = api.json(Method::GET, &url, None).await.map_err(scrub)?;
     let parent = content.parent_id.clone();
     let item = content_item(p.pid, content, parent)
         .filter(|item| matches!(item.kind, Kind::File))
@@ -608,6 +608,7 @@ pub async fn open_download(
     let url = d.url.as_str();
     api.send_custom(|client| Ok(client.get(url).timeout(DOWNLOAD_TIMEOUT)))
         .await
+        .map_err(scrub)
 }
 
 pub async fn open_range(
@@ -770,7 +771,7 @@ async fn upload(
     tokio::pin!(send);
     let resp = loop {
         tokio::select! {
-            resp = &mut send => break resp?,
+            resp = &mut send => break resp.map_err(scrub)?,
             Some(sent) = sent_rx.recv() => progress(sent, total),
         }
     };
@@ -778,7 +779,7 @@ async fn upload(
         progress(sent, total);
     }
     progress(total, total);
-    let bytes = resp.bytes().await?;
+    let bytes = resp.bytes().await.map_err(transport)?;
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Decode(e.to_string()))
 }
 
@@ -961,7 +962,7 @@ async fn delete_content(api: &Api, p: &Project, id: &str) -> Result<(), ApiError
     match api.request(Method::DELETE, &url, None).await {
         Ok(_) => Ok(()),
         Err(ApiError::Status { status: 404, .. }) => Ok(()),
-        Err(e) => Err(e),
+        Err(e) => Err(scrub(e)),
     }
 }
 
@@ -1813,6 +1814,57 @@ mod tests {
         // 2 GiB at 256 KiB/s takes 8192 s, on top of the base time.
         assert_eq!(upload_timeout(2 << 30), Duration::from_secs(120 + 8192));
         assert!(upload_timeout(u64::MAX) > upload_timeout(1 << 30));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_carry_the_request_url() {
+        // Every request is cut off: a listing, a download and the hub probe all fail on the wire.
+        let cut = Server::new(|_, _| Fault::Disconnect).await;
+        let p = project(&format!("{}/v1", cut.origin), Some("root-1"));
+        let api = api_for(&cut.origin);
+        let d = download_url(&api, &p, "d-1", "interaxo:d-1:2.1")
+            .await
+            .unwrap();
+        let base = format!("{}/v1", cut.origin);
+        let mut errors = vec![
+            folder_contents(&api, &p, "folder-1").await.unwrap_err(),
+            open_download(&api, &p, &d, 0).await.unwrap_err(),
+            list_hubs_on(&api, &[base.as_str()]).await.unwrap_err(),
+        ];
+
+        // An upload is cut off after its listing has answered.
+        let dir = TempDir::new("cut-upload");
+        let path = dir.0.join("abc.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let answering = Server::new(|req: &Request, _| {
+            if req.method == "GET" {
+                json_reply(json!([]))
+            } else {
+                Fault::Disconnect
+            }
+        })
+        .await;
+        let p = project(&format!("{}/v1", answering.origin), Some("root-1"));
+        errors.push(
+            create_item(
+                &api_for(&answering.origin),
+                &p,
+                "folder-1",
+                "abc.txt",
+                "interaxo:pending",
+                &path,
+                &|_: u64, _: u64| {},
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        for err in &errors {
+            assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+            let text = format!("{err} {err:?}");
+            assert!(!text.contains("/v1/"), "{text}");
+            assert!(!text.contains("rooms"), "{text}");
+        }
     }
 
     #[tokio::test]
