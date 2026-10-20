@@ -15,26 +15,42 @@
             <TextBlock Text="{loc:T Sv='Inställningar', En='Settings'}"
                        Style="{StaticResource TitleTextBlockStyle}" />
 
-            <!-- The account the engine syncs. Signing out stops the sync for it. -->
-            <tk:SettingsCard Header="{loc:T Sv='Konto', En='Account'}"
-                             Description="{loc:T Sv='Kontot som synkar ACC Docs-filerna. Logga ut stoppar synken.', En='The account that syncs the ACC Docs files. Signing out stops the sync.'}">
-                <tk:SettingsCard.HeaderIcon>
+            <!-- The accounts, one per document provider, in the order of docs\IPC.md. Each
+                 card's state is its header description, written by RefreshAccounts(). -->
+            <TextBlock Text="{loc:T Sv='Konton', En='Accounts'}"
+                       Style="{StaticResource SubtitleTextBlockStyle}"
+                       Margin="0,8,0,0" />
+
+            <!-- ACC: browser sign-in. Signing out stops the sync for ACC projects. -->
+            <tk:SettingsExpander x:Name="AccExpander"
+                                 IsExpanded="True"
+                                 Header="{loc:T Sv='Autodesk Construction Cloud (ACC)', En='Autodesk Construction Cloud (ACC)'}">
+                <tk:SettingsExpander.HeaderIcon>
                     <FontIcon Glyph="&#xE77B;" />
-                </tk:SettingsCard.HeaderIcon>
-                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
-                    <TextBlock x:Name="AccountText"
-                               VerticalAlignment="Center"
-                               MaxWidth="320"
-                               TextWrapping="Wrap"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                    <Button x:Name="SignInButton"
-                            Content="{loc:T Sv='Logga in', En='Sign in'}"
-                            Click="OnSignIn" />
-                    <Button x:Name="SignOutButton"
-                            Content="{loc:T Sv='Logga ut', En='Sign out'}"
-                            Click="OnSignOut" />
-                </StackPanel>
-            </tk:SettingsCard>
+                </tk:SettingsExpander.HeaderIcon>
+                <tk:SettingsExpander.Items>
+                    <tk:SettingsCard>
+                        <StackPanel Spacing="10">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="AccSignInButton"
+                                        Content="{loc:T Sv='Logga in', En='Sign in'}"
+                                        AutomationProperties.Name="{loc:T Sv='Logga in på ACC', En='Sign in to ACC'}"
+                                        Click="OnAccSignIn" />
+                                <Button x:Name="AccSignOutButton"
+                                        Content="{loc:T Sv='Logga ut', En='Sign out'}"
+                                        AutomationProperties.Name="{loc:T Sv='Logga ut från ACC', En='Sign out of ACC'}"
+                                        Click="OnAccSignOut" />
+                            </StackPanel>
+                            <InfoBar x:Name="AccError"
+                                     Tag="acc"
+                                     Severity="Error"
+                                     IsOpen="False"
+                                     IsClosable="True"
+                                     Closed="OnProviderErrorClosed" />
+                        </StackPanel>
+                    </tk:SettingsCard>
+                </tk:SettingsExpander.Items>
+            </tk:SettingsExpander>
 
 
             <!-- Optional public APS app override. Older engines omit the capability flag. -->
@@ -96,6 +112,128 @@
                 </tk:SettingsExpander.Items>
             </tk:SettingsExpander>
 
+            <!-- StreamBIM: e-mail and password, with an MFA code when the account asks for one. -->
+            <tk:SettingsExpander x:Name="StreamBimExpander"
+                                 IsExpanded="True"
+                                 Header="StreamBIM">
+                <tk:SettingsExpander.HeaderIcon>
+                    <FontIcon Glyph="&#xE8A5;" />
+                </tk:SettingsExpander.HeaderIcon>
+                <tk:SettingsExpander.Items>
+                    <tk:SettingsCard x:Name="StreamBimFormCard">
+                        <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
+                            <ComboBox x:Name="StreamBimRegionBox"
+                                      Header="{loc:T Sv='Region', En='Region'}"
+                                      PlaceholderText="{loc:T Sv='Hämtar regioner …', En='Fetching regions …'}"
+                                      HorizontalAlignment="Stretch"
+                                      SelectionChanged="OnStreamBimRegionChanged"
+                                      AutomationProperties.Name="{loc:T Sv='StreamBIM-region', En='StreamBIM region'}" />
+                            <TextBox x:Name="StreamBimEmailBox"
+                                     Header="{loc:T Sv='E-post', En='E-mail'}"
+                                     MaxLength="256"
+                                     AcceptsReturn="False"
+                                     IsSpellCheckEnabled="False"
+                                     IsTextPredictionEnabled="False"
+                                     TextChanged="OnStreamBimFieldChanged"
+                                     AutomationProperties.Name="{loc:T Sv='StreamBIM e-post', En='StreamBIM e-mail'}" />
+                            <PasswordBox x:Name="StreamBimPasswordBox"
+                                         Header="{loc:T Sv='Lösenord', En='Password'}"
+                                         PasswordChanged="OnStreamBimPasswordChanged"
+                                         AutomationProperties.Name="{loc:T Sv='StreamBIM lösenord', En='StreamBIM password'}" />
+                            <InfoBar x:Name="StreamBimError"
+                                     Tag="streambim"
+                                     Severity="Error"
+                                     IsOpen="False"
+                                     IsClosable="True"
+                                     Closed="OnProviderErrorClosed" />
+                            <Button x:Name="StreamBimSignInButton"
+                                    Content="{loc:T Sv='Logga in', En='Sign in'}"
+                                    HorizontalAlignment="Left"
+                                    AutomationProperties.Name="{loc:T Sv='Logga in på StreamBIM', En='Sign in to StreamBIM'}"
+                                    Click="OnStreamBimSignIn" />
+                            <TextBlock Text="{loc:T Sv='StreamBIM använder e-post och lösenord. Konton som bara kan logga in med SSO stöds inte ännu.', En='StreamBIM uses e-mail and password. Accounts that can only sign in with SSO are not supported yet.'}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </tk:SettingsCard>
+                    <tk:SettingsCard x:Name="StreamBimSignedInCard">
+                        <Button x:Name="StreamBimSignOutButton"
+                                Content="{loc:T Sv='Logga ut', En='Sign out'}"
+                                AutomationProperties.Name="{loc:T Sv='Logga ut från StreamBIM', En='Sign out of StreamBIM'}"
+                                Click="OnStreamBimSignOut" />
+                    </tk:SettingsCard>
+                </tk:SettingsExpander.Items>
+            </tk:SettingsExpander>
+
+            <!-- Interaxo: the client id is the user's own (Interaxo support issues it); editable only while signed out. -->
+            <tk:SettingsExpander x:Name="InteraxoExpander"
+                                 IsExpanded="True"
+                                 Header="Interaxo">
+                <tk:SettingsExpander.HeaderIcon>
+                    <FontIcon Glyph="&#xE8D4;" />
+                </tk:SettingsExpander.HeaderIcon>
+                <tk:SettingsExpander.Items>
+                    <tk:SettingsCard x:Name="InteraxoClientCard"
+                                     Header="{loc:T Sv='Egen Interaxo-klient', En='Your Interaxo client'}"
+                                     Description="{loc:T Sv='Be Interaxo support om en Native-klient (Authorization Code + PKCE med refresh token) och registrera exakt den här redirect-URI:n.', En='Ask Interaxo support for a Native client (Authorization Code + PKCE with a refresh token) and register exactly this redirect URI.'}">
+                        <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
+                            <TextBox x:Name="InteraxoClientIdBox"
+                                     Header="Client ID"
+                                     PlaceholderText="{loc:T Sv='Client ID från Interaxo', En='Client ID from Interaxo'}"
+                                     MaxLength="256"
+                                     AcceptsReturn="False"
+                                     IsSpellCheckEnabled="False"
+                                     IsTextPredictionEnabled="False"
+                                     TextChanged="OnInteraxoFieldChanged"
+                                     AutomationProperties.Name="{loc:T Sv='Interaxo Client ID', En='Interaxo Client ID'}" />
+                            <TextBox x:Name="InteraxoRedirectBox"
+                                     Header="Redirect URI"
+                                     MaxLength="512"
+                                     AcceptsReturn="False"
+                                     IsSpellCheckEnabled="False"
+                                     IsTextPredictionEnabled="False"
+                                     TextChanged="OnInteraxoFieldChanged"
+                                     AutomationProperties.Name="{loc:T Sv='Interaxo redirect-URI', En='Interaxo redirect URI'}" />
+                            <PasswordBox x:Name="InteraxoSecretBox"
+                                         Header="{loc:T Sv='Client secret (valfritt)', En='Client secret (optional)'}"
+                                         AutomationProperties.Name="{loc:T Sv='Interaxo client secret', En='Interaxo client secret'}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="InteraxoSaveButton"
+                                        Content="{loc:T Sv='Spara', En='Save'}"
+                                        AutomationProperties.Name="{loc:T Sv='Spara Interaxo-inställningarna', En='Save the Interaxo settings'}"
+                                        Click="OnSaveInteraxo" />
+                                <Button x:Name="InteraxoClearSecretButton"
+                                        Visibility="Collapsed"
+                                        Content="{loc:T Sv='Ta bort', En='Remove'}"
+                                        AutomationProperties.Name="{loc:T Sv='Ta bort den sparade Interaxo-hemligheten', En='Remove the saved Interaxo secret'}"
+                                        Click="OnClearInteraxoSecret" />
+                            </StackPanel>
+                        </StackPanel>
+                    </tk:SettingsCard>
+                    <tk:SettingsCard x:Name="InteraxoAccountCard">
+                        <StackPanel Spacing="10">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="InteraxoSignInButton"
+                                        Content="{loc:T Sv='Logga in', En='Sign in'}"
+                                        AutomationProperties.Name="{loc:T Sv='Logga in på Interaxo', En='Sign in to Interaxo'}"
+                                        Click="OnInteraxoSignIn" />
+                                <Button x:Name="InteraxoSignOutButton"
+                                        Content="{loc:T Sv='Logga ut', En='Sign out'}"
+                                        AutomationProperties.Name="{loc:T Sv='Logga ut från Interaxo', En='Sign out of Interaxo'}"
+                                        Click="OnInteraxoSignOut" />
+                            </StackPanel>
+                            <InfoBar x:Name="InteraxoError"
+                                     Tag="interaxo"
+                                     Severity="Error"
+                                     IsOpen="False"
+                                     IsClosable="True"
+                                     Closed="OnProviderErrorClosed" />
+                        </StackPanel>
+                    </tk:SettingsCard>
+                </tk:SettingsExpander.Items>
+            </tk:SettingsExpander>
+
             <!--
                 Moving the folder is a full rebuild:
                 the engine checks the new place, restarts itself and builds every project
@@ -103,7 +241,7 @@
                 Återställ standardplats shows only while the folder is somewhere else.
             -->
             <tk:SettingsCard Header="{loc:T Sv='Synkmapp', En='Sync folder'}"
-                             Description="{loc:T Sv='Mappen där ACC Docs-filerna synkas. Flyttar du den byggs alla projekt om på den nya platsen.', En='The folder where the ACC Docs files are synced. Moving it rebuilds every project in the new place.'}">
+                             Description="{loc:T Sv='Mappen där projektfilerna synkas. Flyttar du den byggs alla projekt om på den nya platsen.', En='The folder where the project files are synced. Moving it rebuilds every project in the new place.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE8B7;" />
                 </tk:SettingsCard.HeaderIcon>
@@ -141,14 +279,14 @@
                               AutomationProperties.Name="{loc:T Sv='Starta vid inloggning', En='Start at sign-in'}" />
             </tk:SettingsCard>
 
-            <tk:SettingsCard Header="{loc:T Sv='Radera i ACC när du raderar lokalt', En='Delete in ACC when you delete locally'}"
-                             Description="{loc:T Sv='Av: en fil som raderas här ligger kvar i ACC. På: raderingen följer med till ACC.', En='Off: a file deleted here stays in ACC. On: the deletion is passed on to ACC.'}">
+            <tk:SettingsCard Header="{loc:T Sv='Radera i molnet när du raderar lokalt', En='Delete in the cloud when you delete locally'}"
+                             Description="{loc:T Sv='Av: en fil som raderas här ligger kvar i molnet. På: raderingen följer med till molnet.', En='Off: a file deleted here stays in the cloud. On: the deletion is passed on to the cloud.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE74D;" />
                 </tk:SettingsCard.HeaderIcon>
                 <ToggleSwitch x:Name="PropagateSwitch"
                               Toggled="OnPropagateToggled"
-                              AutomationProperties.Name="{loc:T Sv='Radera i ACC', En='Delete in ACC'}" />
+                              AutomationProperties.Name="{loc:T Sv='Radera i molnet', En='Delete in the cloud'}" />
             </tk:SettingsCard>
 
             <tk:SettingsCard Header="{loc:T Sv='Samtidiga nedladdningar', En='Simultaneous downloads'}"
@@ -183,7 +321,7 @@
                            ValueChanged="OnMaxUploadsChanged" />
             </tk:SettingsCard>
 
-            <tk:SettingsCard Header="{loc:T Sv='Hur ofta ACC kontrolleras', En='How often ACC is checked'}"
+            <tk:SettingsCard Header="{loc:T Sv='Hur ofta molnet kontrolleras', En='How often the cloud is checked'}"
                              Description="{loc:T Sv='Sekunder mellan kontrollerna medan du arbetar, 15–300. Motorn kontrollerar glesare när datorn inte används.', En='Seconds between the checks while you work, 15–300. The engine checks less often when the computer is idle.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE916;" />
@@ -200,7 +338,7 @@
             </tk:SettingsCard>
 
             <tk:SettingsCard Header="{loc:T Sv='Frigör utrymme', En='Free up space'}"
-                             Description="{loc:T Sv='Tar bort lokala kopior av synkade filer i alla projekt och avmarkerar Behåll alltid på den här enheten för dem och deras mappar. Osynkade ändringar behålls lokalt. Filerna finns kvar i ACC.', En='Removes local copies of synced files in all projects and clears Always keep on this device for them and their folders. Unsynced changes stay local. The files remain in ACC.'}">
+                             Description="{loc:T Sv='Tar bort lokala kopior av synkade filer i alla projekt och avmarkerar Behåll alltid på den här enheten för dem och deras mappar. Osynkade ändringar behålls lokalt. Filerna finns kvar i molnet.', En='Removes local copies of synced files in all projects and clears Always keep on this device for them and their folders. Unsynced changes stay local. The files remain in the cloud.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xEDA2;" />
                 </tk:SettingsCard.HeaderIcon>
@@ -338,11 +476,11 @@
                                 Click="OnRestartEngine" />
                     </tk:SettingsCard>
                     <!-- The last resort: asks first. Each project reports in its own notify. -->
-                    <tk:SettingsCard Header="{loc:T Sv='Bygg om alla projekt från ACC', En='Rebuild all projects from ACC'}"
-                                     Description="{loc:T Sv='Varje projekt byggs om från ACC där det ligger. Hjälper när synken har kört fast.', En='Every project is rebuilt from ACC where it is. Helps when the sync is stuck.'}">
+                    <tk:SettingsCard Header="{loc:T Sv='Bygg om alla projekt från molnet', En='Rebuild all projects from the cloud'}"
+                                     Description="{loc:T Sv='Varje projekt byggs om från molnet där det ligger. Hjälper när synken har kört fast.', En='Every project is rebuilt from the cloud where it is. Helps when the sync is stuck.'}">
                         <Button x:Name="RebuildAllButton"
                                 Content="{loc:T Sv='Bygg om…', En='Rebuild…'}"
-                                AutomationProperties.Name="{loc:T Sv='Bygg om alla projekt från ACC', En='Rebuild all projects from ACC'}"
+                                AutomationProperties.Name="{loc:T Sv='Bygg om alla projekt från molnet', En='Rebuild all projects from the cloud'}"
                                 Click="OnRebuildAll" />
                     </tk:SettingsCard>
                 </tk:SettingsExpander.Items>

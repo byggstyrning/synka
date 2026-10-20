@@ -28,6 +28,7 @@ internal static class Program
             ("activity_mime_mismatch_preserves_item_reason", ActivityMimeMismatchPreservesItemReason),
             ("activity_error_details_redact_credentials", ActivityErrorDetailsRedactCredentials),
             ("activity_local_paths_with_spaces_are_fully_redacted", ActivityLocalPathsWithSpacesAreFullyRedacted),
+            ("provider_messages_parse_and_commands_carry_protocol_fields", ProviderMessagesParseAndCommandsCarryProtocolFields),
         };
         var selected = args.Length == 0 ? null : args[0];
         if (selected is not null && !scenarios.Any(s => s.Name == selected))
@@ -75,6 +76,94 @@ internal static class Program
         Console.WriteLine($"Report: {reportPath}");
         Console.WriteLine($"UI audit: {results.Count - failures} passed; {failures} failed;");
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// The multi-provider messages (accounts, hub provider, provider settings, sign-in progress,
+    /// StreamBIM regions) parse, an older engine's status still gives the ACC account, and each
+    /// new command carries exactly the fields of docs\IPC.md through the real pipe.
+    /// </summary>
+    private static async Task<string> ProviderMessagesParseAndCommandsCarryProtocolFields()
+    {
+        using var pipes = await PipePair.Connect();
+        var client = NewClient();
+        var progress = new List<string>();
+        client.SignInProgress += info => progress.Add(info.Provider + ":" + info.State);
+        var serving = Serve(client, pipes.Window);
+        await pipes.AckHello();
+
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":true,"user":{"name":"Anna","email":"a@x.se"},"state":"synced","accounts":[{"provider":"acc","label":"ACC","configured":true,"signed_in":true,"signing_in":false,"user":{"name":"Anna","email":"a@x.se"},"host":null},{"provider":"streambim","label":"StreamBIM","configured":true,"signed_in":true,"signing_in":false,"user":{"name":"Bo","email":"b@x.se"},"host":"app.streambim.com"},{"provider":"interaxo","label":"Interaxo","configured":false,"signed_in":false,"signing_in":false,"user":null,"host":null}]}""");
+        await Until(() => client.Accounts.Count == 3);
+        Require(client.IsSignedIn, "Status with accounts did not make the window signed in");
+        Require(client.AccountFor("streambim") is { SignedIn: true, Host: "app.streambim.com" } bo && bo.User?.Name == "Bo",
+            "StreamBIM account (signed in, host, user) did not parse");
+        Require(client.AccountFor("interaxo") is { Configured: false, SignedIn: false }, "Interaxo account did not parse");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"projects","loading":false,"hubs":[{"id":"streambim:app","name":"StreamBIM","provider":"streambim","projects":[{"id":"streambim:app:1552","name":"Projekt","subscribed":true,"local_path":"C:/Synka/StreamBIM/Projekt"}]},{"id":"b.1","name":"Byggbolaget","projects":[]}]}""");
+        await Until(() => client.Projects?.Hubs?.Count == 2);
+        Require(client.Projects!.Hubs![0].Provider == "streambim" && client.Projects.Hubs[1].Provider is null,
+            "Hub provider did not parse, or a hub without one is not null (ACC by default)");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"settings","propagate_deletes":false,"max_downloads":4,"max_uploads":2,"poll_active_secs":60,"log_level":"info","start_at_login":false,"sync_root":"C:/Synka","client_id_configured":true,"providers":["acc","streambim","interaxo"],"interaxo_client_id":"my-client","interaxo_redirect_uri":"http://localhost:47864/","interaxo_redirect_uri_default":"http://localhost:47864/","interaxo_client_secret_set":true}""");
+        await Until(() => client.Settings?.InteraxoClientSecretSet == true);
+        Require(client.Settings!.Providers?.Count == 3 && client.Settings.InteraxoClientId == "my-client"
+            && client.Settings.InteraxoRedirectUriDefault == "http://localhost:47864/",
+            "Provider settings did not parse");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"sign_in_progress","provider":"streambim","state":"mfa_required","error":null}""");
+        await Until(() => client.SignInProgressFor("streambim")?.State == "mfa_required");
+        Require(progress.Contains("streambim:mfa_required"), "sign_in_progress event was not raised");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"streambim_regions","regions":[{"subdomain":"app","title":"Europa","is_default":true},{"subdomain":"sweden","title":"Sverige","is_default":false}]}""");
+        await Until(() => client.StreamBimRegions?.Regions?.Count == 2);
+        Require(client.StreamBimRegions!.Regions![0] is { Subdomain: "app", IsDefault: true }, "StreamBIM regions did not parse");
+
+        // An older engine: no accounts. The ACC account comes from signed_in and user; the others are unknown.
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":true,"user":{"name":"Anna","email":"a@x.se"},"state":"synced"}""");
+        await Until(() => client.Accounts.Count == 0 && client.Status?.State == "synced");
+        Require(client.AccountFor("acc") is { SignedIn: true } acc && acc.User?.Email == "a@x.se",
+            "Older engine: ACC account was not taken from signed_in and user");
+        Require(client.AccountFor("streambim") is null, "Older engine: a provider it does not report was not null");
+
+        var streamBim = client.SignInStreamBimAsync("sweden", "b@x.se", "Hemligt-123");
+        var sign = await ExpectCommand(pipes, streamBim, "sign_in");
+        Require(sign.GetProperty("provider").GetString() == "streambim" && sign.GetProperty("region").GetString() == "sweden"
+            && sign.GetProperty("username").GetString() == "b@x.se" && sign.GetProperty("password").GetString() == "Hemligt-123",
+            "sign_in for StreamBIM did not carry provider, region, username and password");
+
+        var mfa = await ExpectCommand(pipes, client.SignInMfaAsync("streambim", "012345"), "sign_in_mfa");
+        Require(mfa.GetProperty("provider").GetString() == "streambim" && mfa.GetProperty("code").GetString() == "012345",
+            "sign_in_mfa did not send the code as a string with its leading zero");
+
+        var cancel = await ExpectCommand(pipes, client.CancelSignInAsync("streambim"), "cancel_sign_in");
+        Require(cancel.GetProperty("provider").GetString() == "streambim", "cancel_sign_in did not name the provider");
+
+        var signOutAll = await ExpectCommand(pipes, client.SignOutAsync(), "sign_out");
+        Require(!signOutAll.TryGetProperty("provider", out _), "sign_out without a provider sent one");
+
+        var signOutOne = await ExpectCommand(pipes, client.SignOutAsync("interaxo"), "sign_out");
+        Require(signOutOne.GetProperty("provider").GetString() == "interaxo", "sign_out did not name the provider");
+
+        var signIn = await ExpectCommand(pipes, client.SignInAsync(), "sign_in");
+        Require(signIn.GetProperty("provider").GetString() == "acc", "sign_in without an argument did not mean ACC");
+
+        await ExpectCommand(pipes, client.RequestStreamBimRegionsAsync(), "streambim_regions");
+
+        return "Accounts, hub provider, provider settings, sign-in progress and regions parsed; an older status fell back to ACC; "
+            + "sign_in (StreamBIM, ACC), sign_in_mfa, cancel_sign_in, sign_out (all and one) and streambim_regions sent their protocol fields";
+    }
+
+    /// <summary>Takes the next command the client writes, checks its name, acks it, and returns it.</summary>
+    private static async Task<JsonElement> ExpectCommand(PipePair pipes, Task<Ack> call, string cmd)
+    {
+        using var document = JsonDocument.Parse(await pipes.Read());
+        var root = document.RootElement.Clone();
+        var name = root.GetProperty("cmd").GetString();
+        Require(name == cmd, $"Expected the command {cmd}, the client sent {name}");
+        await pipes.Writer.WriteLineAsync(JsonSerializer.Serialize(new { type = "ack", id = root.GetProperty("id").GetInt64(), ok = true }));
+        var ack = await call;
+        Require(ack.Ok, $"{cmd} was not acknowledged: {ack.Error}");
+        return root;
     }
 
     private static string FindRepo()
