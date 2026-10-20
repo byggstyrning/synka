@@ -321,6 +321,82 @@ fn a_rename_the_provider_refuses_keeps_the_local_name_and_queues_nothing_more() 
         "b.txt"
     );
     assert!(due(&f).is_empty(), "and no second job");
+
+    // Refused moves of a file and of a folder (Interaxo has no move). Locally they sit in the
+    // new folder "fb". The listing of the old parent "fa" still shows them there, the listing of
+    // "fb" does not: neither poll may delete them from "fb" and re-create them in "fa" again.
+    for dir in [
+        row(&f.p, "fa", Some("co.ROOT"), "Ritningar", Kind::Folder),
+        row(&f.p, "fb", Some("co.ROOT"), "Arkiv", Kind::Folder),
+        row(&f.p, "FX", Some("fb"), "Skiss", Kind::Folder),
+    ] {
+        f.ctx.store.upsert_item(&dir).unwrap();
+    }
+    for file in [
+        row(&f.p, "F1", Some("fb"), "plan.pdf", Kind::File),
+        row(&f.p, "G1", Some("FX"), "bild.jpg", Kind::File),
+    ] {
+        f.ctx.store.upsert_item(&file).unwrap();
+    }
+    for id in ["F1", "FX"] {
+        let job = f
+            .ctx
+            .store
+            .enqueue(f.p.pid, "move", Some(id), "{}")
+            .unwrap();
+        f.ctx
+            .store
+            .job_unsupported(job, "Interaxo API:t kan inte flytta filer.")
+            .unwrap();
+    }
+    let remote = |f: &Fixture| {
+        vec![
+            (
+                "fa",
+                vec![
+                    row(&f.p, "F1", Some("fa"), "plan.pdf", Kind::File),
+                    row(&f.p, "FX", Some("fa"), "Skiss", Kind::Folder),
+                ],
+            ),
+            ("fb", Vec::new()),
+            (
+                "FX",
+                vec![row(&f.p, "G1", Some("FX"), "bild.jpg", Kind::File)],
+            ),
+        ]
+    };
+    assert_eq!(refused_move_poll(&f, remote(&f)), 0, "first poll");
+    assert_eq!(refused_move_poll(&f, remote(&f)), 0, "second poll");
+    for (id, parent) in [("F1", "fb"), ("FX", "fb"), ("G1", "FX")] {
+        assert_eq!(
+            f.ctx
+                .store
+                .item(f.p.pid, id)
+                .unwrap()
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some(parent),
+            "{id} keeps its local place"
+        );
+    }
+}
+
+/// One poll over the given folder listings (the walk of `poll_project`, minus the disk); returns
+/// how many store changes it applied, which is what the engine reports as activity.
+fn refused_move_poll(f: &Fixture, listings: Vec<(&str, Vec<crate::model::Item>)>) -> usize {
+    let mut delta = Delta::default();
+    for (folder, remote) in listings {
+        let local = f.ctx.store.children(f.p.pid, folder).unwrap();
+        diff_listing(&local, remote, &mut delta);
+    }
+    keep_pending_local(&f.ctx.store, f.p.pid, &mut delta).unwrap();
+    f.ctx
+        .store
+        .apply_delta(f.p.pid, &delta)
+        .unwrap()
+        .changes
+        .len()
 }
 
 #[tokio::test]
