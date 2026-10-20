@@ -47,17 +47,38 @@ public sealed partial class SettingsPage : Page
     /// <summary>A refusal of the last update command, shown until the engine says something newer.</summary>
     private string? _updateProblem;
 
-    /// <summary>The StreamBIM region the user picked (its subdomain). Null until they pick one: the engine's default is used then.</summary>
+    /// <summary>
+    /// The StreamBIM server the user picked in the form: a region's subdomain, or <see cref="OtherServerTag"/>
+    /// for a custom address. Null until they pick one: the engine's default is used then.
+    /// </summary>
     private string? _streamBimRegionChoice;
+
+    /// <summary>The server list's last item: a custom https address, typed in the address box. Not a valid subdomain.</summary>
+    private const string OtherServerTag = "#other";
 
     /// <summary>True while the region list is rebuilt: the ComboBox's selection is then not the user's choice.</summary>
     private bool _populatingRegions;
+
+    /// <summary>The account the form last sent a sign-in for, or whose sign-in failed. Its message is shown, and a success resets the form.</summary>
+    private string? _streamBimFormKey;
+
+    /// <summary>A sign-in from the form is on its way to the engine: Logga in waits for the answer.</summary>
+    private bool _streamBimSending;
+
+    /// <summary>The account cards above the form, kept so they can be replaced when the accounts change.</summary>
+    private readonly List<SettingsCard> _streamBimRows = new();
+
+    /// <summary>What the account cards show last. They are rebuilt only when this changes.</summary>
+    private string _streamBimRowsSignature = string.Empty;
 
     /// <summary>The user has typed in the Interaxo fields since the last save: the engine's values then wait.</summary>
     private bool _interaxoEdited;
 
     /// <summary>The StreamBIM MFA dialog while it is open. Null otherwise.</summary>
     private ContentDialog? _mfaDialog;
+
+    /// <summary>The StreamBIM account whose code the open MFA dialog asks for. Null when no dialog is open.</summary>
+    private string? _mfaAccount;
 
     /// <summary>The code box of the open MFA dialog.</summary>
     private TextBox? _mfaCode;
@@ -69,14 +90,15 @@ public sealed partial class SettingsPage : Page
     private bool _mfaEndedByEngine;
 
     /// <summary>
-    /// The prompt the user closed with Avbryt. The dialog does not come back for that same
-    /// prompt while the engine still reports it (before its `cancelled` arrives).
+    /// The code prompts the user closed with Avbryt, per StreamBIM account. A prompt does not come back
+    /// while the engine still reports that same prompt (before its `cancelled` arrives).
     /// </summary>
-    private SignInProgressInfo? _mfaDismissedFor;
+    private readonly Dictionary<string, SignInProgressInfo> _mfaDismissed = new();
 
     /// <summary>
     /// The failure a provider's card no longer shows: closed by the user, or superseded by a
     /// retry. The same failure does not come back on the next status; a new one (a new message) does.
+    /// Keyed by <see cref="FailureKey"/>.
     /// </summary>
     private readonly Dictionary<string, SignInProgressInfo> _dismissedFailures = new();
 
@@ -126,7 +148,7 @@ public sealed partial class SettingsPage : Page
 
         // A signed-in provider's card starts folded; one that needs the user starts open.
         AccExpander.IsExpanded = _engine.AccountFor(ProviderNames.Acc) is not { SignedIn: true };
-        StreamBimExpander.IsExpanded = _engine.AccountFor(ProviderNames.StreamBim) is not { SignedIn: true };
+        StreamBimExpander.IsExpanded = !_engine.StreamBimAccounts.Any(account => account.SignedIn);
         InteraxoExpander.IsExpanded = _engine.AccountFor(ProviderNames.Interaxo) is not { SignedIn: true };
 
         // The engine may be waiting for an MFA code that was asked for while this page was closed.
@@ -188,7 +210,7 @@ public sealed partial class SettingsPage : Page
                 // The engine's MFA wait does not outlive the connection: the dialog closes with it.
                 if (!_engine.IsConnected)
                 {
-                    HideMfaDialog();
+                    CloseMfaDialogOnDisconnect();
                 }
                 RefreshAccounts();
                 RefreshFolder();
@@ -316,7 +338,8 @@ public sealed partial class SettingsPage : Page
     private void RefreshAccounts()
     {
         RefreshAccAccount();
-        RefreshStreamBimAccount();
+        RefreshStreamBimAccounts();
+        RefreshStreamBimForm();
         RefreshInteraxoAccount();
     }
 
@@ -346,12 +369,16 @@ public sealed partial class SettingsPage : Page
         ShowFailure(AccError, ProviderNames.Acc);
     }
 
-    private void RefreshStreamBimAccount()
+    /// <summary>
+    /// The StreamBIM expander's line, and one card per account the engine reports as signed in or
+    /// signing in, above the form. The cards are rebuilt only when what they show changes.
+    /// </summary>
+    private void RefreshStreamBimAccounts()
     {
         var connected = _engine.IsConnected;
-        var account = connected ? _engine.AccountFor(ProviderNames.StreamBim) : null;
-        var signedIn = account is { SignedIn: true };
-        var editable = account is { SignedIn: false, SigningIn: false };
+        var accounts = connected ? _engine.StreamBimAccounts : Array.Empty<AccountInfo>();
+        var signedIn = accounts.Where(account => account.SignedIn).ToList();
+        var signingIn = accounts.Where(account => !account.SignedIn && account.SigningIn).ToList();
 
         string state;
         if (!connected)
@@ -362,19 +389,22 @@ public sealed partial class SettingsPage : Page
         {
             state = Lang.T("Hämtar kontot …", "Fetching the account …");
         }
-        else if (account is null)
+        else if (_engine.Status.Accounts is null)
         {
             // An older engine has no StreamBIM at all.
             state = Lang.T("Uppdatera motorn för att logga in här.", "Update the engine to sign in here.");
         }
-        else if (signedIn)
+        else if (signedIn.Count == 1)
         {
-            var host = string.IsNullOrWhiteSpace(account.Host) ? string.Empty : " · " + account.Host;
-            state = SignedInAs(account.User) + host;
+            state = SignedInAs(signedIn[0].User) + " · " + ServerHost(signedIn[0]);
         }
-        else if (account.SigningIn)
+        else if (signedIn.Count > 1)
         {
-            state = _engine.SignInProgressFor(ProviderNames.StreamBim)?.State == "mfa_required"
+            state = Lang.T($"Inloggad på {signedIn.Count} StreamBIM-servrar", $"Signed in to {signedIn.Count} StreamBIM servers");
+        }
+        else if (signingIn.Count > 0)
+        {
+            state = signingIn.Any(WaitsForCode)
                 ? Lang.T("Väntar på koden från autentiseringsappen…", "Waiting for the code from your authenticator app…")
                 : Lang.T("Loggar in på StreamBIM…", "Signing in to StreamBIM…");
         }
@@ -384,17 +414,170 @@ public sealed partial class SettingsPage : Page
         }
         SetDescription(StreamBimExpander, state);
 
-        Show(StreamBimFormCard, !signedIn);
-        Show(StreamBimSignedInCard, signedIn);
+        // An account without its key cannot be told apart from the others, so it gets no card (and no buttons).
+        var rows = accounts
+            .Where(account => (account.SignedIn || account.SigningIn) && !string.IsNullOrEmpty(account.Account))
+            .ToList();
+        var signature = connected + "\n" + string.Join("\n", rows.Select(account => string.Join("|",
+            account.Account, account.Host, account.SignedIn, account.SigningIn, account.User?.Name, account.User?.Email,
+            WaitsForCode(account), ProviderNames.StreamBimName(account, _engine.StreamBimRegions))));
+        if (signature == _streamBimRowsSignature)
+        {
+            return;
+        }
+        _streamBimRowsSignature = signature;
+
+        foreach (var card in _streamBimRows)
+        {
+            StreamBimExpander.Items.Remove(card);
+        }
+        _streamBimRows.Clear();
+        foreach (var account in rows)
+        {
+            _streamBimRows.Add(BuildStreamBimRow(account, connected));
+        }
+        for (var index = 0; index < _streamBimRows.Count; index++)
+        {
+            StreamBimExpander.Items.Insert(index, _streamBimRows[index]);
+        }
+    }
+
+    /// <summary>One account's card: its hub-style name, the server's host and its state, with Logga ut (signed in) or Avbryt (signing in).</summary>
+    private SettingsCard BuildStreamBimRow(AccountInfo account, bool connected)
+    {
+        var key = account.Account ?? string.Empty;
+        var host = ServerHost(account);
+        var signedIn = account.SignedIn;
+        var state = signedIn
+            ? SignedInAs(account.User)
+            : WaitsForCode(account)
+                ? Lang.T("Väntar på kod…", "Waiting for code…")
+                : Lang.T("Loggar in…", "Signing in…");
+
+        var button = new Button
+        {
+            Content = signedIn ? Lang.T("Logga ut", "Sign out") : Lang.T("Avbryt", "Cancel"),
+            IsEnabled = connected,
+        };
+        AutomationProperties.SetName(button, signedIn
+            ? Lang.T($"Logga ut från StreamBIM, {host}", $"Sign out of StreamBIM, {host}")
+            : Lang.T($"Avbryt inloggningen på StreamBIM, {host}", $"Cancel the sign-in to StreamBIM, {host}"));
+        button.Click += async (_, _) =>
+        {
+            if (signedIn)
+            {
+                await SignOutStreamBimAsync(key);
+            }
+            else
+            {
+                await CancelStreamBimSignInAsync(key);
+            }
+        };
+
+        return new SettingsCard
+        {
+            Header = ProviderNames.StreamBimName(account, _engine.StreamBimRegions),
+            Description = host + " · " + state,
+            Content = button,
+        };
+    }
+
+    /// <summary>
+    /// The sign-in form: the server list (a server that is signed in is disabled and marked), the own
+    /// address with its warning and inline check, and Logga in. Nothing here is sent by itself.
+    /// </summary>
+    private void RefreshStreamBimForm()
+    {
+        var connected = _engine.IsConnected;
+        // An older engine reports no accounts and takes no StreamBIM sign-in: the form waits for an update.
+        var editable = connected && _engine.Status?.Accounts is not null;
+        var signedIn = new HashSet<string>(
+            _engine.StreamBimAccounts
+                .Where(account => account.SignedIn && !string.IsNullOrEmpty(account.Account))
+                .Select(account => account.Account!),
+            StringComparer.Ordinal);
+
+        foreach (var item in StreamBimRegionBox.Items.OfType<ComboBoxItem>())
+        {
+            if (item.Tag is not string tag || tag == OtherServerTag)
+            {
+                continue;
+            }
+            var taken = signedIn.Contains(tag);
+            var content = taken ? RegionTitle(tag) + " " + Lang.T("(inloggad)", "(signed in)") : RegionTitle(tag);
+            if (!Equals(item.Content, content))
+            {
+                item.Content = content;
+            }
+            item.IsEnabled = !taken;
+        }
+        EnsureServerPicked();
+
+        var other = IsOtherServerPicked();
+        Show(StreamBimUrlBox, other);
+        Show(StreamBimUrlWarning, other);
+
+        var urlReady = false;
+        string? urlError = null;
+        if (other)
+        {
+            var typed = StreamBimUrlBox.Text.Trim();
+            if (StreamBimAddress.TryParse(typed, out var address, out var problem))
+            {
+                if (signedIn.Contains(address.Key))
+                {
+                    urlError = Lang.T(
+                        $"Du är redan inloggad på {address.Host} – logga ut först.",
+                        $"You are already signed in to {address.Host} – sign out first.");
+                }
+                else
+                {
+                    urlReady = true;
+                }
+            }
+            else if (typed.Length > 0)
+            {
+                urlError = problem;
+            }
+        }
+        if (StreamBimUrlError.Text != (urlError ?? string.Empty))
+        {
+            StreamBimUrlError.Text = urlError ?? string.Empty;
+        }
+        Show(StreamBimUrlError, urlError is not null);
+
+        var ready = editable && !_streamBimSending
+            && StreamBimEmailBox.Text.Trim().Length > 0
+            && StreamBimPasswordBox.Password.Length > 0
+            && (other ? urlReady : SelectedRegion() is not null);
         StreamBimRegionBox.IsEnabled = editable;
+        StreamBimUrlBox.IsEnabled = editable;
         StreamBimEmailBox.IsEnabled = editable;
         StreamBimPasswordBox.IsEnabled = editable;
-        StreamBimSignInButton.IsEnabled = editable
-            && SelectedRegion() is not null
-            && StreamBimEmailBox.Text.Trim().Length > 0
-            && StreamBimPasswordBox.Password.Length > 0;
-        StreamBimSignOutButton.IsEnabled = connected && signedIn;
-        ShowFailure(StreamBimError, ProviderNames.StreamBim);
+        StreamBimSignInButton.IsEnabled = ready;
+        ShowFailure(StreamBimError, ProviderNames.StreamBim, _streamBimFormKey);
+    }
+
+    /// <summary>The engine waits for this StreamBIM account's code: its latest progress says mfa_required.</summary>
+    private bool WaitsForCode(AccountInfo account) =>
+        !account.SignedIn && _engine.SignInProgressFor(ProviderNames.StreamBim, account.Account)?.State == "mfa_required";
+
+    /// <summary>The server's host: the region's `&lt;subdomain&gt;.streambim.com` or the custom address's host, or the account key when the engine sends none.</summary>
+    private static string ServerHost(AccountInfo account) =>
+        string.IsNullOrWhiteSpace(account.Host) ? account.Account ?? string.Empty : account.Host;
+
+    /// <summary>The host of a StreamBIM account by its key, for the words the window shows.</summary>
+    private string ServerHostFor(string account) =>
+        _engine.StreamBimAccounts.FirstOrDefault(info => info.Account == account) is { } found
+            ? ServerHost(found)
+            : account;
+
+    /// <summary>A region's title from the engine's list, or its subdomain when the list does not name it.</summary>
+    private string RegionTitle(string subdomain)
+    {
+        var title = _engine.StreamBimRegions?.Regions?
+            .FirstOrDefault(region => region is not null && region.Subdomain == subdomain)?.Title;
+        return string.IsNullOrWhiteSpace(title) ? subdomain : title.Trim();
     }
 
     private void RefreshInteraxoAccount()
@@ -457,13 +640,13 @@ public sealed partial class SettingsPage : Page
     /// already retried stays hidden until the engine reports a new one. A cancelled sign-in
     /// shows only when the engine says why (the user's own Avbryt says nothing).
     /// </summary>
-    private void ShowFailure(InfoBar bar, string provider)
+    private void ShowFailure(InfoBar bar, string provider, string? account = null)
     {
-        var progress = _engine.SignInProgressFor(provider);
+        var progress = _engine.SignInProgressFor(provider, account);
         var reported = progress is { State: "failed" }
             || (progress is { State: "cancelled" } && !string.IsNullOrEmpty(progress.Error));
         var failed = reported
-            && !(_dismissedFailures.TryGetValue(provider, out var dismissed) && ReferenceEquals(dismissed, progress));
+            && !(_dismissedFailures.TryGetValue(FailureKey(provider, account), out var dismissed) && ReferenceEquals(dismissed, progress));
 
         var message = string.Empty;
         if (failed)
@@ -486,13 +669,15 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>Remembers the failure on screen as seen: a new sign-in attempt hides the old message.</summary>
-    private void DismissFailure(string provider)
+    private void DismissFailure(string provider, string? account = null)
     {
-        if (_engine.SignInProgressFor(provider) is { } progress)
+        if (_engine.SignInProgressFor(provider, account) is { } progress)
         {
-            _dismissedFailures[provider] = progress;
+            _dismissedFailures[FailureKey(provider, account)] = progress;
         }
     }
+
+    private static string FailureKey(string provider, string? account) => provider + "/" + (account ?? string.Empty);
 
     private void OnProviderErrorClosed(InfoBar sender, InfoBarClosedEventArgs args)
     {
@@ -554,51 +739,155 @@ public sealed partial class SettingsPage : Page
             Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
     }
 
-    /// <summary>The region the user picked, or the engine's default; null when the list is empty.</summary>
+    /// <summary>The server the user picked, or null when the own address is picked or nothing is.</summary>
     private string? SelectedRegion() =>
-        StreamBimRegionBox.SelectedItem is ComboBoxItem { Tag: string tag } && tag.Length > 0 ? tag : null;
+        StreamBimRegionBox.SelectedItem is ComboBoxItem { Tag: string tag } && tag.Length > 0 && tag != OtherServerTag
+            ? tag
+            : null;
+
+    /// <summary>True when the server list's last item, the own address, is picked.</summary>
+    private bool IsOtherServerPicked() =>
+        StreamBimRegionBox.SelectedItem is ComboBoxItem { Tag: OtherServerTag };
 
     /// <summary>
-    /// The password goes to the engine once. Its box is emptied before the command is built,
-    /// so it is not left on screen, and nothing keeps it after the command has gone.
+    /// Sends a StreamBIM sign-in from the form. The password goes to the engine once: its box is
+    /// emptied as the sign-in is sent, and nothing keeps it afterwards. The form follows this account
+    /// until the engine reports how the attempt went.
     /// </summary>
     private async void OnStreamBimSignIn(object sender, RoutedEventArgs args)
     {
-        var region = SelectedRegion();
-        var username = StreamBimEmailBox.Text.Trim();
-        var password = StreamBimPasswordBox.Password;
-        StreamBimPasswordBox.Password = string.Empty;
-        if (region is null || username.Length == 0 || password.Length == 0)
+        string? region = null;
+        string? url = null;
+        string key;
+        if (IsOtherServerPicked())
         {
-            RefreshAccounts();
+            if (!StreamBimAddress.TryParse(StreamBimUrlBox.Text, out var address, out _))
+            {
+                RefreshStreamBimForm();
+                return;
+            }
+            url = address.Url;
+            key = address.Key;
+        }
+        else if (SelectedRegion() is { } chosen)
+        {
+            region = chosen;
+            key = chosen;
+        }
+        else
+        {
+            RefreshStreamBimForm();
             return;
         }
 
-        DismissFailure(ProviderNames.StreamBim);
-        RefreshAccounts();
-        var ack = await _engine.SignInStreamBimAsync(region, username, password);
-        ReportIfFailed(ack, Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
-        RefreshAccounts();
+        var username = StreamBimEmailBox.Text.Trim();
+        var password = StreamBimPasswordBox.Password;
+        if (username.Length == 0 || password.Length == 0)
+        {
+            RefreshStreamBimForm();
+            return;
+        }
+        StreamBimPasswordBox.Password = string.Empty;
+
+        _streamBimFormKey = key;
+        DismissFailure(ProviderNames.StreamBim, key);
+        _streamBimSending = true;
+        RefreshStreamBimForm();
+        try
+        {
+            var ack = await _engine.SignInStreamBimAsync(region, url, username, password);
+            ReportIfFailed(ack, Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+        }
+        finally
+        {
+            _streamBimSending = false;
+            RefreshAccounts();
+        }
     }
 
-    private async void OnStreamBimSignOut(object sender, RoutedEventArgs args)
+    /// <summary>Signs out of one StreamBIM account (its card's Logga ut).</summary>
+    private async Task SignOutStreamBimAsync(string account)
     {
-        ReportIfFailed(await _engine.SignOutAsync(ProviderNames.StreamBim),
+        ReportIfFailed(await _engine.SignOutAsync(ProviderNames.StreamBim, account),
             Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
     }
 
-    private void OnStreamBimRegionChanged(object sender, SelectionChangedEventArgs args)
+    /// <summary>Ends one StreamBIM account's sign-in while it waits (its card's Avbryt). The engine reports `cancelled`.</summary>
+    private async Task CancelStreamBimSignInAsync(string account)
     {
-        if (!_populatingRegions && SelectedRegion() is { } region)
-        {
-            _streamBimRegionChoice = region;
-        }
+        ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.StreamBim, account),
+            Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
         RefreshAccounts();
     }
 
-    private void OnStreamBimFieldChanged(object sender, TextChangedEventArgs args) => RefreshAccounts();
+    /// <summary>The server the user picks is remembered, and the form follows it.</summary>
+    private void OnStreamBimRegionChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (!_populatingRegions && StreamBimRegionBox.SelectedItem is ComboBoxItem { Tag: string tag } && tag.Length > 0)
+        {
+            _streamBimRegionChoice = tag;
+        }
+        RefreshStreamBimForm();
+    }
 
-    private void OnStreamBimPasswordChanged(object sender, RoutedEventArgs args) => RefreshAccounts();
+    private void OnStreamBimFieldChanged(object sender, TextChangedEventArgs args) => RefreshStreamBimForm();
+
+    private void OnStreamBimPasswordChanged(object sender, RoutedEventArgs args) => RefreshStreamBimForm();
+
+    /// <summary>The user closed the StreamBIM message: it stays closed until the engine reports a new failure.</summary>
+    private void OnStreamBimErrorClosed(InfoBar sender, InfoBarClosedEventArgs args) =>
+        DismissFailure(ProviderNames.StreamBim, _streamBimFormKey);
+
+    /// <summary>After a sign-in succeeded: the e-mail field is cleared, and the form starts over with the default server.</summary>
+    private void ResetStreamBimForm()
+    {
+        _streamBimFormKey = null;
+        _streamBimRegionChoice = null;
+        StreamBimEmailBox.Text = string.Empty;
+        StreamBimPasswordBox.Password = string.Empty;
+        StreamBimUrlBox.Text = string.Empty;
+        _populatingRegions = true;
+        try
+        {
+            StreamBimRegionBox.SelectedItem = null;
+        }
+        finally
+        {
+            _populatingRegions = false;
+        }
+        RefreshStreamBimForm();
+    }
+
+    /// <summary>
+    /// Keeps a server picked in the list. When the selection is gone or cannot be picked (its server is
+    /// signed in now), the picks are tried in order: the server the user chose last, the default region,
+    /// the first region not signed in, and the own address.
+    /// </summary>
+    private void EnsureServerPicked()
+    {
+        if (StreamBimRegionBox.SelectedItem is ComboBoxItem { IsEnabled: true })
+        {
+            return;
+        }
+
+        var enabled = StreamBimRegionBox.Items.OfType<ComboBoxItem>().Where(item => item.IsEnabled).ToList();
+        var defaultRegion = _engine.StreamBimRegions?.Regions?
+            .FirstOrDefault(region => region is { IsDefault: true })?.Subdomain;
+        var pick = enabled.FirstOrDefault(item => item.Tag is string tag && tag == _streamBimRegionChoice)
+            ?? enabled.FirstOrDefault(item => item.Tag is string tag && tag == defaultRegion)
+            ?? enabled.FirstOrDefault(item => item.Tag is string tag && tag != OtherServerTag)
+            ?? enabled.FirstOrDefault();
+
+        _populatingRegions = true;
+        try
+        {
+            StreamBimRegionBox.SelectedItem = pick;
+        }
+        finally
+        {
+            _populatingRegions = false;
+        }
+    }
 
     private void RequestStreamBimRegions()
     {
@@ -617,71 +906,93 @@ public sealed partial class SettingsPage : Page
     private void OnStreamBimRegionsChanged(StreamBimRegionsInfo regions) => ShowStreamBimRegions(regions);
 
     /// <summary>
-    /// Fills the region list. The user's choice stays when the list still has it; otherwise the
-    /// engine's default (is_default) is preselected.
+    /// Fills the server list from the region list, then "Other address". The engine's list comes
+    /// with its own default, and the user's pick stays when it can still be picked.
     /// </summary>
     private void ShowStreamBimRegions(StreamBimRegionsInfo? info)
     {
         var regions = (info?.Regions ?? Array.Empty<StreamBimRegion>())
             .Where(region => region is not null && !string.IsNullOrWhiteSpace(region.Subdomain))
             .ToList();
-        var fallback = regions.FirstOrDefault(region => region.IsDefault) ?? regions.FirstOrDefault();
-        var keep = _streamBimRegionChoice is { } chosen && regions.Any(region => region.Subdomain == chosen)
-            ? chosen
-            : fallback?.Subdomain;
 
         _populatingRegions = true;
         try
         {
             StreamBimRegionBox.Items.Clear();
-            ComboBoxItem? selected = null;
             foreach (var region in regions)
             {
-                var item = new ComboBoxItem
-                {
-                    Content = string.IsNullOrWhiteSpace(region.Title) ? region.Subdomain : region.Title,
-                    Tag = region.Subdomain,
-                };
-                StreamBimRegionBox.Items.Add(item);
-                if (region.Subdomain == keep)
-                {
-                    selected = item;
-                }
+                StreamBimRegionBox.Items.Add(new ComboBoxItem { Tag = region.Subdomain });
             }
-            StreamBimRegionBox.SelectedItem = selected;
+            // The own address is offered once there is a list to choose from.
+            if (regions.Count > 0)
+            {
+                StreamBimRegionBox.Items.Add(new ComboBoxItem
+                {
+                    Content = Lang.T("Annan adress…", "Other address…"),
+                    Tag = OtherServerTag,
+                });
+            }
         }
         finally
         {
             _populatingRegions = false;
         }
 
-        RefreshAccounts();
+        RefreshStreamBimForm();
     }
 
     /// <summary>
-    /// The engine is waiting for a StreamBIM code: its latest progress says so, its account is
-    /// signing in, and the user has not closed this very prompt with Avbryt. The dialog opens only then.
+    /// The StreamBIM account whose engine waits for a code and whose prompt the user has not closed
+    /// with Avbryt; null when there is none. Several accounts can wait: their prompts come one after the other.
     /// </summary>
-    private bool StreamBimWaitsForCode()
+    private string? StreamBimAccountWaitingForCode()
     {
-        var progress = _engine.SignInProgressFor(ProviderNames.StreamBim);
-        return _engine.IsConnected
-            && progress is { State: "mfa_required" }
-            && !ReferenceEquals(progress, _mfaDismissedFor)
-            && _engine.AccountFor(ProviderNames.StreamBim) is { SigningIn: true };
+        if (!_engine.IsConnected)
+        {
+            return null;
+        }
+
+        foreach (var account in _engine.StreamBimAccounts)
+        {
+            if (account.SignedIn || !account.SigningIn || string.IsNullOrEmpty(account.Account))
+            {
+                continue;
+            }
+
+            var progress = _engine.SignInProgressFor(ProviderNames.StreamBim, account.Account);
+            var dismissed = _mfaDismissed.TryGetValue(account.Account, out var closed) && ReferenceEquals(closed, progress);
+            if (progress is { State: "mfa_required" } && !dismissed)
+            {
+                return account.Account;
+            }
+        }
+        return null;
     }
 
-    /// <summary>Opens the MFA dialog when the engine waits for a code and no dialog is open yet.</summary>
+    /// <summary>Opens the code prompt when an account waits for its code and no prompt is open yet.</summary>
     private void ShowMfaDialogIfWanted()
     {
-        if (_mfaDialog is null && StreamBimWaitsForCode())
+        if (_mfaDialog is null && StreamBimAccountWaitingForCode() is { } account)
         {
-            _ = ShowMfaDialogAsync();
+            _ = ShowMfaDialogAsync(account);
         }
     }
 
-    /// <summary>The engine ended the MFA wait (or the connection went): the dialog closes, and the card shows what the engine said.</summary>
-    private void HideMfaDialog()
+    /// <summary>
+    /// The engine ended an account's code wait (signed in, failed or cancelled): its prompt closes, and
+    /// the card shows what the engine said. Another account's prompt stays open.
+    /// </summary>
+    private void HideMfaDialog(string account)
+    {
+        if (_mfaDialog is { } dialog && account == _mfaAccount)
+        {
+            _mfaEndedByEngine = true;
+            dialog.Hide();
+        }
+    }
+
+    /// <summary>The engine's code waits do not outlive the connection: any open prompt closes with it.</summary>
+    private void CloseMfaDialogOnDisconnect()
     {
         if (_mfaDialog is { } dialog)
         {
@@ -700,16 +1011,19 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// The StreamBIM MFA dialog: six digits from the authenticator app. Verify sends the code once
-    /// and the dialog stays open until the engine answers; Avbryt (or Esc) cancels the sign-in in the engine.
+    /// The StreamBIM code prompt of one account: six digits from its authenticator app, naming its server.
+    /// Verify sends the code once and the dialog stays open until the engine answers; Avbryt (or Esc)
+    /// cancels that account's sign-in in the engine.
     /// </summary>
-    private async Task ShowMfaDialogAsync()
+    private async Task ShowMfaDialogAsync(string account)
     {
         if (_mfaDialog is not null || XamlRoot is not { } root)
         {
             return;
         }
 
+        var host = ServerHostFor(account);
+        _mfaAccount = account;
         _mfaEndedByEngine = false;
         _mfaSubmitted = false;
         var code = new TextBox
@@ -724,8 +1038,8 @@ public sealed partial class SettingsPage : Page
 
         var body = new StackPanel { Spacing = 8 };
         body.Children.Add(Line(Lang.T(
-            "Skriv in de sex siffrorna från din autentiseringsapp för StreamBIM.",
-            "Enter the six digits from your authenticator app for StreamBIM.")));
+            $"Skriv in de sex siffrorna från din autentiseringsapp för StreamBIM på {host}.",
+            $"Enter the six digits from your authenticator app for StreamBIM at {host}.")));
         body.Children.Add(code);
 
         var dialog = new ContentDialog
@@ -733,7 +1047,7 @@ public sealed partial class SettingsPage : Page
             XamlRoot = root,
             // The dialog hangs in the popup root and does not inherit the theme choice.
             RequestedTheme = MainWindow.CurrentTheme,
-            Title = Lang.T("Ange koden från din autentiseringsapp", "Enter the code from your authenticator app"),
+            Title = Lang.T($"Ange koden för {host}", $"Enter the code for {host}"),
             Content = body,
             PrimaryButtonText = Lang.T("Verifiera", "Verify"),
             CloseButtonText = Lang.T("Avbryt", "Cancel"),
@@ -764,7 +1078,7 @@ public sealed partial class SettingsPage : Page
 
             _mfaSubmitted = true;
             UpdateMfaVerify();
-            _ = SubmitMfaCodeAsync(code.Text);
+            _ = SubmitMfaCodeAsync(account, code.Text);
         };
 
         _mfaDialog = dialog;
@@ -774,10 +1088,11 @@ public sealed partial class SettingsPage : Page
         }
         catch (Exception)
         {
-            // Another dialog is open, or the window is closing. Nothing can be asked: the sign-in is cancelled.
+            // Another dialog is open, or the window is closing. Nothing can be asked: this account's sign-in is cancelled.
             _mfaDialog = null;
             _mfaCode = null;
-            _ = await _engine.CancelSignInAsync(ProviderNames.StreamBim);
+            _mfaAccount = null;
+            _ = await _engine.CancelSignInAsync(ProviderNames.StreamBim, account);
             MainWindow.Instance?.ShowMessage(
                 Lang.T("Kodfönstret kunde inte visas", "The code dialog could not be shown"),
                 Lang.T("Logga in på StreamBIM igen för att försöka på nytt.", "Sign in to StreamBIM again to try again."),
@@ -787,20 +1102,27 @@ public sealed partial class SettingsPage : Page
 
         _mfaDialog = null;
         _mfaCode = null;
+        _mfaAccount = null;
         if (_mfaEndedByEngine)
         {
             // The engine ended the wait (signed in, failed or cancelled) and closed the dialog itself.
-            // A new prompt that came meanwhile (the dialog was still closing) opens now.
+            // A prompt for another account that came meanwhile (the dialog was still closing) opens now.
             RefreshAccounts();
             ShowMfaDialogIfWanted();
             return;
         }
 
-        // Closed by the user (Avbryt or Esc): that prompt is not shown again, and the engine's sign-in ends.
-        _mfaDismissedFor = _engine.SignInProgressFor(ProviderNames.StreamBim);
-        ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.StreamBim),
+        // Closed by the user (Avbryt or Esc): that prompt is not shown again, and the account's sign-in ends.
+        if (_engine.SignInProgressFor(ProviderNames.StreamBim, account) is { } prompt)
+        {
+            _mfaDismissed[account] = prompt;
+        }
+        ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.StreamBim, account),
             Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
         RefreshAccounts();
+
+        // Another account may have asked for its code meanwhile: its prompt comes now.
+        ShowMfaDialogIfWanted();
     }
 
     /// <summary>
@@ -808,9 +1130,9 @@ public sealed partial class SettingsPage : Page
     /// closes the dialog (signed in, failed, cancelled) or, after a new code prompt, re-enables Verify.
     /// A refused code brings Verify back at once.
     /// </summary>
-    private async Task SubmitMfaCodeAsync(string digits)
+    private async Task SubmitMfaCodeAsync(string account, string digits)
     {
-        var ack = await _engine.SignInMfaAsync(ProviderNames.StreamBim, digits);
+        var ack = await _engine.SignInMfaAsync(ProviderNames.StreamBim, account, digits);
         if (!ack.Ok)
         {
             _mfaSubmitted = false;
@@ -820,14 +1142,22 @@ public sealed partial class SettingsPage : Page
         RefreshAccounts();
     }
 
-    /// <summary>Every sign-in message: the MFA dialog opens or closes, and the cards take the new state.</summary>
+    /// <summary>
+    /// Every sign-in message. A StreamBIM message concerns one account: its code prompt opens or closes,
+    /// the form shows a failure of it, and a success resets the form when it was the one sent from there.
+    /// </summary>
     private void OnSignInProgress(SignInProgressInfo progress)
     {
         if (progress.Provider == ProviderNames.StreamBim)
         {
+            var account = progress.Account;
+
             // A new progress event answers the code that was sent: Verify is usable again until the next prompt.
-            _mfaSubmitted = false;
-            UpdateMfaVerify();
+            if (account is not null && account == _mfaAccount)
+            {
+                _mfaSubmitted = false;
+                UpdateMfaVerify();
+            }
 
             switch (progress.State)
             {
@@ -836,14 +1166,31 @@ public sealed partial class SettingsPage : Page
                     break;
 
                 case "failed":
-                    // The user starts over: the e-mail stays, the password is typed again.
+                    // The user starts over: the e-mail stays, the password is typed again. The message is shown in the form.
                     StreamBimPasswordBox.Password = string.Empty;
-                    HideMfaDialog();
+                    _streamBimFormKey = account;
+                    if (account is not null)
+                    {
+                        HideMfaDialog(account);
+                    }
                     break;
 
                 case "signed_in":
+                    if (account is not null && account == _streamBimFormKey)
+                    {
+                        ResetStreamBimForm();
+                    }
+                    if (account is not null)
+                    {
+                        HideMfaDialog(account);
+                    }
+                    break;
+
                 case "cancelled":
-                    HideMfaDialog();
+                    if (account is not null)
+                    {
+                        HideMfaDialog(account);
+                    }
                     break;
             }
         }

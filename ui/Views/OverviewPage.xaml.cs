@@ -274,7 +274,7 @@ public sealed partial class OverviewPage : Page
     {
         var text = status?.Text?.Trim() ?? string.Empty;
         if (text == BrowserWaitText
-            && Engine.AccountFor(ProviderNames.StreamBim) is { SigningIn: true }
+            && Engine.StreamBimAccounts.Any(account => account.SigningIn)
             && Engine.AccountFor(ProviderNames.Acc) is not { SigningIn: true }
             && Engine.AccountFor(ProviderNames.Interaxo) is not { SigningIn: true })
         {
@@ -286,8 +286,8 @@ public sealed partial class OverviewPage : Page
 
     /// <summary>
     /// Who is signed in. One account: "Inloggad som …". Several (ACC and StreamBIM, say): each
-    /// with its provider, "ACC: … · StreamBIM: …". An engine without per-provider accounts
-    /// reports only `status.user`, and that one is shown.
+    /// with its name, "ACC: … · StreamBIM Japan: …". Each StreamBIM server is its own account, named
+    /// as its hub is. An engine without per-provider accounts reports only `status.user`, and that one is shown.
     /// </summary>
     private static string AccountSummary(StatusInfo? status)
     {
@@ -301,7 +301,7 @@ public sealed partial class OverviewPage : Page
         {
             return string.Join(" · ", accounts.Select(account =>
             {
-                var label = ProviderNames.Label(account.Provider);
+                var label = ProviderNames.AccountLabel(account, Engine.StreamBimRegions);
                 var who = ProviderNames.Who(account.User);
                 return who.Length == 0 ? label : $"{label}: {who}";
             }));

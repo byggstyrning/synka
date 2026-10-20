@@ -188,8 +188,11 @@ public sealed class EngineClient : INotifyPropertyChanged
     private UpdateInfo? _update;
     private StreamBimRegionsInfo? _streamBimRegions;
 
-    /// <summary>The latest sign_in_progress per provider (UI thread). Kept so a page that opens mid-sign-in can catch up.</summary>
-    private readonly Dictionary<string, SignInProgressInfo> _signInProgress = new();
+    /// <summary>
+    /// The latest sign_in_progress per provider and StreamBIM account key (null for the other
+    /// providers), UI thread. Kept so a page that opens mid-sign-in can catch up.
+    /// </summary>
+    private readonly Dictionary<(string Provider, string? Account), SignInProgressInfo> _signInProgress = new();
 
     private bool _isFreeingUp;
     private int _freeUpGeneration;
@@ -266,9 +269,36 @@ public sealed class EngineClient : INotifyPropertyChanged
             : null;
     }
 
-    /// <summary>The latest sign_in_progress for a provider, or null when none has come since the window started.</summary>
-    public SignInProgressInfo? SignInProgressFor(string provider) =>
-        _signInProgress.TryGetValue(provider, out var progress) ? progress : null;
+    /// <summary>
+    /// The StreamBIM accounts the engine reports (one per server that is signed in or signing
+    /// in), in the engine's order. Empty before the first status and from an older engine.
+    /// </summary>
+    public IReadOnlyList<AccountInfo> StreamBimAccounts
+    {
+        get
+        {
+            var list = new List<AccountInfo>();
+            foreach (var account in Accounts)
+            {
+                if (account is not null && string.Equals(account.Provider, "streambim", StringComparison.Ordinal))
+                {
+                    list.Add(account);
+                }
+            }
+            return list;
+        }
+    }
+
+    /// <summary>
+    /// The latest sign_in_progress for a provider and, for StreamBIM, its account key; null when
+    /// none has come since the window started. ACC and Interaxo have no account (pass none).
+    /// </summary>
+    public SignInProgressInfo? SignInProgressFor(string provider, string? account = null) =>
+        _signInProgress.TryGetValue((provider, NormalizeAccount(account)), out var progress) ? progress : null;
+
+    /// <summary>An empty or blank account key is no account.</summary>
+    private static string? NormalizeAccount(string? account) =>
+        string.IsNullOrWhiteSpace(account) ? null : account;
 
     /// <summary>The StreamBIM regions the engine last sent, or null before the first list.</summary>
     public StreamBimRegionsInfo? StreamBimRegions => _streamBimRegions;
@@ -919,12 +949,13 @@ public sealed class EngineClient : INotifyPropertyChanged
             {
                 // docs\IPC.md: the progress of a sign-in. Nothing a password could be in: the
                 // message carries only the provider, the state and the engine's Swedish error text.
-                var progress = JsonSerializer.Deserialize(line, EngineJsonContext.Default.SignInProgressInfo);
-                if (progress is not null && !string.IsNullOrEmpty(progress.Provider))
+                var received = JsonSerializer.Deserialize(line, EngineJsonContext.Default.SignInProgressInfo);
+                if (received is not null && !string.IsNullOrEmpty(received.Provider))
                 {
+                    var progress = received with { Account = NormalizeAccount(received.Account) };
                     Post(() =>
                     {
-                        _signInProgress[progress.Provider] = progress;
+                        _signInProgress[(progress.Provider, progress.Account)] = progress;
                         SignInProgress?.Invoke(progress);
                     });
                 }
@@ -1084,37 +1115,79 @@ public sealed class EngineClient : INotifyPropertyChanged
         SendAsync("sign_in", new Dictionary<string, object?> { ["provider"] = provider });
 
     /// <summary>
-    /// Starts a StreamBIM sign-in with region (subdomain), e-mail and password. The password
-    /// is only handed to the command: it is not kept in a field, logged or echoed back here.
-    /// The caller clears its own copy of the password box. A StreamBIM account that asks
-    /// for an MFA code reports `mfa_required` in <see cref="SignInProgress"/>.
+    /// Starts a StreamBIM sign-in with e-mail and password on exactly one server: a region
+    /// (its subdomain, such as "app") or a custom https address. Giving both or neither is
+    /// refused here, before anything is sent. The password is only handed to the command: it is
+    /// not kept in a field, logged or echoed back here. The caller clears its own copy of the
+    /// password box. A StreamBIM account that asks for an MFA code reports `mfa_required` in
+    /// <see cref="SignInProgress"/>, under that account's key.
     /// </summary>
-    public Task<Ack> SignInStreamBimAsync(string region, string username, string password) =>
-        SendAsync("sign_in", new Dictionary<string, object?>
+    public Task<Ack> SignInStreamBimAsync(string? region, string? url, string username, string password)
+    {
+        if ((region is null) == (url is null))
+        {
+            return Task.FromResult(new Ack(null, false,
+                Lang.T("Ange antingen en region eller en adress.", "Give either a region or an address.")));
+        }
+
+        var fields = new Dictionary<string, object?>
         {
             ["provider"] = "streambim",
-            ["region"] = region,
             ["username"] = username,
             ["password"] = password,
-        });
+        };
+        if (region is not null)
+        {
+            fields["region"] = region;
+        }
+        else
+        {
+            fields["url"] = url;
+        }
+        return SendAsync("sign_in", fields);
+    }
 
-    /// <summary>Sends the six-digit code the user typed for a StreamBIM sign-in that is waiting for MFA.</summary>
-    public Task<Ack> SignInMfaAsync(string provider, string code) =>
+    /// <summary>Sends the six-digit code the user typed for a StreamBIM account that is waiting for MFA.</summary>
+    public Task<Ack> SignInMfaAsync(string provider, string account, string code) =>
         SendAsync("sign_in_mfa", new Dictionary<string, object?>
         {
             ["provider"] = provider,
+            ["account"] = account,
             ["code"] = code,
         });
 
-    /// <summary>Cancels a pending browser sign-in or MFA wait for one provider.</summary>
-    public Task<Ack> CancelSignInAsync(string provider) =>
-        SendAsync("cancel_sign_in", new Dictionary<string, object?> { ["provider"] = provider });
+    /// <summary>
+    /// Cancels a pending browser sign-in or MFA wait for one provider. StreamBIM names its
+    /// account; without one the engine cancels every pending StreamBIM sign-in.
+    /// </summary>
+    public Task<Ack> CancelSignInAsync(string provider, string? account = null)
+    {
+        var fields = new Dictionary<string, object?> { ["provider"] = provider };
+        if (account is not null)
+        {
+            fields["account"] = account;
+        }
+        return SendAsync("cancel_sign_in", fields);
+    }
 
-    /// <summary>Signs out of one provider, or of every provider when none is given.</summary>
-    public Task<Ack> SignOutAsync(string? provider = null) =>
-        provider is null
-            ? SendAsync("sign_out")
-            : SendAsync("sign_out", new Dictionary<string, object?> { ["provider"] = provider });
+    /// <summary>
+    /// Signs out of one StreamBIM account (its key as `account`), of every account of one
+    /// provider (provider only), or of everything (no arguments). An account is always a StreamBIM
+    /// account, so a named account without a provider means StreamBIM.
+    /// </summary>
+    public Task<Ack> SignOutAsync(string? provider = null, string? account = null)
+    {
+        var fields = new Dictionary<string, object?>();
+        if (provider is not null || account is not null)
+        {
+            fields["provider"] = provider ?? "streambim";
+        }
+        if (account is not null)
+        {
+            fields["account"] = account;
+        }
+        return SendAsync("sign_out", fields.Count == 0 ? null : fields);
+    }
 
     /// <summary>Asks the engine for the StreamBIM region list. The answer is <see cref="StreamBimRegionsChanged"/>.</summary>
     public Task<Ack> RequestStreamBimRegionsAsync() => SendAsync("streambim_regions");

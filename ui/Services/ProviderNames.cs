@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 
 namespace Synka.Services;
 
@@ -31,6 +32,32 @@ public static class ProviderNames
         Interaxo => "Interaxo",
         _ => "Autodesk Construction Cloud (ACC)",
     };
+
+    /// <summary>
+    /// The hub-style name of a StreamBIM account, as its hub carries it (docs\PROVIDERS.md):
+    /// "StreamBIM" for the default region, "StreamBIM &lt;title&gt;" for another region (the title from
+    /// the region list), "StreamBIM (&lt;host&gt;)" for a custom address or a region the list does not name.
+    /// </summary>
+    public static string StreamBimName(AccountInfo? account, StreamBimRegionsInfo? regions)
+    {
+        var key = account?.Account ?? string.Empty;
+        var host = string.IsNullOrWhiteSpace(account?.Host) ? key : account!.Host!;
+        if (key.Length == 0 || key == "app")
+        {
+            return Title(StreamBim);
+        }
+        if (key.Contains('.'))
+        {
+            return $"StreamBIM ({host})";
+        }
+
+        var title = regions?.Regions?.FirstOrDefault(region => region is not null && region.Subdomain == key)?.Title;
+        return string.IsNullOrWhiteSpace(title) ? $"StreamBIM ({host})" : "StreamBIM " + title.Trim();
+    }
+
+    /// <summary>One account's name in a list: the hub-style name for each StreamBIM account, the provider label otherwise.</summary>
+    public static string AccountLabel(AccountInfo account, StreamBimRegionsInfo? regions) =>
+        Id(account.Provider) == StreamBim ? StreamBimName(account, regions) : Label(account.Provider);
 
     /// <summary>"Anna Andersson (anna@firma.se)": the name and the e-mail the engine has. Empty when it has neither.</summary>
     public static string Who(UserInfo? user)
