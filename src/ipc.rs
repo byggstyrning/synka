@@ -7,11 +7,12 @@
 //! answered without asking the engine.
 
 use crate::app::{
-    AccountStatus, ActivityItem, HubList, Secret, SettingsView, Status, StreamBimLogin, TrayCmd,
-    UiMsg,
+    AccountStatus, ActivityItem, HubList, Secret, SettingsView, SignInKey, Status, StreamBimLogin,
+    StreamBimServer, TrayCmd, UiMsg,
 };
 use crate::config;
 use crate::model::{HubInfo, ProjectInfo, Provider};
+use crate::streambim_auth::{server_from_region, server_from_url, valid_key};
 use crate::sync::sanitize_name;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,12 +46,15 @@ pub enum Command {
         #[serde(default)]
         version: Option<String>,
     },
-    /// ACC/Interaxo need no fields. StreamBIM needs `region`, `username` and `password`.
+    /// ACC/Interaxo need no fields. StreamBIM needs exactly one of `region` or `url`, plus
+    /// `username` and `password`.
     SignIn {
         #[serde(default)]
         provider: Option<String>,
         #[serde(default)]
         region: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
         #[serde(default)]
         username: Option<String>,
         #[serde(default)]
@@ -58,14 +62,20 @@ pub enum Command {
     },
     SignInMfa {
         provider: String,
+        #[serde(default)]
+        account: Option<String>,
         code: Secret,
     },
     CancelSignIn {
         provider: String,
+        #[serde(default)]
+        account: Option<String>,
     },
     SignOut {
         #[serde(default)]
         provider: Option<String>,
+        #[serde(default)]
+        account: Option<String>,
     },
     #[serde(rename = "streambim_regions")]
     StreamBimRegions,
@@ -131,9 +141,10 @@ struct Cache {
     status: Option<Value>,
     settings: Option<Value>,
     projects: Option<Value>,
-    /// The pending `sign_in_progress` (`browser` or `mfa_required`) of each provider. A reconnecting
-    /// window needs it to reopen the MFA dialog or show the wait for the browser.
-    sign_in: HashMap<Provider, Value>,
+    /// The pending `sign_in_progress` (`browser` or `mfa_required`) of each provider, and of each
+    /// StreamBIM account. A reconnecting window needs it to reopen the MFA dialog or show the wait
+    /// for the browser.
+    sign_in: HashMap<SignInKey, Value>,
     aps_client_id_validation: VecDeque<Value>,
     /// Newest first.
     activity: VecDeque<ActivityItem>,
@@ -205,22 +216,25 @@ impl IpcHub {
             }
             UiMsg::SignInProgress {
                 provider,
+                account,
                 state,
                 error,
             } => {
                 let v = json!({
                     "type": "sign_in_progress",
                     "provider": provider.as_str(),
+                    "account": account,
                     "state": state,
                     "error": error,
                 });
                 {
+                    let key: SignInKey = (*provider, account.clone());
                     let mut cache = self.cache();
                     if matches!(*state, "browser" | "mfa_required") {
-                        cache.sign_in.insert(*provider, v.clone());
+                        cache.sign_in.insert(key, v.clone());
                     } else {
                         // signed_in, failed or cancelled: the wait is over.
-                        cache.sign_in.remove(provider);
+                        cache.sign_in.remove(&key);
                     }
                 }
                 self.emit(&v);
@@ -310,16 +324,28 @@ impl IpcHub {
                 state: "signed_out",
                 sync_root: self.sync_root.display().to_string(),
                 engine_version: env!("CARGO_PKG_VERSION").into(),
-                accounts: Provider::ALL.map(AccountStatus::signed_out).into(),
+                accounts: vec![
+                    AccountStatus::signed_out(Provider::Acc),
+                    AccountStatus::signed_out(Provider::Interaxo),
+                ],
                 ..Default::default()
             })
         });
         let mut out = vec![status];
-        out.extend(
-            Provider::ALL
-                .iter()
-                .filter_map(|p| c.sign_in.get(p).cloned()),
-        );
+        // Provider order, then account key (ACC and Interaxo have no account).
+        let mut waits: Vec<(usize, &Option<String>, &Value)> = c
+            .sign_in
+            .iter()
+            .map(|((provider, account), v)| {
+                let rank = Provider::ALL
+                    .iter()
+                    .position(|p| p == provider)
+                    .unwrap_or(0);
+                (rank, account, v)
+            })
+            .collect();
+        waits.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        out.extend(waits.into_iter().map(|(_, _, v)| v.clone()));
         if let Some(s) = &c.settings {
             out.push(s.clone());
         }
@@ -363,6 +389,7 @@ fn status_json(s: &Status) -> Value {
 fn account_json(a: &AccountStatus) -> Value {
     json!({
         "provider": a.provider.as_str(),
+        "account": a.account,
         "label": a.label,
         "configured": a.configured,
         "signed_in": a.signed_in,
@@ -651,32 +678,59 @@ fn parse_provider(name: &str) -> Result<Provider, String> {
         .ok_or_else(|| "Okänd leverantör. Använd acc, streambim eller interaxo.".to_string())
 }
 
-/// The StreamBIM sign-in fields, all required. The region is a subdomain such as "app".
+/// The StreamBIM sign-in fields. The server is exactly one of `region` (a subdomain such as "app")
+/// or `url` (a custom https address); the username and the password are required. The server is
+/// checked here the same way the engine checks it again.
 fn streambim_login(
     region: Option<String>,
+    url: Option<String>,
     username: Option<String>,
     password: Option<Secret>,
 ) -> Result<StreamBimLogin, String> {
-    let region = region.unwrap_or_default();
-    let region_ok = (1..=32).contains(&region.len())
-        && region
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if !region_ok {
-        return Err("Ange en giltig StreamBIM-region.".into());
-    }
+    let server = match (region, url) {
+        (Some(region), None) => {
+            server_from_region(&region)?;
+            StreamBimServer::Region(region)
+        }
+        (None, Some(url)) => {
+            server_from_url(&url)?;
+            StreamBimServer::Url(url)
+        }
+        (Some(_), Some(_)) => {
+            return Err("Ange antingen region eller adress för StreamBIM, inte båda.".into())
+        }
+        (None, None) => return Err("Ange region eller adress för StreamBIM.".into()),
+    };
     let username = username.unwrap_or_default().trim().to_string();
     if username.is_empty() {
         return Err("Ange e-postadress för StreamBIM.".into());
     }
     match password {
         Some(password) if !password.0.is_empty() => Ok(StreamBimLogin {
-            region,
+            server,
             username,
             password,
         }),
         _ => Err("Ange lösenordet för StreamBIM.".into()),
     }
+}
+
+/// The StreamBIM account a command names, when it names one: a valid account key, and only with
+/// the StreamBIM provider (ACC and Interaxo have one account each, so `account` is refused there).
+fn account_arg(
+    provider: Option<Provider>,
+    account: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(account) = account else {
+        return Ok(None);
+    };
+    if provider != Some(Provider::StreamBim) {
+        return Err("Kontot (account) gäller bara StreamBIM.".into());
+    }
+    if !valid_key(&account) {
+        return Err("Ogiltigt StreamBIM-konto.".into());
+    }
+    Ok(Some(account))
 }
 
 /// Correlation IDs are public UUIDs generated by the UI, never arbitrary log/error text.
@@ -712,12 +766,13 @@ fn dispatch(
         Command::SignIn {
             provider,
             region,
+            url,
             username,
             password,
         } => {
             let provider = parse_provider(provider.as_deref().unwrap_or("acc"))?;
             let streambim = match provider {
-                Provider::StreamBim => Some(streambim_login(region, username, password)?),
+                Provider::StreamBim => Some(streambim_login(region, url, username, password)?),
                 _ => None,
             };
             TrayCmd::SignIn {
@@ -725,25 +780,44 @@ fn dispatch(
                 streambim,
             }
         }
-        Command::SignInMfa { provider, code } => {
+        Command::SignInMfa {
+            provider,
+            account,
+            code,
+        } => {
             let provider = parse_provider(&provider)?;
             if provider != Provider::StreamBim {
                 return Err("Engångskod används bara för StreamBIM.".into());
             }
+            let account = account
+                .filter(|account| !account.is_empty())
+                .ok_or_else(|| "Ange vilket StreamBIM-konto koden gäller.".to_string())?;
+            if !valid_key(&account) {
+                return Err("Ogiltigt StreamBIM-konto.".into());
+            }
             if code.0.len() != 6 || !code.0.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("Koden ska vara 6 siffror.".into());
             }
-            TrayCmd::SignInMfa { provider, code }
+            TrayCmd::SignInMfa {
+                provider,
+                account,
+                code,
+            }
         }
-        Command::CancelSignIn { provider } => TrayCmd::CancelSignIn {
-            provider: parse_provider(&provider)?,
-        },
-        Command::SignOut { provider: None } => TrayCmd::SignOut { provider: None },
-        Command::SignOut {
-            provider: Some(provider),
-        } => TrayCmd::SignOut {
-            provider: Some(parse_provider(&provider)?),
-        },
+        Command::CancelSignIn { provider, account } => {
+            let provider = parse_provider(&provider)?;
+            TrayCmd::CancelSignIn {
+                provider,
+                account: account_arg(Some(provider), account)?,
+            }
+        }
+        Command::SignOut { provider, account } => {
+            let provider = provider.as_deref().map(parse_provider).transpose()?;
+            TrayCmd::SignOut {
+                provider,
+                account: account_arg(provider, account)?,
+            }
+        }
         Command::StreamBimRegions => TrayCmd::StreamBimRegions,
         Command::TestApsClientId {
             client_id,
@@ -858,13 +932,17 @@ mod tests {
             Command::SignIn {
                 provider: None,
                 region: None,
+                url: None,
                 username: None,
                 password: None,
             }
         );
         assert_eq!(
             parse(r#"{"cmd":"sign_out","id":2}"#),
-            Command::SignOut { provider: None }
+            Command::SignOut {
+                provider: None,
+                account: None,
+            }
         );
         assert_eq!(parse(r#"{"cmd":"sync_now"}"#), Command::SyncNow);
         assert_eq!(
@@ -1206,14 +1284,18 @@ mod tests {
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .collect()
         };
-        let sign_in =
-            |hub: &IpcHub, provider: Provider, state: &'static str, error: Option<&str>| {
-                hub.on_msg(&UiMsg::SignInProgress {
-                    provider,
-                    state,
-                    error: error.map(str::to_string),
-                });
-            };
+        let sign_in = |hub: &IpcHub,
+                       provider: Provider,
+                       account: Option<&str>,
+                       state: &'static str,
+                       error: Option<&str>| {
+            hub.on_msg(&UiMsg::SignInProgress {
+                provider,
+                account: account.map(str::to_string),
+                state,
+                error: error.map(str::to_string),
+            });
+        };
         let pending = |lines: &[Value]| -> Vec<Value> {
             lines
                 .iter()
@@ -1228,49 +1310,79 @@ mod tests {
             engine_version: "test".into(),
             ..Default::default()
         }));
-        sign_in(&hub, Provider::StreamBim, "mfa_required", None);
+        sign_in(
+            &hub,
+            Provider::StreamBim,
+            Some("japan"),
+            "mfa_required",
+            None,
+        );
         let reply = hello(&hub);
         assert_eq!(reply[0]["type"], "status", "the replay follows status");
         assert_eq!(
             pending(&reply),
-            vec![
-                json!({"type": "sign_in_progress", "provider": "streambim", "state": "mfa_required", "error": null})
-            ]
+            vec![json!({
+                "type": "sign_in_progress",
+                "provider": "streambim",
+                "account": "japan",
+                "state": "mfa_required",
+                "error": null
+            })]
         );
         assert_eq!(reply[1]["type"], "sign_in_progress");
 
-        // Two providers waiting at once: one entry each, in account order.
-        sign_in(&hub, Provider::Acc, "browser", None);
-        let states: Vec<(String, String)> = pending(&hello(&hub))
+        // Two accounts waiting at once, and ACC: one entry each, in provider order, then account.
+        sign_in(&hub, Provider::StreamBim, Some("app"), "mfa_required", None);
+        sign_in(&hub, Provider::Acc, None, "browser", None);
+        let waits: Vec<(String, Option<String>, String)> = pending(&hello(&hub))
             .iter()
             .map(|v| {
                 (
                     v["provider"].as_str().unwrap().into(),
+                    v["account"].as_str().map(str::to_string),
                     v["state"].as_str().unwrap().into(),
                 )
             })
             .collect();
         assert_eq!(
-            states,
+            waits,
             vec![
-                ("acc".into(), "browser".into()),
-                ("streambim".into(), "mfa_required".into())
+                ("acc".into(), None, "browser".into()),
+                (
+                    "streambim".into(),
+                    Some("app".into()),
+                    "mfa_required".into()
+                ),
+                (
+                    "streambim".into(),
+                    Some("japan".into()),
+                    "mfa_required".into()
+                ),
             ]
         );
 
-        // A terminal state ends the wait: it is not replayed any more.
+        // A terminal state ends one account's wait only.
         sign_in(
             &hub,
             Provider::StreamBim,
+            Some("japan"),
             "cancelled",
             Some("Tiden för koden gick ut – logga in igen."),
         );
+        assert_eq!(pending(&hello(&hub)).len(), 2);
+        sign_in(&hub, Provider::Acc, None, "signed_in", None);
         assert_eq!(pending(&hello(&hub)).len(), 1);
-        sign_in(&hub, Provider::Acc, "signed_in", None);
+        sign_in(
+            &hub,
+            Provider::StreamBim,
+            Some("app"),
+            "failed",
+            Some("HTTP 401"),
+        );
         assert!(pending(&hello(&hub)).is_empty());
 
-        sign_in(&hub, Provider::Interaxo, "browser", None);
-        sign_in(&hub, Provider::Interaxo, "failed", Some("HTTP 401"));
+        sign_in(&hub, Provider::Interaxo, None, "browser", None);
+        sign_in(&hub, Provider::Interaxo, None, "failed", Some("HTTP 401"));
         assert!(pending(&hello(&hub)).is_empty());
     }
 
@@ -1347,6 +1459,7 @@ mod tests {
             engine_version: "0.1.0".into(),
             accounts: vec![AccountStatus {
                 provider: Provider::Acc,
+                account: None,
                 label: "ACC",
                 configured: true,
                 signed_in: true,
@@ -1576,7 +1689,7 @@ mod tests {
                 provider: Provider::StreamBim,
                 streambim: Some(login),
             }) => {
-                assert_eq!(login.region, "app");
+                assert_eq!(login.server, StreamBimServer::Region("app".into()));
                 assert_eq!(login.username, "anna@example.se");
                 assert_eq!(login.password.0, "pw-one");
             }
@@ -1610,7 +1723,7 @@ mod tests {
         let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
 
         let r = handle_line(
-            br#"{"cmd":"sign_in_mfa","id":1,"provider":"streambim","code":"123456"}"#,
+            br#"{"cmd":"sign_in_mfa","id":1,"provider":"streambim","account":"app","code":"123456"}"#,
             &hub,
             &tx,
         );
@@ -1621,16 +1734,17 @@ mod tests {
         match rx.try_recv() {
             Ok(TrayCmd::SignInMfa {
                 provider: Provider::StreamBim,
+                account,
                 code,
-            }) => assert_eq!(code.0, "123456"),
+            }) => assert_eq!((account.as_str(), code.0.as_str()), ("app", "123456")),
             other => panic!("{other:?}"),
         }
         for line in [
-            r#"{"cmd":"sign_in_mfa","id":2,"provider":"streambim","code":"12345"}"#,
-            r#"{"cmd":"sign_in_mfa","id":3,"provider":"streambim","code":"1234567"}"#,
-            r#"{"cmd":"sign_in_mfa","id":4,"provider":"streambim","code":"12a456"}"#,
+            r#"{"cmd":"sign_in_mfa","id":2,"provider":"streambim","account":"app","code":"12345"}"#,
+            r#"{"cmd":"sign_in_mfa","id":3,"provider":"streambim","account":"app","code":"1234567"}"#,
+            r#"{"cmd":"sign_in_mfa","id":4,"provider":"streambim","account":"app","code":"12a456"}"#,
             r#"{"cmd":"sign_in_mfa","id":5,"provider":"acc","code":"123456"}"#,
-            r#"{"cmd":"sign_in_mfa","id":6,"provider":"streambim","code":123456}"#,
+            r#"{"cmd":"sign_in_mfa","id":6,"provider":"streambim","account":"app","code":123456}"#,
             r#"{"cmd":"sign_in_mfa","id":7,"provider":"nope","code":"123456"}"#,
         ] {
             let r = handle_line(line.as_bytes(), &hub, &tx);
@@ -1651,7 +1765,8 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(TrayCmd::CancelSignIn {
-                provider: Provider::Interaxo
+                provider: Provider::Interaxo,
+                account: None,
             })
         ));
         let r = handle_line(
@@ -1668,13 +1783,17 @@ mod tests {
         handle_line(br#"{"cmd":"sign_out"}"#, &hub, &tx);
         assert!(matches!(
             rx.try_recv(),
-            Ok(TrayCmd::SignOut { provider: None })
+            Ok(TrayCmd::SignOut {
+                provider: None,
+                account: None
+            })
         ));
         handle_line(br#"{"cmd":"sign_out","provider":"streambim"}"#, &hub, &tx);
         assert!(matches!(
             rx.try_recv(),
             Ok(TrayCmd::SignOut {
-                provider: Some(Provider::StreamBim)
+                provider: Some(Provider::StreamBim),
+                account: None,
             })
         ));
         let r = handle_line(br#"{"cmd":"sign_out","id":9,"provider":"x"}"#, &hub, &tx);
@@ -1746,6 +1865,7 @@ mod tests {
         let accounts = vec![
             AccountStatus {
                 provider: Provider::Acc,
+                account: None,
                 label: "ACC",
                 configured: true,
                 signed_in: false,
@@ -1755,6 +1875,7 @@ mod tests {
             },
             AccountStatus {
                 provider: Provider::StreamBim,
+                account: None,
                 label: "StreamBIM",
                 configured: true,
                 signed_in: true,
@@ -1768,6 +1889,7 @@ mod tests {
             },
             AccountStatus {
                 provider: Provider::Interaxo,
+                account: None,
                 label: "Interaxo",
                 configured: false,
                 signed_in: false,
@@ -1897,5 +2019,218 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
+#[cfg(test)]
+mod account_command_tests {
+    use super::*;
+    use crate::app::{AccountStatus, StreamBimServer};
+
+    /// The ack of one command line, and the command the engine would get (if any).
+    fn send(line: &str) -> (Value, Option<TrayCmd>) {
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = handle_line(line.as_bytes(), &hub, &tx);
+        // A success without an id is silent: no ack line.
+        let ack: Value = reply
+            .first()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .unwrap_or_else(|| json!({ "ok": true }));
+        (ack, rx.try_recv().ok())
+    }
+
+    fn accepted(line: &str) -> TrayCmd {
+        let (ack, cmd) = send(line);
+        assert_eq!(ack["ok"], true, "{line}: {ack}");
+        cmd.unwrap_or_else(|| panic!("{line}: no command reached the engine"))
+    }
+
+    fn refused(line: &str) {
+        let (ack, cmd) = send(line);
+        assert_eq!(ack["ok"], false, "{line}: {ack}");
+        assert!(cmd.is_none(), "refused line reached the engine: {line}");
+    }
+
+    fn sign_in_with(server: &str) -> String {
+        format!(
+            r#"{{"cmd":"sign_in","id":1,"provider":"streambim",{server},"username":"a@x.se","password":"pw-test"}}"#
+        )
+    }
+
+    #[test]
+    fn sign_in_takes_a_region_or_a_custom_address_and_exactly_one() {
+        match accepted(&sign_in_with(r#""region":"japan""#)) {
+            TrayCmd::SignIn {
+                streambim: Some(login),
+                ..
+            } => assert_eq!(login.server, StreamBimServer::Region("japan".into())),
+            other => panic!("{other:?}"),
+        }
+        match accepted(&sign_in_with(r#""url":"https://streambim.example.com/""#)) {
+            TrayCmd::SignIn {
+                streambim: Some(login),
+                ..
+            } => assert_eq!(
+                login.server,
+                StreamBimServer::Url("https://streambim.example.com/".into())
+            ),
+            other => panic!("{other:?}"),
+        }
+        // A region that is a streambim.com host is an address too.
+        accepted(&sign_in_with(r#""url":"https://japan.streambim.com""#));
+
+        refused(&sign_in_with(
+            r#""region":"app","url":"https://streambim.example.com""#,
+        ));
+        refused(&sign_in_with(r#""region":null,"url":null"#));
+        for url in [
+            "http://streambim.example.com",
+            "https://streambim.example.com:443",
+            "https://streambim.example.com/path",
+            "https://streambim.example.com?x=1",
+            "https://user@streambim.example.com",
+            "https://192.168.0.10",
+            "https://localhost",
+            "streambim.example.com",
+        ] {
+            refused(&sign_in_with(&format!(r#""url":"{url}""#)));
+        }
+    }
+
+    #[test]
+    fn mfa_names_the_account_and_checks_the_key() {
+        match accepted(
+            r#"{"cmd":"sign_in_mfa","id":1,"provider":"streambim","account":"japan","code":"123456"}"#,
+        ) {
+            TrayCmd::SignInMfa {
+                provider: Provider::StreamBim,
+                account,
+                ..
+            } => assert_eq!(account, "japan"),
+            other => panic!("{other:?}"),
+        }
+        accepted(
+            r#"{"cmd":"sign_in_mfa","provider":"streambim","account":"streambim.example.com","code":"123456"}"#,
+        );
+        // No account, an empty one, a key that is not one, and a region spelled as a host.
+        for account in [
+            r#""account":null"#,
+            r#""account":"""#,
+            r#""account":"Bad Key""#,
+            r#""account":"app.streambim.com""#,
+        ] {
+            refused(&format!(
+                r#"{{"cmd":"sign_in_mfa","provider":"streambim",{account},"code":"123456"}}"#
+            ));
+        }
+        refused(r#"{"cmd":"sign_in_mfa","provider":"streambim","code":"123456"}"#);
+    }
+
+    #[test]
+    fn cancel_and_sign_out_take_an_account_only_for_streambim() {
+        match accepted(r#"{"cmd":"cancel_sign_in","provider":"streambim","account":"japan"}"#) {
+            TrayCmd::CancelSignIn {
+                provider: Provider::StreamBim,
+                account,
+            } => assert_eq!(account.as_deref(), Some("japan")),
+            other => panic!("{other:?}"),
+        }
+        match accepted(r#"{"cmd":"cancel_sign_in","provider":"streambim"}"#) {
+            TrayCmd::CancelSignIn { account, .. } => assert_eq!(account, None),
+            other => panic!("{other:?}"),
+        }
+        refused(r#"{"cmd":"cancel_sign_in","provider":"acc","account":"app"}"#);
+        match accepted(r#"{"cmd":"cancel_sign_in","provider":"acc","account":null}"#) {
+            TrayCmd::CancelSignIn { account, .. } => assert_eq!(account, None),
+            other => panic!("{other:?}"),
+        }
+
+        match accepted(r#"{"cmd":"sign_out","provider":"streambim","account":"app"}"#) {
+            TrayCmd::SignOut {
+                provider: Some(Provider::StreamBim),
+                account,
+            } => assert_eq!(account.as_deref(), Some("app")),
+            other => panic!("{other:?}"),
+        }
+        match accepted(r#"{"cmd":"sign_out","provider":"acc","account":null}"#) {
+            TrayCmd::SignOut {
+                provider: Some(Provider::Acc),
+                account: None,
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        refused(r#"{"cmd":"sign_out","account":"app"}"#);
+        refused(r#"{"cmd":"sign_out","provider":"interaxo","account":"app"}"#);
+        refused(r#"{"cmd":"sign_out","provider":"streambim","account":"Bad Key"}"#);
+    }
+
+    #[test]
+    fn status_lists_each_streambim_account_with_its_key_and_host() {
+        let streambim = |key: &str, host: &str, signed_in: bool| AccountStatus {
+            provider: Provider::StreamBim,
+            account: Some(key.into()),
+            label: "StreamBIM",
+            configured: true,
+            signed_in,
+            signing_in: !signed_in,
+            user: signed_in.then(|| crate::auth::UserInfo {
+                user_id: "u".into(),
+                name: "Ada".into(),
+                email: "ada@example.se".into(),
+            }),
+            host: Some(host.into()),
+        };
+        let acc = AccountStatus::signed_out(Provider::Acc);
+        let status = Status {
+            accounts: vec![
+                acc,
+                streambim("app", "app.streambim.com", true),
+                streambim("japan", "japan.streambim.com", false),
+                AccountStatus::signed_out(Provider::Interaxo),
+            ],
+            ..Default::default()
+        };
+        let v = status_json(&status);
+        let accounts = v["accounts"].as_array().unwrap();
+        let shape: Vec<(String, Value, Value)> = accounts
+            .iter()
+            .map(|a| {
+                (
+                    a["provider"].as_str().unwrap().to_string(),
+                    a["account"].clone(),
+                    a["host"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("acc".into(), Value::Null, Value::Null),
+                ("streambim".into(), json!("app"), json!("app.streambim.com")),
+                (
+                    "streambim".into(),
+                    json!("japan"),
+                    json!("japan.streambim.com")
+                ),
+                ("interaxo".into(), Value::Null, Value::Null),
+            ]
+        );
+        assert_eq!(accounts[1]["label"], "StreamBIM");
+        assert_eq!(accounts[1]["signed_in"], true);
+        assert_eq!(accounts[1]["user"]["email"], "ada@example.se");
+        assert_eq!(accounts[2]["signing_in"], true);
+        assert!(accounts[2]["user"].is_null());
+        assert_eq!(v["signed_in"], true, "any account signed in");
+        // Without a status yet, the snapshot names ACC and Interaxo only.
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let first: Value = serde_json::from_str(&hub.snapshot()[0]).unwrap();
+        let providers: Vec<&str> = first["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(providers, ["acc", "interaxo"]);
     }
 }

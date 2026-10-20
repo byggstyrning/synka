@@ -1,9 +1,11 @@
 //! Provider dispatch: the functions the engine calls to reach a provider's API.
 //!
 //! Each function picks the provider from `p.provider` (or `hub.provider`) and calls that
-//! provider's client: `api::dm` and `api::oss` for ACC, `api::streambim` and `api::interaxo`
-//! for the others. The ACC arms pass the arguments the engine passed before, so ACC behaviour
-//! does not change. See docs/PROVIDERS.md "The dispatch module".
+//! provider's client: `api::dm` and `api::oss` for ACC, `api::streambim` for StreamBIM and
+//! `api::interaxo` for Interaxo. The ACC arms pass the arguments the engine passed before, so ACC
+//! behaviour does not change. StreamBIM has one client per account: each StreamBIM arm takes the
+//! account of its project or hub (`streambim_account`), so a request carries the token of the
+//! server the project lives on. See docs/PROVIDERS.md "The dispatch module".
 //!
 //! The engine (`sync`) reaches every provider only through these functions.
 
@@ -13,6 +15,8 @@ use crate::http::{Api, ApiError};
 use crate::model::{
     urn_namespace, urn_suffix, HubInfo, Item, Kind, Project, ProjectInfo, Provider,
 };
+use crate::streambim_auth::{canonical_host, sign_in_label, StreamBimAccount};
+use anyhow::anyhow;
 use std::path::Path;
 
 /// What a provider can do. The engine checks it to skip work the provider would refuse.
@@ -96,23 +100,52 @@ pub struct ProjectSetup {
     pub meta: Option<String>,
 }
 
-/// Hubs of one provider: ACC's account hubs, StreamBIM's one hub, Interaxo's communities.
+/// The signed-in StreamBIM account of a project. Without one (never signed in there, or signed out)
+/// the error names the server to sign in to. The engine pauses such a project before it asks, so
+/// this is a guard, not the usual path.
+fn streambim_account(ctx: &Ctx, p: &Project) -> Result<StreamBimAccount, ApiError> {
+    ctx.streambim
+        .for_project(p)
+        .filter(|account| account.auth.is_signed_in())
+        .ok_or_else(|| ApiError::Auth(anyhow!("Logga in på {} för att synka.", sign_in_label(p))))
+}
+
+/// The signed-in StreamBIM account of a hub (see `streambim_account`).
+fn streambim_hub_account(ctx: &Ctx, hub: &HubInfo) -> Result<StreamBimAccount, ApiError> {
+    ctx.streambim
+        .for_hub(hub)
+        .filter(|account| account.auth.is_signed_in())
+        .ok_or_else(|| {
+            let host = canonical_host(hub.region.as_deref().unwrap_or_default());
+            ApiError::Auth(anyhow!("Logga in på StreamBIM ({host}) först."))
+        })
+}
+
+/// Hubs of one provider: ACC's account hubs, one StreamBIM hub per signed-in account, Interaxo's
+/// communities.
 pub async fn list_hubs(ctx: &Ctx, provider: Provider) -> Result<Vec<HubInfo>, ApiError> {
-    let api = ctx.api_for(provider);
     match provider {
-        Provider::Acc => dm::list_hubs(api).await,
-        Provider::StreamBim => streambim::list_hubs(api, &ctx.streambim).await,
-        Provider::Interaxo => interaxo::list_hubs(api).await,
+        Provider::Acc => dm::list_hubs(&ctx.api).await,
+        // A hub is made from the account alone (no request), so no account fails here.
+        Provider::StreamBim => Ok(ctx
+            .streambim
+            .signed_in()
+            .iter()
+            .map(streambim::hub_for_account)
+            .collect()),
+        Provider::Interaxo => interaxo::list_hubs(&ctx.interaxo_api).await,
     }
 }
 
 /// Projects of one hub.
 pub async fn list_projects(ctx: &Ctx, hub: &HubInfo) -> Result<Vec<ProjectInfo>, ApiError> {
-    let api = ctx.api_for(hub.provider);
     match hub.provider {
-        Provider::Acc => dm::list_projects(api, &hub.id).await,
-        Provider::StreamBim => streambim::list_projects(api, hub).await,
-        Provider::Interaxo => interaxo::list_projects(api, hub).await,
+        Provider::Acc => dm::list_projects(&ctx.api, &hub.id).await,
+        Provider::StreamBim => {
+            let account = streambim_hub_account(ctx, hub)?;
+            streambim::list_projects(&account.api, account.auth.base_url(), hub).await
+        }
+        Provider::Interaxo => interaxo::list_projects(&ctx.interaxo_api, hub).await,
     }
 }
 
@@ -122,11 +155,13 @@ pub async fn project_setup(
     hub: &HubInfo,
     project: &ProjectInfo,
 ) -> Result<ProjectSetup, ApiError> {
-    let api = ctx.api_for(hub.provider);
     match hub.provider {
-        Provider::Acc => acc_project_setup(api, hub, project).await,
-        Provider::StreamBim => streambim::project_setup(api, hub, project).await,
-        Provider::Interaxo => interaxo::project_setup(api, hub, project).await,
+        Provider::Acc => acc_project_setup(&ctx.api, hub, project).await,
+        Provider::StreamBim => {
+            let account = streambim_hub_account(ctx, hub)?;
+            streambim::project_setup(&account.api, hub, project).await
+        }
+        Provider::Interaxo => interaxo::project_setup(&ctx.interaxo_api, hub, project).await,
     }
 }
 
@@ -168,17 +203,16 @@ async fn acc_project_setup(
 
 /// The top folders of a project as (folder id, name), before `model::unique_tops`.
 pub async fn top_folders(ctx: &Ctx, p: &Project) -> Result<Vec<(String, String)>, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
         Provider::Acc => {
-            let found = dm::top_folders(api, &p.hub_id, &p.project_id).await?;
+            let found = dm::top_folders(&ctx.api, &p.hub_id, &p.project_id).await?;
             Ok(found
                 .into_iter()
                 .map(|(urn, name)| (urn_suffix(&urn).to_string(), name))
                 .collect())
         }
-        Provider::StreamBim => streambim::top_folders(api, p).await,
-        Provider::Interaxo => interaxo::top_folders(api, p).await,
+        Provider::StreamBim => streambim::top_folders(p).await,
+        Provider::Interaxo => interaxo::top_folders(&ctx.interaxo_api, p).await,
     }
 }
 
@@ -188,11 +222,13 @@ pub async fn folder_contents(
     p: &Project,
     folder_id: &str,
 ) -> Result<Vec<Item>, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::folder_contents(api, p, folder_id).await,
-        Provider::StreamBim => streambim::folder_contents(api, p, folder_id).await,
-        Provider::Interaxo => interaxo::folder_contents(api, p, folder_id).await,
+        Provider::Acc => dm::folder_contents(&ctx.api, p, folder_id).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::folder_contents(&account.api, p, folder_id).await
+        }
+        Provider::Interaxo => interaxo::folder_contents(&ctx.interaxo_api, p, folder_id).await,
     }
 }
 
@@ -203,11 +239,10 @@ pub async fn download_url(
     item_id: &str,
     storage_urn: &str,
 ) -> Result<DownloadUrl, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
         // A presigned S3 URL: no bearer token, and ranges are answered.
         Provider::Acc => {
-            let (url, size) = oss::download_url(api, p, storage_urn).await?;
+            let (url, size) = oss::download_url(&ctx.api, p, storage_urn).await?;
             Ok(DownloadUrl {
                 url,
                 size,
@@ -215,8 +250,13 @@ pub async fn download_url(
                 ranges: true,
             })
         }
-        Provider::StreamBim => streambim::download_url(api, p, item_id, storage_urn).await,
-        Provider::Interaxo => interaxo::download_url(api, p, item_id, storage_urn).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::download_url(&account.api, p, item_id, storage_urn).await
+        }
+        Provider::Interaxo => {
+            interaxo::download_url(&ctx.interaxo_api, p, item_id, storage_urn).await
+        }
     }
 }
 
@@ -228,11 +268,15 @@ pub async fn open_download(
     d: &DownloadUrl,
     offset: u64,
 ) -> Result<reqwest::Response, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => oss::open_download_with(api, &d.url, offset, d.bearer.as_deref()).await,
-        Provider::StreamBim => streambim::open_download(api, p, d, offset).await,
-        Provider::Interaxo => interaxo::open_download(api, p, d, offset).await,
+        Provider::Acc => {
+            oss::open_download_with(&ctx.api, &d.url, offset, d.bearer.as_deref()).await
+        }
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::open_download(&account.api, p, d, offset).await
+        }
+        Provider::Interaxo => interaxo::open_download(&ctx.interaxo_api, p, d, offset).await,
     }
 }
 
@@ -244,11 +288,15 @@ pub async fn open_range(
     start: u64,
     end: u64,
 ) -> Result<reqwest::Response, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => oss::open_range_with(api, &d.url, start, end, d.bearer.as_deref()).await,
-        Provider::StreamBim => streambim::open_range(api, p, d, start, end).await,
-        Provider::Interaxo => interaxo::open_range(api, p, d, start, end).await,
+        Provider::Acc => {
+            oss::open_range_with(&ctx.api, &d.url, start, end, d.bearer.as_deref()).await
+        }
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::open_range(&account.api, p, d, start, end).await
+        }
+        Provider::Interaxo => interaxo::open_range(&ctx.interaxo_api, p, d, start, end).await,
     }
 }
 
@@ -258,11 +306,13 @@ pub(crate) async fn get_item_upload_info(
     p: &Project,
     id: &str,
 ) -> Result<(Item, dm::UploadInfo), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::get_item_upload_info(api, p, id).await,
-        Provider::StreamBim => streambim::get_item_upload_info(api, p, id).await,
-        Provider::Interaxo => interaxo::get_item_upload_info(api, p, id).await,
+        Provider::Acc => dm::get_item_upload_info(&ctx.api, p, id).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::get_item_upload_info(&account.api, p, id).await
+        }
+        Provider::Interaxo => interaxo::get_item_upload_info(&ctx.interaxo_api, p, id).await,
     }
 }
 
@@ -282,15 +332,15 @@ pub async fn create_storage(
     parent_id: &str,
     name: &str,
 ) -> Result<String, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::create_storage(api, p, parent_id, name).await,
+        Provider::Acc => dm::create_storage(&ctx.api, p, parent_id, name).await,
         Provider::StreamBim => {
-            let marker = streambim::create_storage(api, p, parent_id, name).await?;
+            let account = streambim_account(ctx, p)?;
+            let marker = streambim::create_storage(&account.api, p, parent_id, name).await?;
             unique_marker(&marker)
         }
         Provider::Interaxo => {
-            let marker = interaxo::create_storage(api, p, parent_id, name).await?;
+            let marker = interaxo::create_storage(&ctx.interaxo_api, p, parent_id, name).await?;
             unique_marker(&marker)
         }
     }
@@ -315,14 +365,14 @@ pub async fn upload_file(
     content_type: Option<&str>,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => oss::upload_file(api, p, storage, path, content_type, progress).await,
+        Provider::Acc => oss::upload_file(&ctx.api, p, storage, path, content_type, progress).await,
         Provider::StreamBim => {
-            streambim::upload_file(api, p, storage, path, content_type, progress).await
+            let account = streambim_account(ctx, p)?;
+            streambim::upload_file(&account.api, p, storage, path, content_type, progress).await
         }
         Provider::Interaxo => {
-            interaxo::upload_file(api, p, storage, path, content_type, progress).await
+            interaxo::upload_file(&ctx.interaxo_api, p, storage, path, content_type, progress).await
         }
     }
 }
@@ -338,14 +388,23 @@ pub async fn create_item(
     path: &Path,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<Item, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::create_item(api, p, parent_id, name, storage).await,
+        Provider::Acc => dm::create_item(&ctx.api, p, parent_id, name, storage).await,
         Provider::StreamBim => {
-            streambim::create_item(api, p, parent_id, name, storage, path, progress).await
+            let account = streambim_account(ctx, p)?;
+            streambim::create_item(&account.api, p, parent_id, name, storage, path, progress).await
         }
         Provider::Interaxo => {
-            interaxo::create_item(api, p, parent_id, name, storage, path, progress).await
+            interaxo::create_item(
+                &ctx.interaxo_api,
+                p,
+                parent_id,
+                name,
+                storage,
+                path,
+                progress,
+            )
+            .await
         }
     }
 }
@@ -361,14 +420,14 @@ pub async fn create_version(
     path: &Path,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(i64, String), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::create_version(api, p, id, name, storage).await,
+        Provider::Acc => dm::create_version(&ctx.api, p, id, name, storage).await,
         Provider::StreamBim => {
-            streambim::create_version(api, p, id, name, storage, path, progress).await
+            let account = streambim_account(ctx, p)?;
+            streambim::create_version(&account.api, p, id, name, storage, path, progress).await
         }
         Provider::Interaxo => {
-            interaxo::create_version(api, p, id, name, storage, path, progress).await
+            interaxo::create_version(&ctx.interaxo_api, p, id, name, storage, path, progress).await
         }
     }
 }
@@ -380,11 +439,13 @@ pub async fn create_folder(
     parent_id: &str,
     name: &str,
 ) -> Result<Item, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::create_folder(api, p, parent_id, name).await,
-        Provider::StreamBim => streambim::create_folder(api, p, parent_id, name).await,
-        Provider::Interaxo => interaxo::create_folder(api, p, parent_id, name).await,
+        Provider::Acc => dm::create_folder(&ctx.api, p, parent_id, name).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::create_folder(&account.api, p, parent_id, name).await
+        }
+        Provider::Interaxo => interaxo::create_folder(&ctx.interaxo_api, p, parent_id, name).await,
     }
 }
 
@@ -396,15 +457,19 @@ pub async fn rename_file(
     version_urn: Option<&str>,
     new_name: &str,
 ) -> Result<(), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
         Provider::Acc => {
             let vurn = version_urn
                 .ok_or_else(|| ApiError::Message("file has no remote version yet".to_string()))?;
-            dm::rename_file(api, p, vurn, new_name).await
+            dm::rename_file(&ctx.api, p, vurn, new_name).await
         }
-        Provider::StreamBim => streambim::rename_file(api, p, id, version_urn, new_name).await,
-        Provider::Interaxo => interaxo::rename_file(api, p, id, version_urn, new_name).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::rename_file(&account.api, p, id, version_urn, new_name).await
+        }
+        Provider::Interaxo => {
+            interaxo::rename_file(&ctx.interaxo_api, p, id, version_urn, new_name).await
+        }
     }
 }
 
@@ -415,11 +480,13 @@ pub async fn move_file(
     id: &str,
     new_parent_id: &str,
 ) -> Result<(), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::move_file(api, p, id, new_parent_id).await,
-        Provider::StreamBim => streambim::move_file(api, p, id, new_parent_id).await,
-        Provider::Interaxo => interaxo::move_file(api, p, id, new_parent_id).await,
+        Provider::Acc => dm::move_file(&ctx.api, p, id, new_parent_id).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::move_file(&account.api, p, id, new_parent_id).await
+        }
+        Provider::Interaxo => interaxo::move_file(&ctx.interaxo_api, p, id, new_parent_id).await,
     }
 }
 
@@ -431,46 +498,50 @@ pub async fn patch_folder(
     new_name: Option<&str>,
     new_parent_id: Option<&str>,
 ) -> Result<(), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::patch_folder(api, p, folder_id, new_name, new_parent_id).await,
+        Provider::Acc => dm::patch_folder(&ctx.api, p, folder_id, new_name, new_parent_id).await,
         Provider::StreamBim => {
-            streambim::patch_folder(api, p, folder_id, new_name, new_parent_id).await
+            let account = streambim_account(ctx, p)?;
+            streambim::patch_folder(&account.api, p, folder_id, new_name, new_parent_id).await
         }
         Provider::Interaxo => {
-            interaxo::patch_folder(api, p, folder_id, new_name, new_parent_id).await
+            interaxo::patch_folder(&ctx.interaxo_api, p, folder_id, new_name, new_parent_id).await
         }
     }
 }
 
 /// Delete a file (soft delete on ACC and StreamBIM).
 pub async fn delete_file(ctx: &Ctx, p: &Project, id: &str) -> Result<(), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::delete_file(api, p, id).await,
-        Provider::StreamBim => streambim::delete_file(api, p, id).await,
-        Provider::Interaxo => interaxo::delete_file(api, p, id).await,
+        Provider::Acc => dm::delete_file(&ctx.api, p, id).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::delete_file(&account.api, p, id).await
+        }
+        Provider::Interaxo => interaxo::delete_file(&ctx.interaxo_api, p, id).await,
     }
 }
 
 /// Delete a folder.
 pub async fn delete_folder(ctx: &Ctx, p: &Project, folder_id: &str) -> Result<(), ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::delete_folder(api, p, folder_id).await,
-        Provider::StreamBim => streambim::delete_folder(api, p, folder_id).await,
-        Provider::Interaxo => interaxo::delete_folder(api, p, folder_id).await,
+        Provider::Acc => dm::delete_folder(&ctx.api, p, folder_id).await,
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::delete_folder(&account.api, p, folder_id).await
+        }
+        Provider::Interaxo => interaxo::delete_folder(&ctx.interaxo_api, p, folder_id).await,
     }
 }
 
 /// The provider's web page for an item (the API part only: the engine refuses local-only
 /// items and the hub itself before it asks).
 pub async fn web_link(ctx: &Ctx, p: &Project, item: &Item) -> Result<String, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => acc_web_link(api, p, item).await,
-        Provider::StreamBim => streambim::web_link(api, p, item).await,
-        Provider::Interaxo => interaxo::web_link(api, p, item).await,
+        Provider::Acc => acc_web_link(&ctx.api, p, item).await,
+        // The page is named by the project's meta: no request, so no account is needed.
+        Provider::StreamBim => streambim::web_link(p, item).await,
+        Provider::Interaxo => interaxo::web_link(&ctx.interaxo_api, p, item).await,
     }
 }
 
@@ -496,24 +567,26 @@ pub async fn set_reserved(
     id: &str,
     reserve: bool,
 ) -> Result<Option<String>, ApiError> {
-    let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => dm::set_reserved(api, p, id, reserve).await,
-        Provider::StreamBim => streambim::set_reserved(api, p, id, reserve).await,
-        Provider::Interaxo => interaxo::set_reserved(api, p, id, reserve).await,
+        Provider::Acc => dm::set_reserved(&ctx.api, p, id, reserve).await,
+        // StreamBIM has no locks: refused before any account is needed.
+        Provider::StreamBim => streambim::set_reserved(p, id, reserve).await,
+        Provider::Interaxo => interaxo::set_reserved(&ctx.interaxo_api, p, id, reserve).await,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Auth;
+    use crate::auth::{dpapi_protect, Auth};
     use crate::config::Config;
     use crate::ipc::IpcHub;
     use crate::model::{ChangeSourceKind, TopFolder};
     use crate::paths::Paths;
     use crate::store::Store;
-    use crate::streambim_auth::StreamBimAuth;
+    use crate::streambim_auth::StreamBimAccounts;
+    use crate::test_support::{Fault, Server};
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, RwLock};
@@ -552,7 +625,7 @@ mod tests {
         let store = Arc::new(Store::open(&paths.db_file).unwrap());
         let http = crate::http::build_client();
         let auth = Arc::new(Auth::new(String::new(), http.clone(), &state));
-        let streambim = Arc::new(StreamBimAuth::new(http.clone(), &state));
+        let streambim = Arc::new(StreamBimAccounts::load(http.clone(), &state));
         let (tx, _rx) = std::sync::mpsc::channel();
         let ui = crate::app::UiSender {
             tx,
@@ -567,11 +640,7 @@ mod tests {
             store,
             auth: auth.clone(),
             api: Api::new(http.clone(), auth.clone()),
-            streambim: streambim.clone(),
-            streambim_api: Api::with_source(
-                http.clone(),
-                crate::http::TokenSource::StreamBim(streambim),
-            ),
+            streambim,
             interaxo: auth.clone(),
             interaxo_api: Api::new(http, auth),
             ui,
@@ -603,6 +672,53 @@ mod tests {
             provider,
             meta: None,
         }
+    }
+
+    /// A StreamBIM project of account `key`, served at `base` (its meta names both).
+    fn streambim_project(key: &str, base: &str, id: &str) -> Project {
+        let mut p = project(Provider::StreamBim);
+        p.hub_id = format!("streambim:{key}");
+        p.project_id = format!("streambim:{key}:{id}");
+        p.meta = Some(json!({"region": key, "base": base, "project": id}).to_string());
+        p
+    }
+
+    /// Writes a signed-in StreamBIM account: its token file (DPAPI) and its profile.
+    fn write_session(state: &Path, key: &str, base: &str, id_token: &str) {
+        let tokens = json!({
+            "refresh_token": "test-only-refresh",
+            "id_token": id_token,
+            "expires_at": 4_102_444_800i64,
+        });
+        std::fs::write(
+            state.join(format!("token-streambim-{key}.bin")),
+            dpapi_protect(tokens.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let profile = json!({
+            "user_id": "test-only-streambim-user",
+            "name": "Testanvändare",
+            "email": "test@example.invalid",
+            "region": key,
+            "base": base,
+        });
+        std::fs::write(
+            state.join(format!("user-streambim-{key}.json")),
+            profile.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Loads the accounts of the fixture's state directory again, after `write_session`.
+    fn reload_accounts(f: &mut Fixture) {
+        let http = crate::http::build_client();
+        f.ctx.streambim = Arc::new(StreamBimAccounts::load(http, &f.ctx.paths.state_dir));
+    }
+
+    /// An empty listing for the StreamBIM JSON:API calls of `folder_contents`.
+    fn empty_listing() -> Fault {
+        Fault::reply(200, json!({"data": []}).to_string())
+            .header("Content-Type", "application/vnd.api+json")
     }
 
     #[test]
@@ -651,9 +767,14 @@ mod tests {
         let mut p = project(Provider::StreamBim);
         p.meta =
             Some(r#"{"region":"app","base":"https://app.streambim.com","project":"1552"}"#.into());
-        // Not signed in: the client fails with its auth error before any request is sent.
+        // Not signed in: the call fails with an auth error before any request is sent, and the
+        // error names the server to sign in to.
         let err = folder_contents(&f.ctx, &p, "0").await.unwrap_err();
         assert!(matches!(err, ApiError::Auth(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "auth: Logga in på StreamBIM (app.streambim.com) för att synka."
+        );
         assert!(list_hubs(&f.ctx, Provider::StreamBim)
             .await
             .unwrap()
@@ -662,6 +783,98 @@ mod tests {
             set_reserved(&f.ctx, &p, "1", true).await,
             Err(ApiError::Unsupported(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn two_accounts_make_two_hubs_and_each_project_uses_its_own_token() {
+        let app = Server::new(|req, _| {
+            if req.header("authorization") == Some("Bearer id-app") {
+                empty_listing()
+            } else {
+                Fault::reply(401, "wrong token")
+            }
+        })
+        .await;
+        let japan = Server::new(|req, _| {
+            if req.header("authorization") == Some("Bearer id-japan") {
+                empty_listing()
+            } else {
+                Fault::reply(401, "wrong token")
+            }
+        })
+        .await;
+        let mut f = fixture("two-accounts");
+        let state = f.ctx.paths.state_dir.clone();
+        write_session(&state, "app", &app.origin, "id-app");
+        write_session(&state, "japan", &japan.origin, "id-japan");
+        reload_accounts(&mut f);
+
+        let hubs = list_hubs(&f.ctx, Provider::StreamBim).await.unwrap();
+        let ids: Vec<(&str, &str)> = hubs
+            .iter()
+            .map(|h| (h.id.as_str(), h.name.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("streambim:app", "StreamBIM"),
+                ("streambim:japan", "StreamBIM Japan")
+            ]
+        );
+        assert!(hubs.iter().all(|h| h.provider == Provider::StreamBim));
+
+        let app_project = streambim_project("app", &app.origin, "1552");
+        let japan_project = streambim_project("japan", &japan.origin, "9001");
+        folder_contents(&f.ctx, &app_project, "0").await.unwrap();
+        folder_contents(&f.ctx, &japan_project, "0").await.unwrap();
+        assert!(app
+            .requests()
+            .iter()
+            .all(|r| r.header("authorization") == Some("Bearer id-app")));
+        assert!(japan
+            .requests()
+            .iter()
+            .all(|r| r.header("authorization") == Some("Bearer id-japan")));
+        assert!(!app.requests().is_empty() && !japan.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_project_of_a_signed_out_account_is_refused_without_a_request() {
+        let server = Server::new(|_, _| empty_listing()).await;
+        let mut f = fixture("signed-out-account");
+        let state = f.ctx.paths.state_dir.clone();
+        write_session(&state, "app", &server.origin, "id-app");
+        reload_accounts(&mut f);
+        // The project's account (japan) has no session on this install.
+        let japan = streambim_project("japan", &server.origin, "9001");
+        let err = folder_contents(&f.ctx, &japan, "0").await.unwrap_err();
+        assert!(matches!(err, ApiError::Auth(_)), "{err}");
+        assert!(
+            err.to_string().contains("StreamBIM (japan.streambim.com)"),
+            "{err}"
+        );
+        assert_eq!(server.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_existing_user_project_keeps_its_account_and_hub() {
+        let mut f = fixture("legacy-meta");
+        let state = f.ctx.paths.state_dir.clone();
+        write_session(&state, "app", "https://app.streambim.com", "id-app");
+        reload_accounts(&mut f);
+        // The meta and ids of a project made by the single-account version.
+        let mut p = project(Provider::StreamBim);
+        p.hub_id = "streambim:app".into();
+        p.project_id = "streambim:app:13588".into();
+        p.meta =
+            Some(r#"{"base":"https://app.streambim.com","project":"13588","region":"app"}"#.into());
+        let account = f.ctx.streambim.for_project(&p).expect("the app account");
+        assert_eq!(account.key, "app");
+        assert!(f.ctx.project_connected(&p));
+        let hubs = list_hubs(&f.ctx, Provider::StreamBim).await.unwrap();
+        assert_eq!(hubs.len(), 1);
+        assert_eq!(hubs[0].id, "streambim:app");
+        assert_eq!(hubs[0].name, "StreamBIM");
     }
 
     #[tokio::test]
@@ -688,10 +901,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_acc_storage_markers_are_unique_and_never_prove_a_commit() {
-        let f = fixture("markers");
-        let mut sb = project(Provider::StreamBim);
-        sb.meta =
-            Some(r#"{"region":"app","base":"https://app.streambim.com","project":"1552"}"#.into());
+        let mut f = fixture("markers");
+        let state = f.ctx.paths.state_dir.clone();
+        let server = Server::new(|_, _| empty_listing()).await;
+        write_session(&state, "app", &server.origin, "id-app");
+        reload_accounts(&mut f);
+        let sb = streambim_project("app", &server.origin, "1552");
         let mut ix = project(Provider::Interaxo);
         ix.meta = None;
         for p in [&sb, &ix] {

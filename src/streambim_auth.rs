@@ -1,26 +1,44 @@
-//! StreamBIM sign-in: region + e-mail + password, optional TOTP code (MFA). See
-//! docs/PROVIDERS.md "StreamBIM" and docs/specs/streambim-endpoints.md section 2.
+//! StreamBIM sign-in: a server (a region or a custom https address) + e-mail + password, optional
+//! TOTP code (MFA). See docs/PROVIDERS.md "StreamBIM" and docs/specs/streambim-endpoints.md
+//! section 2.
 //!
-//! Files in the state directory: `token-streambim.bin` (DPAPI-protected JSON with the refresh
-//! material) and `user-streambim.json` (plain JSON profile with the region and base URL). The
-//! password, the tokens and the MFA session are never logged or put in an error message. A
-//! refused call is logged with the server's reason, but only after the submitted secrets are
-//! removed from it (see `clean`).
-
-// `login`, `verify_mfa`, `sign_out` and `LoginOutcome` are called by the sign-in commands of
-// the IPC layer, which is wired in a later step; until then only the tests call them.
+//! One `StreamBimAuth` per server account (`StreamBimAccount`), held by `StreamBimAccounts`. The
+//! account key is the region subdomain for `*.streambim.com` (`app`, `japan`) and the lowercase
+//! host otherwise (docs/IPC.md "Providers and accounts").
+//!
+//! Files in the state directory, per key: `token-streambim-<key>.bin` (DPAPI-protected JSON with
+//! the refresh material) and `user-streambim-<key>.json` (plain JSON profile with the user, the
+//! key and the base URL). The password, the tokens and the MFA session are never logged or put in
+//! an error message. A refused call is logged with the server's reason, but only after the
+//! submitted secrets are removed from it (see `clean`).
 
 use crate::auth::{dpapi_protect, dpapi_unprotect, UserInfo};
+use crate::http::{Api, TokenSource};
+use crate::model::{HubInfo, Project};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-const TOKEN_FILE: &str = "token-streambim.bin";
-const PROFILE_FILE: &str = "user-streambim.json";
+const TOKEN_PREFIX: &str = "token-streambim-";
+const PROFILE_PREFIX: &str = "user-streambim-";
+/// The files of a single-account install, renamed to the keyed names once (`migrate_legacy`).
+const LEGACY_TOKEN_FILE: &str = "token-streambim.bin";
+const LEGACY_PROFILE_FILE: &str = "user-streambim.json";
+
+/// The token file of the account `key`.
+fn token_file(key: &str) -> String {
+    format!("{TOKEN_PREFIX}{key}.bin")
+}
+
+/// The profile file of the account `key`.
+fn profile_file(key: &str) -> String {
+    format!("{PROFILE_PREFIX}{key}.json")
+}
 /// An MFA challenge is accepted this long after the password step.
 const CHALLENGE_TTL_SECS: i64 = 5 * 60;
 /// The id token is refreshed when less than this is left of its lifetime.
@@ -54,16 +72,34 @@ pub enum LoginOutcome {
     MfaRequired,
 }
 
-/// Holds the StreamBIM session (refresh material and the signed-in user).
+/// The session of one StreamBIM server account: refresh material and the signed-in user.
 pub struct StreamBimAuth {
     http: reqwest::Client,
     state_dir: PathBuf,
+    /// The account key (`app`, `japan`, or the lowercase host of a custom server).
+    key: String,
+    /// The server's origin, `https://<host>` (a loopback origin in tests).
+    base: String,
     state: Mutex<State>,
     /// One refresh request at a time. Callers that wait re-check the token before refreshing.
     refresh: tokio::sync::Mutex<()>,
-    /// Test only: every region resolves to this origin (a loopback server).
-    #[cfg(test)]
-    base_override: Option<String>,
+}
+
+/// One StreamBIM account: the server's key, its session and the API client that sends the
+/// session's bearer token (`TokenSource::StreamBim`).
+#[derive(Clone)]
+pub struct StreamBimAccount {
+    pub key: String,
+    pub auth: Arc<StreamBimAuth>,
+    pub api: Api,
+}
+
+/// Every StreamBIM account of this install, by key. Accounts are loaded from the state directory
+/// at start and added on their first sign-in.
+pub struct StreamBimAccounts {
+    http: reqwest::Client,
+    state_dir: PathBuf,
+    accounts: RwLock<BTreeMap<String, StreamBimAccount>>,
 }
 
 #[derive(Default)]
@@ -76,7 +112,8 @@ struct State {
     pending: Option<Challenge>,
 }
 
-/// `user-streambim.json`: the user plus where the account lives.
+/// `user-streambim-<key>.json`: the user plus where the account lives. `region` holds the account
+/// key (for a custom server, its host); `base` is the origin.
 #[derive(Serialize, Deserialize, Clone)]
 struct Profile {
     user_id: String,
@@ -97,8 +134,6 @@ struct Tokens {
 
 #[derive(Clone)]
 struct Challenge {
-    region: String,
-    base: String,
     username: String,
     session: String,
     /// Unix seconds.
@@ -133,35 +168,52 @@ enum Answer {
 
 impl StreamBimAuth {
     /// `state_dir` is where the token and profile files live. The profile is read now; the
-    /// tokens are read on first use.
-    pub fn new(http: reqwest::Client, state_dir: &Path) -> StreamBimAuth {
-        let profile = std::fs::read(state_dir.join(PROFILE_FILE))
+    /// tokens are read on first use. `key` names the account, `base` is its server's origin.
+    pub fn new(http: reqwest::Client, state_dir: &Path, key: &str, base: &str) -> StreamBimAuth {
+        let profile = std::fs::read(state_dir.join(profile_file(key)))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Profile>(&bytes).ok());
         StreamBimAuth {
             http,
             state_dir: state_dir.to_path_buf(),
+            key: key.to_string(),
+            base: base.trim_end_matches('/').to_string(),
             state: Mutex::new(State {
                 profile,
                 ..State::default()
             }),
             refresh: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
-            base_override: None,
         }
     }
 
-    /// Test constructor: every request goes to `base_override` (a loopback origin).
+    /// Test constructor for the account "app": every request goes to `base` (a loopback origin).
     #[cfg(test)]
-    pub(crate) fn for_test(
+    pub(crate) fn for_test(http: reqwest::Client, state_dir: &Path, base: &str) -> StreamBimAuth {
+        StreamBimAuth::new(http, state_dir, "app", base)
+    }
+
+    /// Test constructor for an account with any key.
+    #[cfg(test)]
+    pub(crate) fn for_test_key(
         http: reqwest::Client,
         state_dir: &Path,
-        base_override: &str,
+        key: &str,
+        base: &str,
     ) -> StreamBimAuth {
-        StreamBimAuth {
-            base_override: Some(base_override.to_string()),
-            ..StreamBimAuth::new(http, state_dir)
-        }
+        StreamBimAuth::new(http, state_dir, key, base)
+    }
+
+    /// The server's origin, `https://<host>` (a loopback origin in tests).
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    /// The server's host, e.g. "app.streambim.com".
+    pub fn host(&self) -> String {
+        url::Url::parse(&self.base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| canonical_host(&self.key))
     }
 
     /// Signed in: a profile with a user id, and tokens (on disk or in memory). The tokens are
@@ -180,31 +232,20 @@ impl StreamBimAuth {
         self.signed_in_profile().map(|p| profile_user(&p))
     }
 
-    /// The region host once signed in, e.g. "app.streambim.com".
-    pub fn host(&self) -> Option<String> {
-        let base = self.signed_in_profile()?.base;
-        url::Url::parse(&base).ok()?.host_str().map(str::to_string)
-    }
-
-    /// The region subdomain once signed in, e.g. "app".
-    pub fn region(&self) -> Option<String> {
-        self.signed_in_profile().map(|p| p.region)
+    /// True while an MFA code is awaited (the password step was accepted).
+    pub fn has_pending_mfa(&self) -> bool {
+        self.st().pending.is_some()
     }
 
     /// Password step. `SignedIn` when the account has no MFA; `MfaRequired` keeps the challenge
     /// in memory for `verify_mfa`. A new login replaces an unfinished challenge.
-    pub async fn login(
-        &self,
-        region: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<LoginOutcome> {
-        let base = self.base_for_region(region)?;
+    pub async fn login(&self, username: &str, password: &str) -> Result<LoginOutcome> {
         self.st().pending = None;
         let username = username.trim();
         if username.is_empty() || password.is_empty() {
             bail!("Ange e-post och lösenord för StreamBIM.");
         }
+        let base = self.base.clone();
         let body = json!({ "username": username, "password": password });
         match self
             .call(
@@ -225,11 +266,11 @@ impl StreamBimAuth {
                         user_id: username.to_string(),
                         name: name.unwrap_or_else(|| username.to_string()),
                         email: username.to_string(),
-                        region: region.to_string(),
+                        region: self.key.clone(),
                         base,
                     };
                     self.save_session(tokens, &profile)?;
-                    info!("StreamBIM: inloggad (region {region})");
+                    info!("StreamBIM: inloggad (server {})", self.key);
                     Ok(LoginOutcome::SignedIn(profile_user(&profile)))
                 }
                 "CHALLENGE_REQUESTED" => {
@@ -237,23 +278,21 @@ impl StreamBimAuth {
                         anyhow!("StreamBIM-inloggningen misslyckades: MFA-sessionen saknas.")
                     })?;
                     self.st().pending = Some(Challenge {
-                        region: region.to_string(),
-                        base,
                         username: username.to_string(),
                         session,
                         issued_at: now_secs(),
                     });
-                    info!("StreamBIM: MFA-kod krävs (region {region})");
+                    info!("StreamBIM: MFA-kod krävs (server {})", self.key);
                     Ok(LoginOutcome::MfaRequired)
                 }
-                "NEW_PASSWORD_REQUIRED" => bail!(password_reset_text(region)),
+                "NEW_PASSWORD_REQUIRED" => bail!(password_reset_text(&self.key)),
                 _ => bail!("StreamBIM-inloggningen misslyckades: oväntat svar från servern."),
             },
             Answer::Status {
                 status,
                 code,
                 reason,
-            } => bail!(login_refusal(region, status, &code, &reason)),
+            } => bail!(login_refusal(&self.key, status, &code, &reason)),
             Answer::Failed => {
                 bail!("StreamBIM-inloggningen misslyckades: inget giltigt svar från servern.")
             }
@@ -277,7 +316,8 @@ impl StreamBimAuth {
             "session": challenge.session,
             "code": code,
         });
-        let url = format!("{}/auth/v1/mfa/verify", challenge.base);
+        let base = self.base.clone();
+        let url = format!("{base}/auth/v1/mfa/verify");
         let secrets = [
             challenge.username.as_str(),
             challenge.session.as_str(),
@@ -288,16 +328,16 @@ impl StreamBimAuth {
                 let tokens = tokens_from(reply, None, now_secs()).ok_or_else(|| {
                     anyhow!("StreamBIM-verifieringen misslyckades: svaret saknar token.")
                 })?;
-                let name = self.profile_name(&challenge.base, &tokens.id_token).await;
+                let name = self.profile_name(&base, &tokens.id_token).await;
                 let profile = Profile {
                     user_id: challenge.username.clone(),
                     name: name.unwrap_or_else(|| challenge.username.clone()),
                     email: challenge.username.clone(),
-                    region: challenge.region.clone(),
-                    base: challenge.base.clone(),
+                    region: self.key.clone(),
+                    base,
                 };
                 self.save_session(tokens, &profile)?;
-                info!("StreamBIM: MFA godkänd (region {})", challenge.region);
+                info!("StreamBIM: MFA godkänd (server {})", self.key);
                 Ok(profile_user(&profile))
             }
             // Any other definitive answer ends the challenge, as a refusal does.
@@ -384,11 +424,11 @@ impl StreamBimAuth {
     }
 
     fn token_path(&self) -> PathBuf {
-        self.state_dir.join(TOKEN_FILE)
+        self.state_dir.join(token_file(&self.key))
     }
 
     fn profile_path(&self) -> PathBuf {
-        self.state_dir.join(PROFILE_FILE)
+        self.state_dir.join(profile_file(&self.key))
     }
 
     fn signed_in_profile(&self) -> Option<Profile> {
@@ -396,16 +436,6 @@ impl StreamBimAuth {
             return None;
         }
         self.st().profile.clone()
-    }
-
-    /// The base URL for a region. Validates the region first, also in tests.
-    fn base_for_region(&self, region: &str) -> Result<String> {
-        let base = region_base(region)?;
-        #[cfg(test)]
-        if let Some(origin) = &self.base_override {
-            return Ok(origin.clone());
-        }
-        Ok(base)
     }
 
     /// The tokens, read from disk on first use.
@@ -450,12 +480,10 @@ impl StreamBimAuth {
     /// Exchange the last id token and the refresh token for new tokens. Caller holds `refresh`.
     async fn refresh_session(&self) -> Result<String> {
         let tokens = self.cached_tokens().ok_or_else(|| anyhow!(NOT_SIGNED_IN))?;
-        let base = self
-            .st()
-            .profile
-            .as_ref()
-            .map(|p| p.base.clone())
-            .ok_or_else(|| anyhow!(NOT_SIGNED_IN))?;
+        if self.st().profile.is_none() {
+            bail!(NOT_SIGNED_IN);
+        }
+        let base = self.base.clone();
         let Some(refresh_token) = tokens.refresh_token.clone() else {
             self.clear_session();
             bail!(SESSION_EXPIRED);
@@ -825,17 +853,21 @@ fn mentions(code: &str, reason: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| hay.contains(&squash(needle)))
 }
 
-/// The Swedish text for a refused password step.
-fn login_refusal(region: &str, status: u16, code: &str, reason: &str) -> String {
+/// The Swedish text for a refused password step. `key` is the account key of the server.
+fn login_refusal(key: &str, status: u16, code: &str, reason: &str) -> String {
+    let host = canonical_host(key);
     if mentions(
         code,
         reason,
         &["usernotfound", "user does not exist", "not found"],
     ) {
-        return format!(
-            "Det finns inget StreamBIM-konto med den e-postadressen i regionen {region}. \
-             Välj en annan region (de flesta svenska konton finns i Europe eller Sweden)."
-        );
+        if valid_region(key) {
+            return format!(
+                "Det finns inget StreamBIM-konto med den e-postadressen i regionen {key}. \
+                 Välj en annan region (de flesta svenska konton finns i Europe eller Sweden)."
+            );
+        }
+        return format!("Det finns inget StreamBIM-konto med den e-postadressen på {host}.");
     }
     if mentions(
         code,
@@ -846,7 +878,7 @@ fn login_refusal(region: &str, status: u16, code: &str, reason: &str) -> String 
             "force_change_password",
         ],
     ) {
-        return password_reset_text(region);
+        return password_reset_text(key);
     }
     if mentions(code, reason, &["usernotconfirmed"]) {
         return "StreamBIM-kontot är inte bekräftat ännu. Bekräfta det via e-posten från StreamBIM."
@@ -861,9 +893,15 @@ fn login_refusal(region: &str, status: u16, code: &str, reason: &str) -> String 
             .to_string();
     }
     if status == 401 || mentions(code, reason, &["notauthorized", "incorrect"]) {
+        if valid_region(key) {
+            return format!(
+                "Fel e-post eller lösenord för StreamBIM (region {key}). \
+                 Kontrollera också att kontot finns i den regionen."
+            );
+        }
         return format!(
-            "Fel e-post eller lösenord för StreamBIM (region {region}). \
-             Kontrollera också att kontot finns i den regionen."
+            "Fel e-post eller lösenord för StreamBIM ({host}). \
+             Kontrollera också att kontot finns på servern."
         );
     }
     if status == 429 {
@@ -873,9 +911,10 @@ fn login_refusal(region: &str, status: u16, code: &str, reason: &str) -> String 
 }
 
 /// The Swedish text for a login that needs a password change in the web app.
-fn password_reset_text(region: &str) -> String {
+fn password_reset_text(key: &str) -> String {
     format!(
-        "StreamBIM kräver att du byter lösenord. Logga in på {region}.streambim.com i webbläsaren först."
+        "StreamBIM kräver att du byter lösenord. Logga in på {} i webbläsaren först.",
+        canonical_host(key)
     )
 }
 
@@ -907,12 +946,312 @@ pub fn valid_region(region: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// `https://<region>.streambim.com`. Anything but a plain subdomain is rejected.
-pub fn region_base(region: &str) -> Result<String> {
+/// The account key and the origin of a region: `app` gives `https://app.streambim.com`.
+pub fn server_from_region(region: &str) -> Result<(String, String), String> {
     if !valid_region(region) {
-        bail!("Ogiltig StreamBIM-region.");
+        return Err("Ogiltig StreamBIM-region.".into());
     }
-    Ok(format!("https://{region}.streambim.com"))
+    Ok((
+        region.to_string(),
+        format!("https://{region}.streambim.com"),
+    ))
+}
+
+/// The account key and the origin of a custom StreamBIM address `https://<host>`. Only https, a
+/// DNS name with at least one dot, no port, path (other than "/"), query, fragment or user info,
+/// and no IP address. A host `<region>.streambim.com` is the region itself (key `<region>`). The
+/// host is lowercased, so the key is the lowercase host.
+pub fn server_from_url(url: &str) -> Result<(String, String), String> {
+    const SCHEME: &str = "https://";
+    let url = url.trim();
+    let rest =
+        match url.get(..SCHEME.len()) {
+            Some(scheme) if scheme.eq_ignore_ascii_case(SCHEME) => &url[SCHEME.len()..],
+            _ => return Err(
+                "Adressen måste börja med https:// (till exempel https://streambim.example.com)."
+                    .into(),
+            ),
+        };
+    if rest.contains(['?', '#']) {
+        return Err("Adressen får inte innehålla frågetecken (?) eller fragment (#).".into());
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    if !path.is_empty() && path != "/" {
+        return Err("Adressen får inte innehålla någon sökväg. Ange bara https://värdnamn.".into());
+    }
+    if authority.contains('@') {
+        return Err("Adressen får inte innehålla användarnamn eller lösenord.".into());
+    }
+    if authority.contains(':') {
+        return Err("Adressen får inte innehålla någon port.".into());
+    }
+    let host = authority.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("Ange adressen till StreamBIM-servern.".into());
+    }
+    if host.contains('[') {
+        return Err("Ange ett värdnamn, inte en IP-adress.".into());
+    }
+    if host
+        .split('.')
+        .all(|label| label.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err("Ange ett värdnamn, inte en IP-adress.".into());
+    }
+    if !host.contains('.') {
+        return Err(
+            "Värdnamnet måste ha minst en punkt, till exempel streambim.example.com.".into(),
+        );
+    }
+    if !valid_host(&host) {
+        return Err("Ogiltigt värdnamn. Använd bokstäver, siffror och bindestreck, till exempel streambim.example.com.".into());
+    }
+    let key = match host.strip_suffix(".streambim.com") {
+        Some(label) if valid_region(label) => label.to_string(),
+        _ => host.clone(),
+    };
+    Ok((key, format!("https://{host}")))
+}
+
+/// A DNS name: at most 253 characters, labels of 1 to 63 letters, digits and '-', none starting or
+/// ending with '-'. The host is already lowercase.
+fn valid_host(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// The account key of a server origin, when it is a StreamBIM server this app can sign in to.
+/// `https://app.streambim.com` gives "app"; a loopback test origin gives None.
+pub fn key_for_base(base: &str) -> Option<String> {
+    server_from_url(base).ok().map(|(key, _)| key)
+}
+
+/// True for an account key: a region (`app`) or the lowercase host of a custom server.
+pub fn valid_key(key: &str) -> bool {
+    valid_region(key)
+        || (key.contains('.')
+            && server_from_url(&format!("https://{key}")).is_ok_and(|(found, _)| found == key))
+}
+
+/// The host of an account's server: `<key>.streambim.com` for a region, the key itself otherwise.
+pub fn canonical_host(key: &str) -> String {
+    if valid_region(key) {
+        format!("{key}.streambim.com")
+    } else {
+        key.to_string()
+    }
+}
+
+/// The account key of a project: from the origin of its `meta.base`, else its `meta.region`
+/// (the key of a project made before a custom server could be chosen).
+pub fn project_key(p: &Project) -> Option<String> {
+    let meta: Value = serde_json::from_str(p.meta.as_deref()?).ok()?;
+    meta.get("base")
+        .and_then(Value::as_str)
+        .and_then(key_for_base)
+        .or_else(|| {
+            meta.get("region")
+                .and_then(Value::as_str)
+                .filter(|region| valid_key(region))
+                .map(str::to_string)
+        })
+}
+
+/// What the user signs in to for a project: "StreamBIM (<host>)".
+pub fn sign_in_label(p: &Project) -> String {
+    match project_key(p) {
+        Some(key) => format!("StreamBIM ({})", canonical_host(&key)),
+        None => "StreamBIM".to_string(),
+    }
+}
+
+/// The base URL of an account key: `https://<key>.streambim.com`, or `https://<host>`.
+fn base_for_key(key: &str) -> String {
+    format!("https://{}", canonical_host(key))
+}
+
+/// The keys of the profiles in the state directory (`user-streambim-<key>.json`), sorted.
+fn keys_on_disk(state_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = entries
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let key = name
+                .strip_prefix(PROFILE_PREFIX)?
+                .strip_suffix(".json")?
+                .to_string();
+            valid_key(&key).then_some(key)
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A single-account install keeps `token-streambim.bin` and `user-streambim.json`. Their server
+/// gives the key (from the profile's `base`, else its `region`), and each file is renamed to the
+/// keyed name, unless that file already exists: then the legacy one is deleted. A profile with no
+/// usable server is removed with its token, since nothing can use them.
+fn migrate_legacy(state_dir: &Path) {
+    let legacy_profile = state_dir.join(LEGACY_PROFILE_FILE);
+    if !legacy_profile.exists() {
+        return;
+    }
+    let key = std::fs::read(&legacy_profile)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|profile| {
+            profile
+                .get("base")
+                .and_then(Value::as_str)
+                .and_then(key_for_base)
+                .or_else(|| {
+                    profile
+                        .get("region")
+                        .and_then(Value::as_str)
+                        .filter(|region| valid_region(region))
+                        .map(str::to_string)
+                })
+        });
+    let Some(key) = key else {
+        warn!("StreamBIM: den gamla kontofilen saknar server och tas bort");
+        drop_file(&legacy_profile);
+        drop_file(&state_dir.join(LEGACY_TOKEN_FILE));
+        return;
+    };
+    move_or_drop(&legacy_profile, &state_dir.join(profile_file(&key)));
+    move_or_drop(
+        &state_dir.join(LEGACY_TOKEN_FILE),
+        &state_dir.join(token_file(&key)),
+    );
+    info!("StreamBIM: kontofilerna flyttades till kontot {key}");
+}
+
+/// Renames `from` to `to`, unless `to` exists: then `from` is deleted.
+fn move_or_drop(from: &Path, to: &Path) {
+    if !from.exists() {
+        return;
+    }
+    if to.exists() {
+        drop_file(from);
+    } else if let Err(e) = std::fs::rename(from, to) {
+        warn!("StreamBIM: kunde inte flytta {}: {e}", from.display());
+    }
+}
+
+/// Removes a file, logging a failure (no contents are named).
+fn drop_file(path: &Path) {
+    if let Err(e) = remove_if_exists(path) {
+        warn!("StreamBIM: kunde inte ta bort en kontofil: {e:#}");
+    }
+}
+
+impl StreamBimAccounts {
+    /// The accounts whose profiles are in `state_dir`. A single-account install is migrated first.
+    pub fn load(http: reqwest::Client, state_dir: &Path) -> StreamBimAccounts {
+        migrate_legacy(state_dir);
+        let accounts = StreamBimAccounts {
+            http,
+            state_dir: state_dir.to_path_buf(),
+            accounts: RwLock::new(BTreeMap::new()),
+        };
+        for key in keys_on_disk(state_dir) {
+            let account = accounts.make(&key, &base_for_key(&key));
+            accounts.write().insert(key, account);
+        }
+        accounts
+    }
+
+    /// The account with this key, if it exists (signed in or not).
+    pub fn get(&self, key: &str) -> Option<StreamBimAccount> {
+        self.read().get(key).cloned()
+    }
+
+    /// The account with this key, added (signed out) on first use with its server `base`.
+    pub fn get_or_add(&self, key: &str, base: &str) -> StreamBimAccount {
+        if let Some(account) = self.get(key) {
+            return account;
+        }
+        let mut accounts = self.write();
+        accounts
+            .entry(key.to_string())
+            .or_insert_with(|| self.make(key, base))
+            .clone()
+    }
+
+    /// Every account, sorted by key.
+    pub fn all(&self) -> Vec<StreamBimAccount> {
+        self.read().values().cloned().collect()
+    }
+
+    /// The accounts that are signed in, sorted by key.
+    pub fn signed_in(&self) -> Vec<StreamBimAccount> {
+        self.all()
+            .into_iter()
+            .filter(|account| account.auth.is_signed_in())
+            .collect()
+    }
+
+    /// True when at least one account is signed in.
+    pub fn any_signed_in(&self) -> bool {
+        self.all().iter().any(|account| account.auth.is_signed_in())
+    }
+
+    /// The account a project belongs to (its key, see `project_key`).
+    pub fn for_project(&self, p: &Project) -> Option<StreamBimAccount> {
+        self.get(&project_key(p)?)
+    }
+
+    /// The account of a StreamBIM hub (its region is the key).
+    pub fn for_hub(&self, hub: &HubInfo) -> Option<StreamBimAccount> {
+        self.get(hub.region.as_deref()?)
+    }
+
+    /// Drops the in-memory account when it has no session and waits for no MFA code. Its files
+    /// are already gone after a sign-out; a failed sign-in leaves none.
+    pub fn forget_if_signed_out(&self, key: &str) {
+        let mut accounts = self.write();
+        let signed_out = accounts
+            .get(key)
+            .is_some_and(|account| !account.auth.is_signed_in() && !account.auth.has_pending_mfa());
+        if signed_out {
+            accounts.remove(key);
+        }
+    }
+
+    fn make(&self, key: &str, base: &str) -> StreamBimAccount {
+        let auth = Arc::new(StreamBimAuth::new(
+            self.http.clone(),
+            &self.state_dir,
+            key,
+            base,
+        ));
+        let api = Api::with_source(self.http.clone(), TokenSource::StreamBim(auth.clone()));
+        StreamBimAccount {
+            key: key.to_string(),
+            auth,
+            api,
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, StreamBimAccount>> {
+        self.accounts.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, StreamBimAccount>> {
+        self.accounts.write().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 fn now_secs() -> i64 {
@@ -1030,10 +1369,13 @@ mod tests {
     #[test]
     fn region_validation() {
         assert_eq!(
-            region_base("sweden").unwrap(),
+            server_from_region("sweden").unwrap().1,
             "https://sweden.streambim.com"
         );
-        assert_eq!(region_base("app").unwrap(), "https://app.streambim.com");
+        assert_eq!(
+            server_from_region("app").unwrap().1,
+            "https://app.streambim.com"
+        );
         assert!(valid_region(&"a".repeat(32)));
         assert!(!valid_region(&"a".repeat(33)));
         for bad in [
@@ -1047,19 +1389,8 @@ mod tests {
             "a?b",
         ] {
             assert!(!valid_region(bad), "{bad:?} must be rejected");
-            assert!(region_base(bad).is_err(), "{bad:?} must be rejected");
+            assert!(server_from_region(bad).is_err(), "{bad:?} must be rejected");
         }
-    }
-
-    #[tokio::test]
-    async fn region_is_validated_before_any_request() {
-        let server = success_server().await;
-        let dir = TestDir::new("region");
-        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        for bad in ["", "App", "evil.example.com/x"] {
-            assert!(auth.login(bad, "ada@example.com", "pw").await.is_err());
-        }
-        assert_eq!(server.count(), 0);
     }
 
     #[tokio::test]
@@ -1068,10 +1399,7 @@ mod tests {
         let dir = TestDir::new("login");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
 
-        let outcome = auth
-            .login("app", "ada@example.com", "pw-secret")
-            .await
-            .unwrap();
+        let outcome = auth.login("ada@example.com", "pw-secret").await.unwrap();
         match outcome {
             LoginOutcome::SignedIn(user) => {
                 assert_eq!(user.name, "Ada Lovelace");
@@ -1081,8 +1409,7 @@ mod tests {
             LoginOutcome::MfaRequired => panic!("no MFA expected"),
         }
         assert!(auth.is_signed_in());
-        assert_eq!(auth.region().as_deref(), Some("app"));
-        assert_eq!(auth.host().as_deref(), Some("127.0.0.1"));
+        assert_eq!(auth.host(), "127.0.0.1");
 
         // The login request: JSON body and the charset content type.
         let requests = server.requests();
@@ -1102,9 +1429,9 @@ mod tests {
         assert_eq!(profile.header("accept"), Some(JSON_API));
 
         // Files: the refresh token is protected, the profile has no secrets.
-        let token_bytes = std::fs::read(dir.path().join(TOKEN_FILE)).unwrap();
+        let token_bytes = std::fs::read(dir.path().join(token_file("app"))).unwrap();
         assert!(!token_bytes.windows(4).any(|w| w == b"rt-1"));
-        let profile_text = std::fs::read_to_string(dir.path().join(PROFILE_FILE)).unwrap();
+        let profile_text = std::fs::read_to_string(dir.path().join(profile_file("app"))).unwrap();
         assert!(profile_text.contains("\"region\":\"app\""));
         assert!(profile_text.contains("\"base\""));
         for secret in ["pw-secret", "rt-1", "id-1", "at-1"] {
@@ -1113,7 +1440,7 @@ mod tests {
 
         // A new instance (after a restart) is signed in and uses the stored id token, with no
         // request, while the token is fresh.
-        let again = StreamBimAuth::new(http(), dir.path());
+        let again = StreamBimAuth::new(http(), dir.path(), "app", &server.origin);
         assert!(again.is_signed_in());
         assert_eq!(again.user().unwrap().email, "ada@example.com");
         assert_eq!(again.access_token().await.unwrap(), "id-1");
@@ -1124,9 +1451,9 @@ mod tests {
     async fn wrong_password_is_a_swedish_error_without_the_password() {
         let server = Server::new(|_, _| reply_json(401, json!({"error": "bad"}))).await;
         let dir = TestDir::new("wrongpw");
-        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let auth = StreamBimAuth::for_test_key(http(), dir.path(), "sweden", &server.origin);
         let err = auth
-            .login("sweden", "ada@example.com", "hunter2-secret")
+            .login("ada@example.com", "hunter2-secret")
             .await
             .unwrap_err()
             .to_string();
@@ -1143,11 +1470,7 @@ mod tests {
         let server = Server::new(|_, _| reply_json(500, json!({"detail": "boom"}))).await;
         let dir = TestDir::new("status");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        let err = auth
-            .login("app", "a@b.se", "pw")
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = auth.login("a@b.se", "pw").await.unwrap_err().to_string();
         assert_eq!(err, "StreamBIM avvisade inloggningen (HTTP 500): boom");
     }
 
@@ -1169,10 +1492,10 @@ mod tests {
         let dir = TestDir::new("mfa");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
 
-        let outcome = auth.login("app", "ada@example.com", "pw").await.unwrap();
+        let outcome = auth.login("ada@example.com", "pw").await.unwrap();
         assert!(matches!(outcome, LoginOutcome::MfaRequired));
         assert!(!auth.is_signed_in());
-        assert!(!dir.path().join(TOKEN_FILE).exists());
+        assert!(!dir.path().join(token_file("app")).exists());
 
         let user = auth.verify_mfa("123456").await.unwrap();
         assert_eq!(user.name, "Ada Lovelace");
@@ -1209,7 +1532,7 @@ mod tests {
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
 
         // Malformed codes never reach the server.
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         for bad in [
             "12345",
             "1234567",
@@ -1231,7 +1554,7 @@ mod tests {
         assert_eq!(server.count(), 1);
 
         // A wrong code ends the challenge: the next try needs a new password step.
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         let err = auth.verify_mfa("000000").await.unwrap_err().to_string();
         assert_eq!(err, "Fel kod. Logga in igen och ange en ny kod.");
         assert_eq!(server.count(), 3);
@@ -1256,7 +1579,7 @@ mod tests {
         .await;
         let dir = TestDir::new("refresh");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
 
         auth.invalidate().await;
         assert_eq!(auth.access_token().await.unwrap(), "id-2");
@@ -1292,8 +1615,8 @@ mod tests {
         .await;
         let dir = TestDir::new("rejected");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
-        assert!(dir.path().join(TOKEN_FILE).exists());
+        auth.login("ada@example.com", "pw").await.unwrap();
+        assert!(dir.path().join(token_file("app")).exists());
 
         auth.invalidate().await;
         let err = auth.access_token().await.unwrap_err().to_string();
@@ -1303,7 +1626,7 @@ mod tests {
         );
         assert!(!auth.is_signed_in());
         assert!(auth.user().is_none());
-        assert!(!dir.path().join(TOKEN_FILE).exists());
+        assert!(!dir.path().join(token_file("app")).exists());
         // Signed out: no more refresh attempts.
         let before = server.count();
         assert!(auth.access_token().await.is_err());
@@ -1327,7 +1650,7 @@ mod tests {
         .await;
         let dir = TestDir::new("norefresh");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         auth.verify_mfa("654321").await.unwrap();
         let count = server.count();
 
@@ -1336,7 +1659,7 @@ mod tests {
         assert!(err.contains("logga in igen"), "{err}");
         assert_eq!(server.count(), count, "no refresh without a refresh token");
         assert!(!auth.is_signed_in());
-        assert!(!dir.path().join(TOKEN_FILE).exists());
+        assert!(!dir.path().join(token_file("app")).exists());
     }
 
     #[tokio::test]
@@ -1353,7 +1676,7 @@ mod tests {
         .await;
         let dir = TestDir::new("outage");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         auth.invalidate().await;
 
         let err = auth.access_token().await.unwrap_err().to_string();
@@ -1362,7 +1685,7 @@ mod tests {
             "StreamBIM-sessionen kunde inte förnyas: HTTP 503. Försök igen."
         );
         assert!(auth.is_signed_in());
-        assert!(dir.path().join(TOKEN_FILE).exists());
+        assert!(dir.path().join(token_file("app")).exists());
     }
 
     #[tokio::test]
@@ -1370,13 +1693,13 @@ mod tests {
         let server = success_server().await;
         let dir = TestDir::new("signout");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         auth.sign_out().await.unwrap();
         assert!(!auth.is_signed_in());
         assert!(auth.user().is_none());
-        assert!(!dir.path().join(TOKEN_FILE).exists());
-        assert!(!dir.path().join(PROFILE_FILE).exists());
-        assert!(!StreamBimAuth::new(http(), dir.path()).is_signed_in());
+        assert!(!dir.path().join(token_file("app")).exists());
+        assert!(!dir.path().join(profile_file("app")).exists());
+        assert!(!StreamBimAuth::new(http(), dir.path(), "app", &server.origin).is_signed_in());
     }
 
     /// Server: login with `id-1`/`rt-1`, the profile, and a refresh answered by `refresh`.
@@ -1409,7 +1732,7 @@ mod tests {
         .await;
         let dir = TestDir::new("stale");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
 
         // A 401 for a token that is not the current one changes nothing.
         auth.invalidate_token("id-0").await;
@@ -1445,7 +1768,7 @@ mod tests {
                 refresh_server(move || reply_json(status, json!({"error": "later"}))).await;
             let dir = TestDir::new("temporary");
             let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-            auth.login("app", "ada@example.com", "pw").await.unwrap();
+            auth.login("ada@example.com", "pw").await.unwrap();
             auth.invalidate_token("id-1").await;
 
             let err = auth.access_token().await.unwrap_err().to_string();
@@ -1454,7 +1777,7 @@ mod tests {
                 format!("StreamBIM-sessionen kunde inte förnyas: HTTP {status}. Försök igen.")
             );
             assert!(auth.is_signed_in(), "{status}: the session stays");
-            assert!(dir.path().join(TOKEN_FILE).exists(), "{status}");
+            assert!(dir.path().join(token_file("app")).exists(), "{status}");
             // The next call tries the refresh again with the same tokens.
             let before = server.count();
             assert!(auth.access_token().await.is_err());
@@ -1467,7 +1790,7 @@ mod tests {
         let server = refresh_server(|| Fault::Disconnect).await;
         let dir = TestDir::new("noanswer");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         auth.invalidate_token("id-1").await;
 
         assert_eq!(
@@ -1475,7 +1798,7 @@ mod tests {
             REFRESH_RETRY
         );
         assert!(auth.is_signed_in());
-        assert!(dir.path().join(TOKEN_FILE).exists());
+        assert!(dir.path().join(token_file("app")).exists());
     }
 
     #[tokio::test]
@@ -1496,7 +1819,7 @@ mod tests {
             let server = refresh_server(move || answer.clone()).await;
             let dir = TestDir::new("refused");
             let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-            auth.login("app", "ada@example.com", "pw").await.unwrap();
+            auth.login("ada@example.com", "pw").await.unwrap();
             auth.invalidate_token("id-1").await;
 
             assert_eq!(
@@ -1505,7 +1828,7 @@ mod tests {
                 "{name}"
             );
             assert!(!auth.is_signed_in(), "{name}");
-            assert!(!dir.path().join(TOKEN_FILE).exists(), "{name}");
+            assert!(!dir.path().join(token_file("app")).exists(), "{name}");
         }
     }
 
@@ -1514,7 +1837,7 @@ mod tests {
         let server = success_server().await;
         let dir = TestDir::new("unreadable");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
 
         // Bytes that are not DPAPI data, and DPAPI data that is not a token document.
         let garbage = [
@@ -1522,11 +1845,14 @@ mod tests {
             dpapi_protect(b"{\"refresh_").unwrap(),
         ];
         for bytes in garbage {
-            std::fs::write(dir.path().join(TOKEN_FILE), &bytes).unwrap();
-            let again = StreamBimAuth::new(http(), dir.path());
+            std::fs::write(dir.path().join(token_file("app")), &bytes).unwrap();
+            let again = StreamBimAuth::new(http(), dir.path(), "app", &server.origin);
             assert!(!again.is_signed_in());
             assert!(again.user().is_none());
-            assert!(!dir.path().join(TOKEN_FILE).exists(), "the file is removed");
+            assert!(
+                !dir.path().join(token_file("app")).exists(),
+                "the file is removed"
+            );
             let err = again.access_token().await.unwrap_err().to_string();
             assert!(err.contains("logga in igen"), "{err}");
         }
@@ -1589,9 +1915,9 @@ mod tests {
     async fn login_error_with(fault: Fault) -> String {
         let server = Server::new(move |_, _| fault.clone()).await;
         let dir = TestDir::new("loginerr");
-        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let auth = StreamBimAuth::for_test_key(http(), dir.path(), "sweden", &server.origin);
         let err = auth
-            .login("sweden", "ada@example.com", "pw-secret")
+            .login("ada@example.com", "pw-secret")
             .await
             .unwrap_err()
             .to_string();
@@ -1616,7 +1942,7 @@ mod tests {
         .await;
         let dir = TestDir::new("mfaerr");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         let err = auth.verify_mfa("123456").await.unwrap_err().to_string();
         assert!(
             !err.contains("sess-1") && !err.contains("123456") && !err.contains("ada@example.com"),
@@ -1762,7 +2088,7 @@ mod tests {
         let _guard = logs.install();
 
         let err = auth
-            .login("app", "ada@example.com", "hunter\"2\\secret")
+            .login("ada@example.com", "hunter\"2\\secret")
             .await
             .unwrap_err()
             .to_string();
@@ -1798,7 +2124,7 @@ mod tests {
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
         let logs = LogCapture::default();
         let _guard = logs.install();
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
 
         let err = auth.verify_mfa("482915").await.unwrap_err().to_string();
         let log = logs.text();
@@ -1831,7 +2157,7 @@ mod tests {
         .await;
         let dir = TestDir::new("refreshecho");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
         auth.invalidate().await;
         let logs = LogCapture::default();
         let _guard = logs.install();
@@ -1862,9 +2188,7 @@ mod tests {
         let logs = LogCapture::default();
         let _guard = logs.install();
 
-        auth.login("sweden", "ada@example.com", "pw")
-            .await
-            .unwrap_err();
+        auth.login("ada@example.com", "pw").await.unwrap_err();
         let log = logs.text();
         let line = log
             .lines()
@@ -1890,9 +2214,7 @@ mod tests {
         let logs = LogCapture::default();
         let _guard = logs.install();
 
-        auth.login("app", "ada@example.com", "pw")
-            .await
-            .unwrap_err();
+        auth.login("ada@example.com", "pw").await.unwrap_err();
         let log = logs.text();
         assert!(
             log.lines()
@@ -1946,7 +2268,7 @@ mod tests {
         .await;
         let dir = TestDir::new("transient");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.login("ada@example.com", "pw").await.unwrap();
 
         let err = auth.verify_mfa("123456").await.unwrap_err().to_string();
         assert_eq!(err, "StreamBIM avvisade inloggningen (HTTP 503): busy");
@@ -2028,5 +2350,299 @@ mod tests {
             clean("banana", &secret_forms(&["", "n"]), 200),
             "ba***a***a"
         );
+    }
+
+    #[test]
+    fn a_region_is_a_server_under_its_own_key() {
+        assert_eq!(
+            server_from_region("app").unwrap(),
+            ("app".to_string(), "https://app.streambim.com".to_string())
+        );
+        assert_eq!(
+            server_from_region("japan").unwrap().1,
+            "https://japan.streambim.com"
+        );
+        for bad in [
+            "",
+            "App",
+            "a.b",
+            "a/b",
+            "a b",
+            "evil.example.com/x",
+            "https://app.streambim.com",
+        ] {
+            assert!(server_from_region(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(server_from_region(&"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn a_custom_address_is_an_https_host_and_nothing_else() {
+        let ok = |url: &str| server_from_url(url).unwrap();
+        let example = (
+            "streambim.example.com".to_string(),
+            "https://streambim.example.com".to_string(),
+        );
+        assert_eq!(ok("https://streambim.example.com"), example);
+        assert_eq!(
+            ok("https://streambim.example.com/"),
+            example,
+            "a trailing slash is fine"
+        );
+        assert_eq!(
+            ok("https://StreamBIM.Example.COM"),
+            example,
+            "the host is lowercased"
+        );
+        assert_eq!(
+            ok("  https://streambim.example.com \n"),
+            example,
+            "the ends are trimmed"
+        );
+        // A host under streambim.com with a region label is that region.
+        assert_eq!(
+            ok("https://japan.streambim.com"),
+            (
+                "japan".to_string(),
+                "https://japan.streambim.com".to_string()
+            )
+        );
+        assert_eq!(ok("https://JAPAN.streambim.com/").0, "japan");
+        // A label that is not a region keeps the whole host as its key.
+        assert_eq!(ok("https://a.b.streambim.com").0, "a.b.streambim.com");
+
+        for bad in [
+            "http://streambim.example.com",
+            "ftp://streambim.example.com",
+            "streambim.example.com",
+            "https://",
+            "https://streambim.example.com:443",
+            "https://streambim.example.com:8443",
+            "https://streambim.example.com/x",
+            "https://streambim.example.com/?q=1",
+            "https://streambim.example.com?q=1",
+            "https://streambim.example.com#frag",
+            "https://user@streambim.example.com",
+            "https://user:pw@streambim.example.com",
+            "https://192.168.0.1",
+            "https://[::1]",
+            "https://localhost",
+            "https://streambim_example.com",
+            "https://-bad.example.com",
+            "https://bad-.example.com",
+            "https://a..b.com",
+            "https://example.com.",
+            "https://ex ample.com",
+            "https://ä.example.com",
+        ] {
+            assert!(server_from_url(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_base_gives_its_key_and_only_a_streambim_server_has_one() {
+        assert_eq!(
+            key_for_base("https://app.streambim.com").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            key_for_base("https://app.streambim.com/").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            key_for_base("https://streambim.example.com").as_deref(),
+            Some("streambim.example.com")
+        );
+        // The loopback origins of the tests have no key: the project's region names it then.
+        assert_eq!(key_for_base("http://127.0.0.1:9000"), None);
+        assert_eq!(key_for_base("garbage"), None);
+        assert!(valid_key("app"));
+        assert!(valid_key("streambim.example.com"));
+        assert!(!valid_key("app.streambim.com"), "a region key has no dot");
+        assert!(!valid_key("App"));
+        assert!(!valid_key("1.2.3.4"));
+        assert_eq!(canonical_host("sweden"), "sweden.streambim.com");
+        assert_eq!(
+            canonical_host("streambim.example.com"),
+            "streambim.example.com"
+        );
+    }
+
+    fn project_with_meta(meta: &str) -> Project {
+        Project {
+            pid: 1,
+            hub_id: "streambim:app".into(),
+            hub_name: "StreamBIM".into(),
+            project_id: "streambim:app:13588".into(),
+            name: "Demo".into(),
+            root_folder_urn: "0".into(),
+            urn_ns: String::new(),
+            tops: vec![crate::model::TopFolder {
+                id: "0".into(),
+                name: "Dokument".into(),
+            }],
+            oss_scopes: None,
+            change_source: crate::model::ChangeSourceKind::PublicWalk,
+            cursor: None,
+            enabled: true,
+            last_sync_ms: None,
+            provider: crate::model::Provider::StreamBim,
+            meta: Some(meta.into()),
+        }
+    }
+
+    #[test]
+    fn a_project_belongs_to_the_account_of_its_server() {
+        // The meta of a project made by the single-account version.
+        let legacy = project_with_meta(
+            r#"{"base":"https://app.streambim.com","project":"13588","region":"app"}"#,
+        );
+        assert_eq!(project_key(&legacy).as_deref(), Some("app"));
+        assert_eq!(sign_in_label(&legacy), "StreamBIM (app.streambim.com)");
+        let custom = project_with_meta(
+            r#"{"region":"streambim.example.com","base":"https://streambim.example.com","project":"7"}"#,
+        );
+        assert_eq!(
+            project_key(&custom).as_deref(),
+            Some("streambim.example.com")
+        );
+        // A test origin has no key, so the region of the meta names the account.
+        let loopback =
+            project_with_meta(r#"{"region":"app","base":"http://127.0.0.1:9","project":"1"}"#);
+        assert_eq!(project_key(&loopback).as_deref(), Some("app"));
+        assert_eq!(project_key(&project_with_meta("{}")), None);
+        assert_eq!(sign_in_label(&project_with_meta("{}")), "StreamBIM");
+    }
+
+    /// Writes a signed-in account (its token and profile) the way a sign-in leaves them.
+    fn write_account(dir: &Path, key: &str, base: &str) {
+        let tokens = json!({
+            "refresh_token": format!("rt-{key}"),
+            "id_token": format!("id-{key}"),
+            "expires_at": 4_102_444_800i64,
+        });
+        std::fs::write(
+            dir.join(token_file(key)),
+            dpapi_protect(tokens.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let profile = json!({
+            "user_id": format!("{key}@example.com"),
+            "name": "Ada",
+            "email": format!("{key}@example.com"),
+            "region": key,
+            "base": base,
+        });
+        std::fs::write(dir.join(profile_file(key)), profile.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_single_account_install_is_migrated_to_its_key() {
+        let dir = TestDir::new("migrate");
+        // The exact profile shape of the single-account version.
+        std::fs::write(
+            dir.path().join(LEGACY_PROFILE_FILE),
+            r#"{"user_id":"ada@example.com","name":"Ada","email":"ada@example.com","region":"app","base":"https://app.streambim.com"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_TOKEN_FILE),
+            dpapi_protect(
+                br#"{"refresh_token":"rt-legacy","id_token":"id-legacy","expires_at":4102444800}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let accounts = StreamBimAccounts::load(http(), dir.path());
+        assert!(!dir.path().join(LEGACY_PROFILE_FILE).exists());
+        assert!(!dir.path().join(LEGACY_TOKEN_FILE).exists());
+        assert!(dir.path().join("user-streambim-app.json").exists());
+        assert!(dir.path().join("token-streambim-app.bin").exists());
+        let app = accounts.get("app").expect("the account is loaded");
+        assert!(app.auth.is_signed_in());
+        assert_eq!(app.auth.base_url(), "https://app.streambim.com");
+        assert_eq!(app.auth.user().unwrap().email, "ada@example.com");
+    }
+
+    #[test]
+    fn a_keyed_file_wins_over_the_legacy_copy() {
+        let dir = TestDir::new("migrate-keep");
+        write_account(dir.path(), "app", "https://app.streambim.com");
+        std::fs::write(
+            dir.path().join(LEGACY_PROFILE_FILE),
+            r#"{"user_id":"old@example.com","name":"Old","email":"old@example.com","region":"app","base":"https://app.streambim.com"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(LEGACY_TOKEN_FILE), b"legacy").unwrap();
+
+        let accounts = StreamBimAccounts::load(http(), dir.path());
+        assert!(!dir.path().join(LEGACY_PROFILE_FILE).exists());
+        assert!(!dir.path().join(LEGACY_TOKEN_FILE).exists());
+        let app = accounts.get("app").unwrap();
+        assert_eq!(app.auth.user().unwrap().user_id, "app@example.com");
+        assert!(app.auth.is_signed_in());
+    }
+
+    #[test]
+    fn a_legacy_profile_without_a_server_is_dropped() {
+        let dir = TestDir::new("migrate-none");
+        std::fs::write(dir.path().join(LEGACY_PROFILE_FILE), r#"{"user_id":"x"}"#).unwrap();
+        std::fs::write(dir.path().join(LEGACY_TOKEN_FILE), b"legacy").unwrap();
+        let accounts = StreamBimAccounts::load(http(), dir.path());
+        assert!(accounts.all().is_empty());
+        assert!(!dir.path().join(LEGACY_PROFILE_FILE).exists());
+        assert!(!dir.path().join(LEGACY_TOKEN_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn two_accounts_are_independent_and_signing_one_out_keeps_the_other() {
+        let dir = TestDir::new("two");
+        write_account(dir.path(), "app", "https://app.streambim.com");
+        write_account(dir.path(), "japan", "https://japan.streambim.com");
+        write_account(
+            dir.path(),
+            "streambim.example.com",
+            "https://streambim.example.com",
+        );
+        let accounts = StreamBimAccounts::load(http(), dir.path());
+        let keys: Vec<String> = accounts.all().into_iter().map(|a| a.key).collect();
+        assert_eq!(
+            keys,
+            ["app", "japan", "streambim.example.com"],
+            "sorted by key"
+        );
+        assert_eq!(accounts.signed_in().len(), 3);
+
+        let japan = accounts.get("japan").unwrap();
+        japan.auth.sign_out().await.unwrap();
+        accounts.forget_if_signed_out("japan");
+        assert!(!dir.path().join("token-streambim-japan.bin").exists());
+        assert!(!dir.path().join("user-streambim-japan.json").exists());
+        assert!(dir.path().join("token-streambim-app.bin").exists());
+        assert!(dir.path().join("user-streambim-app.json").exists());
+        assert!(accounts.get("japan").is_none());
+        assert!(accounts.get("app").unwrap().auth.is_signed_in());
+        assert_eq!(accounts.signed_in().len(), 2);
+        assert!(accounts.any_signed_in());
+    }
+
+    #[test]
+    fn an_account_is_added_once_and_keeps_its_first_server() {
+        let dir = TestDir::new("add");
+        let accounts = StreamBimAccounts::load(http(), dir.path());
+        assert!(accounts.all().is_empty());
+        let japan = accounts.get_or_add("japan", "https://japan.streambim.com");
+        assert!(!japan.auth.is_signed_in(), "a new account is signed out");
+        assert_eq!(
+            accounts
+                .get_or_add("japan", "https://elsewhere.invalid")
+                .auth
+                .base_url(),
+            "https://japan.streambim.com"
+        );
+        assert_eq!(accounts.all().len(), 1);
+        accounts.forget_if_signed_out("japan");
+        assert!(accounts.get("japan").is_none());
     }
 }

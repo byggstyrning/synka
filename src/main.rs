@@ -46,7 +46,7 @@ use paths::Paths;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use store::Store;
-use streambim_auth::StreamBimAuth;
+use streambim_auth::StreamBimAccounts;
 use sync::Engine;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -122,11 +122,8 @@ fn run() -> anyhow::Result<()> {
     let http = http::build_client();
     let auth = Arc::new(Auth::new(cfg.client_id(), http.clone(), &paths.state_dir));
     let api = http::Api::new(http.clone(), auth.clone());
-    let streambim = Arc::new(StreamBimAuth::new(http.clone(), &paths.state_dir));
-    let streambim_api = http::Api::with_source(
-        http.clone(),
-        http::TokenSource::StreamBim(streambim.clone()),
-    );
+    // One account per StreamBIM server; each account has its own API client (streambim_auth).
+    let streambim = Arc::new(StreamBimAccounts::load(http.clone(), &paths.state_dir));
     // Not configured (empty client id) until the user gives one; applying the settings at
     // runtime comes in a later step.
     let interaxo = Arc::new(Auth::interaxo(
@@ -156,7 +153,6 @@ fn run() -> anyhow::Result<()> {
         auth,
         api,
         streambim,
-        streambim_api,
         interaxo,
         interaxo_api,
         ui,

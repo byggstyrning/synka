@@ -143,6 +143,7 @@ fn the_sync_root_keeps_the_acc_registration_and_names_the_other_providers() {
 fn the_status_user_is_the_first_signed_in_account_in_account_order() {
     let account = |p: Provider, id: &str, signed: bool| AccountStatus {
         provider: p,
+        account: None,
         label: p.label(),
         configured: true,
         signed_in: signed,
@@ -405,7 +406,7 @@ async fn a_streambim_mfa_wait_that_runs_out_ends_as_a_cancelled_sign_in() {
     let engine = Engine::new(f.ctx.clone());
     let mut live = test_live();
     live.sign_ins.insert(
-        Provider::StreamBim,
+        (Provider::StreamBim, Some("app".into())),
         SignInAttempt {
             task: tokio::spawn(std::future::pending::<()>()),
             generation: 7,
@@ -413,17 +414,21 @@ async fn a_streambim_mfa_wait_that_runs_out_ends_as_a_cancelled_sign_in() {
             mfa_pending: true,
         },
     );
-    engine.st().signing_in.insert(Provider::StreamBim);
-    engine.on_sign_in_expired(Provider::StreamBim, 7, &mut live);
+    engine
+        .st()
+        .signing_in
+        .insert((Provider::StreamBim, Some("app".into())));
+    engine.on_sign_in_expired((Provider::StreamBim, Some("app".into())), 7, &mut live);
     assert!(live.sign_ins.is_empty());
     assert!(engine.st().signing_in.is_empty());
     assert!(f._rx.try_iter().any(|m| matches!(
         m,
         UiMsg::SignInProgress {
             provider: Provider::StreamBim,
+            account: Some(ref account),
             state: "cancelled",
             error: Some(ref e),
-        } if e == "Tiden för koden gick ut – logga in igen."
+        } if e == "Tiden för koden gick ut – logga in igen." && account == "app"
     )));
 }
 
@@ -437,6 +442,7 @@ async fn a_code_without_a_pending_mfa_wait_is_refused() {
         .on_cmd(
             TrayCmd::SignInMfa {
                 provider: Provider::StreamBim,
+                account: "app".into(),
                 code: Secret("123456".into()),
             },
             &mut live,
@@ -732,17 +738,18 @@ fn a_lock_held_by_the_users_own_interaxo_account_is_not_read_only() {
     assert!(spec_for(&other, me.as_deref()).read_only);
 }
 
-/// Makes StreamBIM look signed in to `region`, the way a sign-in leaves its profile and token.
-fn streambim_signed_in(f: &mut Fixture, region: &str) {
+/// Writes the token and profile of a signed-in StreamBIM account `key` served at `base`, the way a
+/// sign-in leaves them, and adds the account to the fixture. The token is DPAPI-protected; an
+/// unreadable file would mean signed out.
+fn streambim_session(f: &Fixture, key: &str, base: &str) {
     let state = f.ctx.paths.state_dir.clone();
-    // The account reads its token file through DPAPI; an unreadable file means signed out.
     let tokens = json!({
         "refresh_token": "test-only-refresh",
-        "id_token": "test-only-id",
+        "id_token": format!("test-only-id-{key}"),
         "expires_at": 4_102_444_800i64,
     });
     std::fs::write(
-        state.join("token-streambim.bin"),
+        state.join(format!("token-streambim-{key}.bin")),
         crate::auth::dpapi_protect(tokens.to_string().as_bytes()).unwrap(),
     )
     .unwrap();
@@ -750,24 +757,25 @@ fn streambim_signed_in(f: &mut Fixture, region: &str) {
         "user_id": "test-only-streambim-user",
         "name": "Testanvändare",
         "email": "test@example.invalid",
-        "region": region,
-        "base": format!("https://{region}.streambim.com"),
+        "region": key,
+        "base": base,
     });
-    std::fs::write(state.join("user-streambim.json"), profile.to_string()).unwrap();
-    let http = crate::http::build_client();
-    let streambim = Arc::new(crate::streambim_auth::StreamBimAuth::new(
-        http.clone(),
-        &state,
-    ));
-    assert!(streambim.is_signed_in());
-    let ctx = Arc::get_mut(&mut f.ctx).unwrap();
-    ctx.streambim_api =
-        crate::http::Api::with_source(http, crate::http::TokenSource::StreamBim(streambim.clone()));
-    ctx.streambim = streambim;
+    std::fs::write(
+        state.join(format!("user-streambim-{key}.json")),
+        profile.to_string(),
+    )
+    .unwrap();
+    let account = f.ctx.streambim.get_or_add(key, base);
+    assert!(account.auth.is_signed_in());
+}
+
+/// Makes the StreamBIM account of `region` (on its own server) look signed in.
+fn streambim_signed_in(f: &mut Fixture, region: &str) {
+    streambim_session(f, region, &format!("https://{region}.streambim.com"));
 }
 
 #[tokio::test]
-async fn a_streambim_project_of_another_region_stays_paused() {
+async fn a_streambim_project_of_another_server_stays_paused() {
     let mut f = fixture("streambim-region");
     streambim_signed_in(&mut f, "sweden");
     let mut sb = other_provider_project(&f, Provider::StreamBim);
@@ -775,8 +783,11 @@ async fn a_streambim_project_of_another_region_stays_paused() {
         Some(r#"{"region":"app","base":"https://app.streambim.com","project":"1552"}"#.into());
     f.ctx.store.upsert_project(&sb).unwrap();
     assert!(f.ctx.signed_in(Provider::StreamBim));
-    assert!(!f.ctx.project_connected(&sb), "signed in to another region");
-    assert_eq!(f.ctx.sign_in_target(&sb), "StreamBIM (app)");
+    assert!(
+        !f.ctx.project_connected(&sb),
+        "its account (app) is not signed in"
+    );
+    assert_eq!(f.ctx.sign_in_target(&sb), "StreamBIM (app.streambim.com)");
     let mut same_region = sb.clone();
     same_region.meta = Some(
         r#"{"region":"sweden","base":"https://sweden.streambim.com","project":"1552"}"#.into(),
@@ -801,7 +812,8 @@ async fn a_streambim_project_of_another_region_stays_paused() {
     let summary = f.ctx.store.job_summary().unwrap();
     assert!(
         summary.iter().any(|(_, _, attempts, error)| *attempts == 0
-            && error.as_deref() == Some("Logga in på StreamBIM (app) för att synka.")),
+            && error.as_deref()
+                == Some("Logga in på StreamBIM (app.streambim.com) för att synka.")),
         "{summary:?}"
     );
 }
@@ -850,7 +862,7 @@ fn a_signed_out_providers_unsubscribed_projects_leave_the_projects_list() {
         ),
     ];
     let subscribed: HashSet<String> = HashSet::from(["streambim:app:2".to_string()]);
-    let hubs = offline_hubs(Provider::StreamBim, &previous, &[], &subscribed);
+    let hubs = offline_hubs(Provider::StreamBim, None, &previous, &[], &subscribed);
     assert_eq!(
         hubs.len(),
         1,
@@ -914,8 +926,7 @@ fn streambim_loopback(f: &mut Fixture, origin: &str) {
     p.meta = Some(json!({"region": "app", "base": origin, "project": "1552"}).to_string());
     f.ctx.store.upsert_project(&p).unwrap();
     f.p = p;
-    let ctx = Arc::get_mut(&mut f.ctx).unwrap();
-    ctx.streambim_api = crate::http::Api::for_test(origin, Duration::from_secs(5));
+    streambim_session(f, "app", origin);
 }
 
 #[tokio::test]
@@ -1016,6 +1027,7 @@ async fn sign_in_steps_are_admitted_during_a_move() {
     engine.st().moving = true;
     let mfa = TrayCmd::SignInMfa {
         provider: Provider::StreamBim,
+        account: "app".into(),
         code: Secret("123456".into()),
     };
     assert!(
@@ -1024,9 +1036,13 @@ async fn sign_in_steps_are_admitted_during_a_move() {
     );
     let cancel = TrayCmd::CancelSignIn {
         provider: Provider::StreamBim,
+        account: None,
     };
     assert!(engine.begin_command(&cancel).is_some());
-    let reset = TrayCmd::SignOut { provider: None };
+    let reset = TrayCmd::SignOut {
+        provider: None,
+        account: None,
+    };
     assert!(
         engine.begin_command(&reset).is_none(),
         "other commands still wait for the move"
@@ -1072,7 +1088,7 @@ async fn a_second_code_while_one_is_being_checked_is_a_quiet_repeat() {
     let engine = Engine::new(f.ctx.clone());
     let mut live = test_live();
     live.sign_ins.insert(
-        Provider::StreamBim,
+        (Provider::StreamBim, Some("app".into())),
         SignInAttempt {
             task: tokio::spawn(std::future::pending::<()>()),
             generation: 3,
@@ -1085,6 +1101,7 @@ async fn a_second_code_while_one_is_being_checked_is_a_quiet_repeat() {
         .on_cmd(
             TrayCmd::SignInMfa {
                 provider: Provider::StreamBim,
+                account: "app".into(),
                 code: Secret("123456".into()),
             },
             &mut live,
@@ -1094,9 +1111,201 @@ async fn a_second_code_while_one_is_being_checked_is_a_quiet_repeat() {
     assert_eq!(notices(&f, "Ingen kod väntas"), 0, "no warning");
     assert_eq!(
         live.sign_ins
-            .get(&Provider::StreamBim)
+            .get(&(Provider::StreamBim, Some("app".into())))
             .map(|a| a.generation),
         Some(3),
         "the check that is running stays"
     );
+}
+
+/// A subscribed StreamBIM project of the account `key` (its own hub, project and meta).
+fn streambim_project_of(f: &Fixture, key: &str) -> Project {
+    let mut p = f.p.clone();
+    p.pid = 0;
+    p.provider = Provider::StreamBim;
+    p.hub_id = format!("streambim:{key}");
+    p.hub_name = format!("StreamBIM {key}");
+    p.project_id = format!("streambim:{key}:1552");
+    p.name = format!("Bygge {key}");
+    p.change_source = ChangeSourceKind::PublicWalk;
+    p.root_folder_urn = "0".into();
+    p.urn_ns = String::new();
+    p.oss_scopes = None;
+    p.tops = vec![TopFolder {
+        id: "0".into(),
+        name: "Dokument".into(),
+    }];
+    p.meta = Some(
+        json!({
+            "region": key,
+            "base": format!("https://{key}.streambim.com"),
+            "project": "1552",
+            "account": key,
+        })
+        .to_string(),
+    );
+    p.pid = f.ctx.store.upsert_project(&p).unwrap();
+    p
+}
+
+#[tokio::test]
+async fn a_second_sign_in_to_a_signed_in_server_is_refused_with_a_notice() {
+    let mut f = fixture("sign-in-refused");
+    streambim_signed_in(&mut f, "app");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    let login = StreamBimLogin {
+        server: StreamBimServer::Region("app".into()),
+        username: "ada@example.com".into(),
+        password: Secret("pw-test".into()),
+    };
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::StreamBim,
+                streambim: Some(login),
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert!(live.sign_ins.is_empty(), "no attempt is started");
+    assert_eq!(
+        notices(
+            &f,
+            "Du är redan inloggad på app.streambim.com – logga ut först."
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_custom_address_that_is_not_https_is_refused_before_any_request() {
+    let f = fixture("sign-in-url");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    let login = StreamBimLogin {
+        server: StreamBimServer::Url("http://streambim.example.com".into()),
+        username: "ada@example.com".into(),
+        password: Secret("pw-test".into()),
+    };
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::StreamBim,
+                streambim: Some(login),
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert!(live.sign_ins.is_empty());
+    assert_eq!(notices(&f, "Adressen måste börja med https://"), 1);
+}
+
+#[tokio::test]
+async fn signing_out_one_account_pauses_only_its_projects_and_keeps_the_root() {
+    let mut f = fixture("sign-out-one-account");
+    streambim_signed_in(&mut f, "app");
+    streambim_signed_in(&mut f, "japan");
+    let app = streambim_project_of(&f, "app");
+    let japan = streambim_project_of(&f, "japan");
+    let engine = Engine::new(f.ctx.clone());
+    {
+        let mut st = engine.st();
+        st.next_due.insert(app.pid, Instant::now());
+        st.next_due.insert(japan.pid, Instant::now());
+    }
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignOut {
+                provider: Some(Provider::StreamBim),
+                account: Some("japan".into()),
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    // Japan's files are gone; app's stay, and the account stays signed in.
+    let state = f.ctx.paths.state_dir.clone();
+    assert!(!state.join("token-streambim-japan.bin").exists());
+    assert!(!state.join("user-streambim-japan.json").exists());
+    assert!(state.join("token-streambim-app.bin").exists());
+    assert!(f.ctx.streambim.get("japan").is_none());
+    assert!(f.ctx.streambim.get("app").unwrap().auth.is_signed_in());
+    // The root stays registered: something is still signed in.
+    assert!(f.ctx.any_signed_in());
+    let st = engine.st();
+    assert!(st.next_due.contains_key(&app.pid), "app keeps polling");
+    assert!(!st.next_due.contains_key(&japan.pid), "japan is paused");
+}
+
+#[tokio::test]
+async fn an_account_sign_out_leaves_the_other_providers_signed_in() {
+    let mut f = fixture("sign-out-keeps-acc");
+    client_override_signed_in(&mut f);
+    streambim_signed_in(&mut f, "japan");
+    let japan = streambim_project_of(&f, "japan");
+    let engine = Engine::new(f.ctx.clone());
+    engine.st().next_due.insert(japan.pid, Instant::now());
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignOut {
+                provider: Some(Provider::StreamBim),
+                account: None,
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert!(f.ctx.signed_in(Provider::Acc), "ACC is untouched");
+    assert!(!f.ctx.signed_in(Provider::StreamBim));
+    assert!(!engine.st().next_due.contains_key(&japan.pid));
+}
+
+#[tokio::test]
+async fn status_accounts_are_one_entry_per_streambim_account_in_key_order() {
+    let mut f = fixture("status-accounts");
+    streambim_signed_in(&mut f, "japan");
+    streambim_signed_in(&mut f, "app");
+    let engine = Engine::new(f.ctx.clone());
+    // A third account is signing in (no session yet): it is listed too.
+    engine
+        .st()
+        .signing_in
+        .insert((Provider::StreamBim, Some("sweden".into())));
+    let accounts = engine.account_statuses();
+    let shape: Vec<(Provider, Option<String>, bool, bool)> = accounts
+        .iter()
+        .map(|a| (a.provider, a.account.clone(), a.signed_in, a.signing_in))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (Provider::Acc, None, false, false),
+            (Provider::StreamBim, Some("app".into()), true, false),
+            (Provider::StreamBim, Some("japan".into()), true, false),
+            (Provider::StreamBim, Some("sweden".into()), false, true),
+            (Provider::Interaxo, None, false, false),
+        ]
+    );
+    let japan = accounts
+        .iter()
+        .find(|a| a.account.as_deref() == Some("japan"))
+        .unwrap();
+    assert_eq!(japan.host.as_deref(), Some("japan.streambim.com"));
+    assert_eq!(japan.label, "StreamBIM");
+    assert!(japan.user.is_some());
+    // The status user is the first signed-in entry: app.
+    assert_eq!(
+        status_user(&accounts).unwrap().email,
+        "test@example.invalid"
+    );
+    assert_eq!(accounts[0].host, None, "ACC has no host");
 }

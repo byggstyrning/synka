@@ -3,15 +3,16 @@
 //! The endpoints and the facts they rely on: docs/specs/streambim-endpoints.md. The provider
 //! contract: docs/PROVIDERS.md "StreamBIM".
 //!
-//! Base URL: a project's calls use `Project.meta` (`{"region","base","project"}`). The project
-//! listing and its setup use the hub's region. Production derives `https://<region>.streambim.com`.
-//! Tests call the `*_at` functions with a loopback origin, so no global override exists.
+//! Base URL: a project's calls use `Project.meta` (`{"region","base","project","account"}`). The
+//! project listing uses the base of the hub's account (`StreamBimAccount`), which is the server
+//! the account signed in to (`https://<key>.streambim.com` for a region, `https://<host>` for a
+//! custom address). Tests point an account at a loopback origin, so no global override exists.
 
 use crate::api::dm::{self, UploadInfo};
 use crate::http::{error_body, Api, ApiError, Body};
 use crate::model::{now_ms, HubInfo, Item, Kind, LocalState, Pid, Project, ProjectInfo, Provider};
 use crate::remote::{DownloadUrl, ProjectSetup};
-use crate::streambim_auth::{region_base, valid_region, StreamBimAuth};
+use crate::streambim_auth::{valid_key, valid_region, StreamBimAccount};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, RANGE};
 use reqwest::Method;
 use serde::Deserialize;
@@ -148,27 +149,36 @@ fn region_from_json(row: &Value) -> Option<Region> {
     })
 }
 
-/// One StreamBIM hub for the signed-in account (its region). Nothing without a sign-in.
-pub async fn list_hubs(_api: &Api, auth: &StreamBimAuth) -> Result<Vec<HubInfo>, ApiError> {
-    let Some(region) = auth.region().filter(|_| auth.is_signed_in()) else {
-        return Ok(Vec::new());
-    };
-    Ok(vec![HubInfo {
-        id: format!("streambim:{region}"),
-        name: "StreamBIM".into(),
-        region: Some(region),
+/// The hub of one StreamBIM account: `streambim:<key>`, named after its server (`hub_name`).
+pub fn hub_for_account(account: &StreamBimAccount) -> HubInfo {
+    HubInfo {
+        id: format!("streambim:{}", account.key),
+        name: hub_name(&account.key),
+        region: Some(account.key.clone()),
         provider: Provider::StreamBim,
-    }])
+    }
 }
 
-/// Every project the account can see (`project-links`), under the hub's region.
-pub async fn list_projects(api: &Api, hub: &HubInfo) -> Result<Vec<ProjectInfo>, ApiError> {
-    let region = hub_region(hub)?;
-    let base = region_base(&region).map_err(|e| user_error(e.to_string()))?;
-    list_projects_at(api, &base, hub).await
+/// The hub name of an account key (docs/PROVIDERS.md): "StreamBIM" for `app`, "StreamBIM <title>"
+/// for a region in `fallback_regions`, "StreamBIM <key>" for another region, and
+/// "StreamBIM (<host>)" for a custom address.
+pub fn hub_name(key: &str) -> String {
+    if key == "app" {
+        return "StreamBIM".into();
+    }
+    if let Some(region) = fallback_regions().into_iter().find(|r| r.subdomain == key) {
+        return format!("StreamBIM {}", region.title);
+    }
+    if key.contains('.') {
+        format!("StreamBIM ({key})")
+    } else {
+        format!("StreamBIM {key}")
+    }
 }
 
-async fn list_projects_at(
+/// Every project the account can see (`project-links`), on the account's server `base`. The
+/// projects are listed under the hub of the account.
+pub async fn list_projects(
     api: &Api,
     base: &str,
     hub: &HubInfo,
@@ -245,7 +255,7 @@ async fn start_project(api: &Api, meta: &Meta) {
 }
 
 /// StreamBIM has one top folder per project, the root (`0`), shown as "Dokument".
-pub async fn top_folders(_api: &Api, _p: &Project) -> Result<Vec<(String, String)>, ApiError> {
+pub async fn top_folders(_p: &Project) -> Result<Vec<(String, String)>, ApiError> {
     Ok(vec![(ROOT_ID.into(), TOP_NAME.into())])
 }
 
@@ -665,7 +675,7 @@ pub async fn delete_folder(api: &Api, p: &Project, folder_id: &str) -> Result<()
 }
 
 /// The project's page in the web app. StreamBIM has no documented link to one document or folder.
-pub async fn web_link(_api: &Api, p: &Project, item: &Item) -> Result<String, ApiError> {
+pub async fn web_link(p: &Project, item: &Item) -> Result<String, ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
     if item.kind == Kind::File {
         server_doc_id(&item.id)?;
@@ -677,7 +687,6 @@ pub async fn web_link(_api: &Api, p: &Project, item: &Item) -> Result<String, Ap
 }
 
 pub async fn set_reserved(
-    _api: &Api,
     _p: &Project,
     _id: &str,
     _reserve: bool,
@@ -687,7 +696,8 @@ pub async fn set_reserved(
 
 // ---------- project base, metadata ----------
 
-/// `Project.meta` of a StreamBIM project.
+/// `Project.meta` of a StreamBIM project. `region` is the account key (a region, or the host of
+/// a custom server); `account` repeats it for readers that look for the account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Meta {
     region: String,
@@ -708,11 +718,11 @@ fn parse_meta(raw: Option<&str>) -> Result<Meta, ApiError> {
     meta_checked(&parsed.region, &parsed.base, &parsed.project)
 }
 
-/// The checks every meta goes through: a plain region, an http(s) base, a plain project id.
+/// The checks every meta goes through: an account key, an http(s) base, a plain project id.
 fn meta_checked(region: &str, base: &str, project: &str) -> Result<Meta, ApiError> {
     let base = base.trim_end_matches('/');
     let plain_base = base.starts_with("https://") || base.starts_with("http://");
-    if !valid_region(region) || !plain_base || !plain_id(project) {
+    if !valid_key(region) || !plain_base || !plain_id(project) {
         return Err(user_error(META_BAD));
     }
     Ok(Meta {
@@ -723,7 +733,13 @@ fn meta_checked(region: &str, base: &str, project: &str) -> Result<Meta, ApiErro
 }
 
 fn meta_json(m: &Meta) -> String {
-    json!({"region": m.region, "base": m.base, "project": m.project}).to_string()
+    json!({
+        "region": m.region,
+        "base": m.base,
+        "project": m.project,
+        "account": m.region,
+    })
+    .to_string()
 }
 
 fn hub_region(hub: &HubInfo) -> Result<String, ApiError> {
@@ -1374,7 +1390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_needs_a_sign_in_and_projects_come_from_project_links() {
+    async fn an_account_hub_lists_its_projects_from_project_links() {
         let dir = TestDir::new("hub");
         let server = Server::new(|req, _| match req.target.as_str() {
             "/auth/v1/login" => reply(200, json!({"result": "SUCCESS", "idToken": "id-1", "refreshToken": "rt", "expiresIn": 3600})),
@@ -1387,22 +1403,19 @@ mod tests {
             _ => Fault::reply(404, "unexpected"),
         })
         .await;
-        let auth = StreamBimAuth::for_test(http(), dir.0.as_path(), &server.origin);
-        assert!(list_hubs(&api_for(&server), &auth)
-            .await
-            .unwrap()
-            .is_empty());
-        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        let accounts = crate::streambim_auth::StreamBimAccounts::load(http(), dir.0.as_path());
+        let account = accounts.get_or_add("app", &server.origin);
+        assert!(!account.auth.is_signed_in());
+        assert!(accounts.signed_in().is_empty());
+        account.auth.login("ada@example.com", "pw").await.unwrap();
 
-        let hubs = list_hubs(&api_for(&server), &auth).await.unwrap();
-        assert_eq!(hubs.len(), 1);
-        assert_eq!(hubs[0].id, "streambim:app");
-        assert_eq!(hubs[0].name, "StreamBIM");
-        assert_eq!(hubs[0].region.as_deref(), Some("app"));
-        assert_eq!(hubs[0].provider, Provider::StreamBim);
+        let hub = hub_for_account(&account);
+        assert_eq!(hub.id, "streambim:app");
+        assert_eq!(hub.name, "StreamBIM");
+        assert_eq!(hub.region.as_deref(), Some("app"));
+        assert_eq!(hub.provider, Provider::StreamBim);
 
-        let api = api_for(&server);
-        let projects = list_projects_at(&api, &server.origin, &hubs[0])
+        let projects = list_projects(&account.api, account.auth.base_url(), &hub)
             .await
             .unwrap();
         assert_eq!(projects.len(), 2);
@@ -1414,9 +1427,23 @@ mod tests {
         assert_eq!(meta.base, server.origin);
         assert_eq!(meta.project, "1553");
         assert_eq!(meta.region, "app");
+        let meta_doc: Value = serde_json::from_str(projects[1].meta.as_deref().unwrap()).unwrap();
+        assert_eq!(meta_doc["account"], "app");
         let links = server.requests().into_iter().last().unwrap();
         assert_eq!(links.target, "/mgw/api/v3/project-links");
         assert_eq!(links.header("accept"), Some(JSON_API));
+    }
+
+    #[test]
+    fn hub_names_follow_the_provider_contract() {
+        assert_eq!(hub_name("app"), "StreamBIM");
+        assert_eq!(hub_name("japan"), "StreamBIM Japan");
+        assert_eq!(hub_name("sweden"), "StreamBIM Sweden");
+        assert_eq!(hub_name("usa"), "StreamBIM usa");
+        assert_eq!(
+            hub_name("streambim.example.com"),
+            "StreamBIM (streambim.example.com)"
+        );
     }
 
     #[tokio::test]
@@ -2238,10 +2265,9 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_is_unsupported_and_web_link_names_the_project() {
-        let api = Api::for_test("http://127.0.0.1:9", Duration::from_secs(1));
         let p = project("http://127.0.0.1:9");
         assert!(matches!(
-            set_reserved(&api, &p, "1002", true).await,
+            set_reserved(&p, "1002", true).await,
             Err(ApiError::Unsupported(_))
         ));
         let item = Item {
@@ -2263,7 +2289,7 @@ mod tests {
             populated: false,
         };
         assert_eq!(
-            web_link(&api, &p, &item).await.unwrap(),
+            web_link(&p, &item).await.unwrap(),
             "http://127.0.0.1:9/webapp/default/#/?projectId=1552"
         );
     }
@@ -2396,7 +2422,7 @@ mod tests {
             populated: false,
         };
         assert!(matches!(
-            web_link(&api, &p, &item).await,
+            web_link(&p, &item).await,
             Err(ApiError::Message(_))
         ));
         assert_eq!(server.count(), 0);

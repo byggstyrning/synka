@@ -74,8 +74,8 @@ pub(crate) use reset::project_resetting;
 use crate::api::syncfeed;
 use crate::api::syncfeed::FeedError;
 use crate::app::{
-    AccountStatus, Ctx, CtxRef, HeldDeletes, HubList, SettingsView, Severity, Status,
-    StreamBimLogin, Transfer, TrayCmd, UiMsg,
+    AccountStatus, Ctx, CtxRef, HeldDeletes, HubList, SettingsView, Severity, SignInKey, Status,
+    StreamBimLogin, StreamBimServer, Transfer, TrayCmd, UiMsg,
 };
 use crate::auth::{UserInfo, INTERAXO_DEFAULT_REDIRECT};
 use crate::cf::callbacks as cb;
@@ -89,7 +89,9 @@ use crate::http::ApiError;
 use crate::model::*;
 use crate::remote::{self, DownloadUrl};
 use crate::store::Store;
-use crate::streambim_auth::LoginOutcome;
+use crate::streambim_auth::{
+    project_key, server_from_region, server_from_url, LoginOutcome, StreamBimAccounts,
+};
 use crate::sync::watcher::{LocalChange, WatchHandle};
 use crate::update::{self, UpdateInfo};
 use anyhow::{anyhow, Result};
@@ -116,6 +118,8 @@ const STATUS_GAP: Duration = Duration::from_millis(500);
 const SIGN_IN_BURST: Duration = Duration::from_secs(1);
 /// How long a StreamBIM sign-in waits for its MFA code.
 const MFA_WAIT: Duration = Duration::from_secs(5 * 60);
+/// The sign-in key of ACC (one account: no StreamBIM account key).
+const ACC_KEY: SignInKey = (Provider::Acc, None);
 /// Stored in kv: the id the sync root is registered under (see `root_uid`).
 const SYNC_ROOT_UID_KEY: &str = "sync_root_uid";
 const PROGRESS_GAP: Duration = Duration::from_millis(250);
@@ -242,8 +246,8 @@ struct St {
     /// Install the pending update automatically once the engine is quiet.
     auto_install_at: Option<Instant>,
     installing: bool,
-    /// Providers with a sign-in attempt in progress (browser, login or MFA wait).
-    signing_in: HashSet<Provider>,
+    /// Sign-ins in progress (browser, login or MFA wait), per provider and StreamBIM account.
+    signing_in: HashSet<SignInKey>,
     last_status: Option<Instant>,
     flush_scheduled: bool,
     provider: Option<u8>,
@@ -286,14 +290,14 @@ pub(crate) struct Work {
 }
 
 enum Internal {
-    /// A sign-in task of one provider finished (a StreamBIM login may answer "MFA required").
+    /// A sign-in task finished (a StreamBIM login may answer "MFA required").
     SignedIn {
-        provider: Provider,
+        key: SignInKey,
         generation: u64,
         result: Result<LoginOutcome>,
     },
     /// The five minutes for a StreamBIM MFA code are over.
-    SignInExpired { provider: Provider, generation: u64 },
+    SignInExpired { key: SignInKey, generation: u64 },
     ClientIdValidated {
         generation: u64,
         request_id: String,
@@ -329,8 +333,8 @@ struct Live {
     watch: Option<WatchHandle>,
     cf_tx: UnboundedSender<CfEvent>,
     w_tx: UnboundedSender<Vec<LocalChange>>,
-    /// Pending sign-in attempts, one per provider.
-    sign_ins: HashMap<Provider, SignInAttempt>,
+    /// Pending sign-in attempts, one per provider and StreamBIM account.
+    sign_ins: HashMap<SignInKey, SignInAttempt>,
     /// Last generation handed out (monotonic over all providers).
     sign_in_generation: u64,
     client_validation: Option<ClientIdValidation>,
@@ -427,11 +431,11 @@ impl Engine {
                     }
                 }
                 msg = irx.recv() => match msg {
-                    Some(Internal::SignedIn { provider, generation, result }) => {
-                        self.on_signed_in(provider, generation, result, &mut live, &itx).await;
+                    Some(Internal::SignedIn { key, generation, result }) => {
+                        self.on_signed_in(key, generation, result, &mut live, &itx).await;
                     }
-                    Some(Internal::SignInExpired { provider, generation }) => {
-                        self.on_sign_in_expired(provider, generation, &mut live);
+                    Some(Internal::SignInExpired { key, generation }) => {
+                        self.on_sign_in_expired(key, generation, &mut live);
                     }
                     Some(Internal::ClientIdValidated { generation, request_id, result }) => {
                         self.on_client_id_validated(generation, &request_id, result, &mut live).await;
@@ -619,12 +623,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Stops one provider's pending sign-in and waits until its task is gone. Aborting first
-    /// releases a browser callback socket before a replacement tries the same port, and awaiting
-    /// the aborted task prevents a late token commit after logout. A completion that is already
-    /// queued is dropped: its attempt is no longer in `sign_ins`.
-    async fn cancel_sign_in(self: &Arc<Self>, live: &mut Live, provider: Provider) {
-        if let Some(attempt) = live.sign_ins.remove(&provider) {
+    /// Stops one pending sign-in and waits until its task is gone. Aborting first releases a
+    /// browser callback socket before a replacement tries the same port, and awaiting the aborted
+    /// task prevents a late token commit after logout. A completion that is already queued is
+    /// dropped: its attempt is no longer in `sign_ins`.
+    async fn cancel_sign_in(self: &Arc<Self>, live: &mut Live, key: &SignInKey) {
+        if let Some(attempt) = live.sign_ins.remove(key) {
             attempt.task.abort();
             if let Err(error) = attempt.task.await {
                 if !error.is_cancelled() {
@@ -632,8 +636,8 @@ impl Engine {
                 }
             }
         }
-        self.st().signing_in.remove(&provider);
-        if provider == Provider::Acc {
+        self.st().signing_in.remove(key);
+        if *key == ACC_KEY {
             if let Some(pending) = live.client_validation.take() {
                 self.client_validation_event(&pending.request_id, "cancelled", None);
             }
@@ -641,13 +645,41 @@ impl Engine {
     }
 
     async fn cancel_all_sign_ins(self: &Arc<Self>, live: &mut Live) {
-        for provider in Provider::ALL {
-            self.cancel_sign_in(live, provider).await;
+        let keys: HashSet<SignInKey> = live
+            .sign_ins
+            .keys()
+            .cloned()
+            .chain(self.st().signing_in.iter().cloned())
+            .collect();
+        for key in keys {
+            self.cancel_sign_in(live, &key).await;
         }
     }
 
-    /// `sign_in` for one provider. A repeat within SIGN_IN_BURST shares the pending attempt, so an
-    /// accidental double click cannot open two browser tabs; a later one replaces it.
+    /// True when a repeat of a sign-in shares the pending attempt: within SIGN_IN_BURST, and not
+    /// waiting for an MFA code. A double click then cannot open two browser tabs.
+    fn attempt_is_shared(live: &Live, key: &SignInKey, provider: Provider) -> bool {
+        live.sign_ins.get(key).is_some_and(|attempt| {
+            attempt.started_at.elapsed() < SIGN_IN_BURST
+                && !attempt.task.is_finished()
+                && !attempt.mfa_pending
+        }) && !(provider == Provider::Acc && live.client_validation.is_some())
+    }
+
+    /// Records a started sign-in attempt and marks it as signing in.
+    fn record_attempt(&self, live: &mut Live, key: SignInKey, attempt: SignInAttempt) {
+        {
+            let mut st = self.st();
+            st.signing_in.insert(key.clone());
+            if key == ACC_KEY {
+                st.last_error = None;
+            }
+        }
+        live.sign_ins.insert(key, attempt);
+    }
+
+    /// `sign_in` of one provider: ACC and Interaxo open the browser; StreamBIM logs in to its
+    /// server (see `sign_in_streambim`).
     async fn sign_in(
         self: &Arc<Self>,
         provider: Provider,
@@ -655,17 +687,27 @@ impl Engine {
         live: &mut Live,
         itx: &UnboundedSender<Internal>,
     ) {
-        let shared = live.sign_ins.get(&provider).is_some_and(|attempt| {
-            attempt.started_at.elapsed() < SIGN_IN_BURST
-                && !attempt.task.is_finished()
-                && !attempt.mfa_pending
-        }) && !(provider == Provider::Acc && live.client_validation.is_some());
-        if shared {
+        match provider {
+            Provider::StreamBim => self.sign_in_streambim(login, live, itx).await,
+            _ => self.sign_in_browser(provider, live, itx).await,
+        }
+    }
+
+    /// Browser sign-in of ACC or Interaxo. A repeat within SIGN_IN_BURST shares the pending
+    /// attempt; a later one replaces it.
+    async fn sign_in_browser(
+        self: &Arc<Self>,
+        provider: Provider,
+        live: &mut Live,
+        itx: &UnboundedSender<Internal>,
+    ) {
+        let key: SignInKey = (provider, None);
+        if Self::attempt_is_shared(live, &key, provider) {
             self.publish();
             return;
         }
-        // One more explicit click retries a closed browser tab or starts a new password login.
-        self.cancel_sign_in(live, provider).await;
+        // One more explicit click retries a closed browser tab.
+        self.cancel_sign_in(live, &key).await;
         if self.ctx.signed_in(provider) {
             if let Err(e) = self.go_online(live).await {
                 self.set_error(format!("{e:#}"));
@@ -676,52 +718,23 @@ impl Engine {
         let generation = next_sign_in_generation(live);
         let me = self.clone();
         let tx = itx.clone();
-        let task = match provider {
-            Provider::Acc => tokio::spawn(async move {
-                let result = me.ctx.auth.sign_in().await.map(LoginOutcome::SignedIn);
-                let _ = tx.send(Internal::SignedIn {
-                    provider,
-                    generation,
-                    result,
-                });
-                me.wake.notify_one();
-            }),
-            Provider::Interaxo => tokio::spawn(async move {
-                let result = me.ctx.interaxo.sign_in().await.map(LoginOutcome::SignedIn);
-                let _ = tx.send(Internal::SignedIn {
-                    provider,
-                    generation,
-                    result,
-                });
-                me.wake.notify_one();
-            }),
-            Provider::StreamBim => {
-                let Some(login) = login else {
-                    self.ctx.ui.send(UiMsg::notify(
-                        Severity::Warning,
-                        "Ange region, e-postadress och lösenord för StreamBIM.",
-                    ));
-                    self.publish();
-                    return;
-                };
-                tokio::spawn(async move {
-                    let result = me
-                        .ctx
-                        .streambim
-                        .login(&login.region, &login.username, &login.password.0)
-                        .await;
-                    drop(login);
-                    let _ = tx.send(Internal::SignedIn {
-                        provider,
-                        generation,
-                        result,
-                    });
-                    me.wake.notify_one();
-                })
-            }
-        };
-        live.sign_ins.insert(
-            provider,
+        let task = tokio::spawn(async move {
+            let result = (if provider == Provider::Acc {
+                me.ctx.auth.sign_in().await
+            } else {
+                me.ctx.interaxo.sign_in().await
+            })
+            .map(LoginOutcome::SignedIn);
+            let _ = tx.send(Internal::SignedIn {
+                key: (provider, None),
+                generation,
+                result,
+            });
+            me.wake.notify_one();
+        });
+        self.record_attempt(
+            live,
+            key,
             SignInAttempt {
                 task,
                 generation,
@@ -729,20 +742,92 @@ impl Engine {
                 mfa_pending: false,
             },
         );
-        {
-            let mut st = self.st();
-            st.signing_in.insert(provider);
-            if provider == Provider::Acc {
-                st.last_error = None;
+        self.ctx.ui.send(UiMsg::SignInProgress {
+            provider,
+            account: None,
+            state: "browser",
+            error: None,
+        });
+        self.publish();
+    }
+
+    /// Password sign-in to one StreamBIM server. The server (a region or a custom address) gives
+    /// the account key. An account that is signed in is not signed in again; the user signs out
+    /// first. Nothing is sent to the UI when the login starts: the next event is `mfa_required`,
+    /// `signed_in` or `failed`.
+    async fn sign_in_streambim(
+        self: &Arc<Self>,
+        login: Option<StreamBimLogin>,
+        live: &mut Live,
+        itx: &UnboundedSender<Internal>,
+    ) {
+        let Some(login) = login else {
+            self.ctx.ui.send(UiMsg::notify(
+                Severity::Warning,
+                "Ange region, e-postadress och lösenord för StreamBIM.",
+            ));
+            self.publish();
+            return;
+        };
+        let server = match &login.server {
+            StreamBimServer::Region(region) => server_from_region(region),
+            StreamBimServer::Url(url) => server_from_url(url),
+        };
+        let (account_key, base) = match server {
+            Ok(server) => server,
+            Err(text) => {
+                self.ctx.ui.send(UiMsg::notify(Severity::Warning, text));
+                self.publish();
+                return;
             }
+        };
+        let key: SignInKey = (Provider::StreamBim, Some(account_key.clone()));
+        if Self::attempt_is_shared(live, &key, Provider::StreamBim) {
+            self.publish();
+            return;
         }
-        if provider != Provider::StreamBim {
-            self.ctx.ui.send(UiMsg::SignInProgress {
-                provider,
-                state: "browser",
-                error: None,
+        if let Some(account) = self
+            .ctx
+            .streambim
+            .get(&account_key)
+            .filter(|account| account.auth.is_signed_in())
+        {
+            self.ctx.ui.send(UiMsg::notify(
+                Severity::Warning,
+                format!(
+                    "Du är redan inloggad på {} – logga ut först.",
+                    account.auth.host()
+                ),
+            ));
+            self.publish();
+            return;
+        }
+        self.cancel_sign_in(live, &key).await;
+        let account = self.ctx.streambim.get_or_add(&account_key, &base);
+        let generation = next_sign_in_generation(live);
+        let me = self.clone();
+        let tx = itx.clone();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            let result = account.auth.login(&login.username, &login.password.0).await;
+            drop(login);
+            let _ = tx.send(Internal::SignedIn {
+                key: task_key,
+                generation,
+                result,
             });
-        }
+            me.wake.notify_one();
+        });
+        self.record_attempt(
+            live,
+            key,
+            SignInAttempt {
+                task,
+                generation,
+                started_at: Instant::now(),
+                mfa_pending: false,
+            },
+        );
         self.publish();
     }
 
@@ -750,15 +835,16 @@ impl Engine {
     /// dropped. A StreamBIM login that needs an MFA code keeps its attempt for `MFA_WAIT`.
     async fn on_signed_in(
         self: &Arc<Self>,
-        provider: Provider,
+        key: SignInKey,
         generation: u64,
         r: Result<LoginOutcome>,
         live: &mut Live,
         itx: &UnboundedSender<Internal>,
     ) {
+        let (provider, account) = (key.0, key.1.clone());
         let current = live
             .sign_ins
-            .get(&provider)
+            .get(&key)
             .is_some_and(|attempt| attempt.generation == generation);
         if live.restart_pending || !current {
             debug!("ignorerar svar från en ersatt inloggning");
@@ -767,24 +853,26 @@ impl Engine {
         match r {
             Ok(LoginOutcome::MfaRequired) => {
                 // The login task is finished; the attempt now waits for the code.
-                let timer = mfa_timer(provider, generation, itx);
-                if let Some(attempt) = live.sign_ins.get_mut(&provider) {
+                let timer = mfa_timer(key.clone(), generation, itx);
+                if let Some(attempt) = live.sign_ins.get_mut(&key) {
                     attempt.task = timer;
                     attempt.mfa_pending = true;
                     attempt.started_at = Instant::now();
                 }
                 self.ctx.ui.send(UiMsg::SignInProgress {
                     provider,
+                    account,
                     state: "mfa_required",
                     error: None,
                 });
             }
             Ok(LoginOutcome::SignedIn(_)) => {
-                live.sign_ins.remove(&provider);
-                self.st().signing_in.remove(&provider);
+                live.sign_ins.remove(&key);
+                self.st().signing_in.remove(&key);
                 info!("inloggad i {}", provider.label());
                 self.ctx.ui.send(UiMsg::SignInProgress {
                     provider,
+                    account,
                     state: "signed_in",
                     error: None,
                 });
@@ -798,8 +886,8 @@ impl Engine {
                 self.spawn_maintenance(async move { me.refresh_projects().await });
             }
             Err(e) => {
-                live.sign_ins.remove(&provider);
-                self.st().signing_in.remove(&provider);
+                live.sign_ins.remove(&key);
+                self.st().signing_in.remove(&key);
                 warn!("inloggning misslyckades ({}): {e:#}", provider.label());
                 let text = format!("{e:#}");
                 if provider == Provider::Acc {
@@ -809,8 +897,13 @@ impl Engine {
                         format!("Inloggningen misslyckades: {text}"),
                     ));
                 }
+                // A StreamBIM account that never got a session is not kept in memory.
+                if let Some(account_key) = &account {
+                    self.ctx.streambim.forget_if_signed_out(account_key);
+                }
                 self.ctx.ui.send(UiMsg::SignInProgress {
                     provider,
+                    account,
                     state: "failed",
                     error: Some(text),
                 });
@@ -820,18 +913,19 @@ impl Engine {
     }
 
     /// The MFA wait ran out: the attempt ends, the user starts over.
-    fn on_sign_in_expired(self: &Arc<Self>, provider: Provider, generation: u64, live: &mut Live) {
+    fn on_sign_in_expired(self: &Arc<Self>, key: SignInKey, generation: u64, live: &mut Live) {
         let waiting = live
             .sign_ins
-            .get(&provider)
+            .get(&key)
             .is_some_and(|attempt| attempt.mfa_pending && attempt.generation == generation);
         if !waiting {
             return;
         }
-        live.sign_ins.remove(&provider);
-        self.st().signing_in.remove(&provider);
+        live.sign_ins.remove(&key);
+        self.st().signing_in.remove(&key);
         self.ctx.ui.send(UiMsg::SignInProgress {
-            provider,
+            provider: key.0,
+            account: key.1,
             state: "cancelled",
             error: Some("Tiden för koden gick ut – logga in igen.".into()),
         });
@@ -899,55 +993,106 @@ impl Engine {
         st.outbox_next = Some(now);
     }
 
-    /// `sign_out` with `Some(provider)` or `None` (every provider). While another provider stays
-    /// signed in, the sync root stays registered and only this provider's projects pause.
-    async fn sign_out(self: &Arc<Self>, provider: Option<Provider>, live: &mut Live) {
-        match provider {
-            Some(p) => {
-                self.cancel_sign_in(live, p).await;
-                let others = Provider::ALL
-                    .into_iter()
-                    .any(|q| q != p && self.ctx.signed_in(q));
-                if others {
-                    self.sign_out_account(p).await;
-                    let paused: Vec<Pid> = self
-                        .ctx
-                        .store
-                        .projects()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|q| q.provider == p)
-                        .map(|q| q.pid)
-                        .collect();
-                    {
-                        let mut st = self.st();
-                        for pid in paused {
-                            st.next_due.remove(&pid);
-                            st.fails.remove(&pid);
-                            st.activity.remove(&pid);
-                        }
-                    }
-                    info!("utloggad från {}; övriga konton synkar vidare", p.label());
-                    self.publish();
-                    // The signed-out provider's hubs leave the Projects list.
-                    let me = self.clone();
-                    self.spawn_maintenance(async move { me.refresh_projects().await });
-                    return;
+    /// `sign_out` of one provider, or of one StreamBIM account (`account`), or of every provider
+    /// (`provider` None). While another account stays signed in, the sync root stays registered and
+    /// only the signed-out accounts' projects pause.
+    async fn sign_out(
+        self: &Arc<Self>,
+        provider: Option<Provider>,
+        account: Option<String>,
+        live: &mut Live,
+    ) {
+        let Some(provider) = provider else {
+            self.cancel_all_sign_ins(live).await;
+            self.sign_out_everything(live).await;
+            return;
+        };
+        // The sign-ins of the accounts that go are cancelled first.
+        let targets = |key: &SignInKey| {
+            key.0 == provider && (account.is_none() || key.1.as_deref() == account.as_deref())
+        };
+        let pending: HashSet<SignInKey> = live
+            .sign_ins
+            .keys()
+            .cloned()
+            .chain(self.st().signing_in.iter().cloned())
+            .filter(|key| targets(key))
+            .collect();
+        for key in pending {
+            self.cancel_sign_in(live, &key).await;
+        }
+        if self.signed_in_outside(provider, account.as_deref()) {
+            self.sign_out_account(provider, account.as_deref()).await;
+            let paused: Vec<Pid> = self
+                .ctx
+                .store
+                .projects()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|q| {
+                    q.provider == provider
+                        && (account.is_none() || project_key(q).as_deref() == account.as_deref())
+                })
+                .map(|q| q.pid)
+                .collect();
+            {
+                let mut st = self.st();
+                for pid in paused {
+                    st.next_due.remove(&pid);
+                    st.fails.remove(&pid);
+                    st.activity.remove(&pid);
                 }
             }
-            None => self.cancel_all_sign_ins(live).await,
+            info!(
+                "utloggad från {}; övriga konton synkar vidare",
+                provider.label()
+            );
+            self.publish();
+            // The signed-out accounts' hubs leave the Projects list.
+            let me = self.clone();
+            self.spawn_maintenance(async move { me.refresh_projects().await });
+            return;
         }
         self.sign_out_everything(live).await;
     }
 
-    async fn sign_out_account(&self, provider: Provider) {
-        let result = match provider {
-            Provider::Acc => self.ctx.auth.sign_out().await,
-            Provider::StreamBim => self.ctx.streambim.sign_out().await,
-            Provider::Interaxo => self.ctx.interaxo.sign_out().await,
-        };
-        if let Err(e) = result {
-            warn!("utloggning ({}): {e:#}", provider.label());
+    /// True when a signed-in account lies outside the sign-out of `provider` (and `account`).
+    fn signed_in_outside(&self, provider: Provider, account: Option<&str>) -> bool {
+        Provider::ALL.into_iter().any(|other| match other {
+            Provider::StreamBim => self.ctx.streambim.signed_in().iter().any(|a| {
+                let targeted =
+                    provider == Provider::StreamBim && account.is_none_or(|key| a.key == key);
+                !targeted
+            }),
+            _ => other != provider && self.ctx.signed_in(other),
+        })
+    }
+
+    /// Signs out one provider, or one StreamBIM account (`account`), or every StreamBIM account.
+    /// A signed-out StreamBIM account is dropped from memory.
+    async fn sign_out_account(&self, provider: Provider, account: Option<&str>) {
+        match provider {
+            Provider::Acc => {
+                if let Err(e) = self.ctx.auth.sign_out().await {
+                    warn!("utloggning ({}): {e:#}", provider.label());
+                }
+            }
+            Provider::Interaxo => {
+                if let Err(e) = self.ctx.interaxo.sign_out().await {
+                    warn!("utloggning ({}): {e:#}", provider.label());
+                }
+            }
+            Provider::StreamBim => {
+                for found in self.ctx.streambim.all() {
+                    if account.is_some_and(|key| found.key != key) {
+                        continue;
+                    }
+                    if let Err(e) = found.auth.sign_out().await {
+                        warn!("utloggning ({}): {e:#}", provider.label());
+                    }
+                    self.ctx.streambim.forget_if_signed_out(&found.key);
+                }
+            }
         }
     }
 
@@ -974,7 +1119,7 @@ impl Engine {
             }
         }
         for provider in Provider::ALL {
-            self.sign_out_account(provider).await;
+            self.sign_out_account(provider, None).await;
         }
         if let Err(e) = self.ctx.store.kv_set(SYNC_ROOT_UID_KEY, None) {
             warn!("kunde inte glömma synkrotens id: {e:#}");
@@ -2351,16 +2496,21 @@ impl Engine {
             } => {
                 self.sign_in(provider, streambim, live, itx).await;
             }
-            TrayCmd::SignInMfa { provider, code } => {
+            TrayCmd::SignInMfa {
+                provider,
+                account,
+                code,
+            } => {
+                let key: SignInKey = (provider, Some(account.clone()));
                 let generation = live
                     .sign_ins
-                    .get(&provider)
+                    .get(&key)
                     .filter(|attempt| attempt.mfa_pending)
                     .map(|attempt| attempt.generation);
                 let Some(generation) = generation else {
                     // An attempt that is not waiting for a code is already checking one (a repeat
                     // of the same code, a double click): nothing to tell the user.
-                    if live.sign_ins.contains_key(&provider) {
+                    if live.sign_ins.contains_key(&key) {
                         return;
                     }
                     self.ctx.ui.send(UiMsg::notify(
@@ -2370,29 +2520,29 @@ impl Engine {
                     return;
                 };
                 // The MFA wait's timer gives way to the verification of the code.
-                if let Some(wait) = live.sign_ins.remove(&provider) {
+                if let Some(wait) = live.sign_ins.remove(&key) {
                     wait.task.abort();
                     let _ = wait.task.await;
                 }
                 let me = self.clone();
                 let tx = itx.clone();
+                let task_key = key.clone();
                 let task = tokio::spawn(async move {
-                    let result = me
-                        .ctx
-                        .streambim
-                        .verify_mfa(&code.0)
-                        .await
-                        .map(LoginOutcome::SignedIn);
+                    let result = match me.ctx.streambim.get(&account) {
+                        Some(found) => found.auth.verify_mfa(&code.0).await,
+                        None => Err(anyhow!("StreamBIM-kontot finns inte längre.")),
+                    }
+                    .map(LoginOutcome::SignedIn);
                     drop(code);
                     let _ = tx.send(Internal::SignedIn {
-                        provider,
+                        key: task_key,
                         generation,
                         result,
                     });
                     me.wake.notify_one();
                 });
                 live.sign_ins.insert(
-                    provider,
+                    key,
                     SignInAttempt {
                         task,
                         generation,
@@ -2402,16 +2552,34 @@ impl Engine {
                 );
                 self.publish();
             }
-            TrayCmd::CancelSignIn { provider } => {
-                self.cancel_sign_in(live, provider).await;
-                self.ctx.ui.send(UiMsg::SignInProgress {
-                    provider,
-                    state: "cancelled",
-                    error: None,
-                });
+            TrayCmd::CancelSignIn { provider, account } => {
+                // StreamBIM without an account: every pending StreamBIM sign-in ends.
+                let keys: Vec<SignInKey> = if provider == Provider::StreamBim && account.is_none() {
+                    let pending: HashSet<SignInKey> = live
+                        .sign_ins
+                        .keys()
+                        .cloned()
+                        .chain(self.st().signing_in.iter().cloned())
+                        .filter(|key| key.0 == Provider::StreamBim)
+                        .collect();
+                    pending.into_iter().collect()
+                } else {
+                    vec![(provider, account)]
+                };
+                for key in &keys {
+                    self.cancel_sign_in(live, key).await;
+                }
+                for key in keys {
+                    self.ctx.ui.send(UiMsg::SignInProgress {
+                        provider: key.0,
+                        account: key.1,
+                        state: "cancelled",
+                        error: None,
+                    });
+                }
                 self.publish();
             }
-            TrayCmd::SignOut { provider } => self.sign_out(provider, live).await,
+            TrayCmd::SignOut { provider, account } => self.sign_out(provider, account, live).await,
             TrayCmd::StreamBimRegions => {
                 let client = self.ctx.api.client().clone();
                 let ui = self.ctx.ui.clone();
@@ -2432,7 +2600,7 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|pending| pending.request_id == request_id)
                 {
-                    self.cancel_sign_in(live, Provider::Acc).await;
+                    self.cancel_sign_in(live, &ACC_KEY).await;
                     self.publish();
                 } else if !self.ctx.ui.hub.replay_client_validation_result(&request_id) {
                     // A new engine has no live request after a crash/restart. Let the UI
@@ -2480,10 +2648,15 @@ impl Engine {
                 };
                 match found {
                     // Unsubscribing needs no API, so a signed-out provider's project can be let go.
-                    Some((hub, _)) if subscribe && !self.ctx.signed_in(hub.provider) => {
+                    Some((hub, _)) if subscribe && !self.ctx.hub_connected(&hub) => {
+                        // A StreamBIM hub is named by its server: "StreamBIM Japan".
+                        let target = match hub.provider {
+                            Provider::StreamBim => hub.name.clone(),
+                            other => other.label().to_string(),
+                        };
                         self.ctx.ui.send(UiMsg::notify(
                             Severity::Warning,
-                            format!("Logga in på {} först.", hub.provider.label()),
+                            format!("Logga in på {target} först."),
                         ));
                     }
                     Some((hub, project)) => {
@@ -2508,7 +2681,7 @@ impl Engine {
                     return;
                 }
                 if live.client_validation.is_some() {
-                    self.cancel_sign_in(live, Provider::Acc).await;
+                    self.cancel_sign_in(live, &ACC_KEY).await;
                 }
                 if self.set_client_id(&value, live).await {
                     crate::app::request_restart();
@@ -2645,10 +2818,30 @@ impl Engine {
             }
         }
         // A signed-out provider cannot be listed. Its subscribed projects still show, so they
-        // can be unsubscribed.
+        // can be unsubscribed. StreamBIM is listed per account: each account that is not signed in.
         for provider in Provider::ALL {
-            if !self.ctx.signed_in(provider) {
-                out.extend(offline_hubs(provider, &previous, &stored, &subscribed));
+            match provider {
+                Provider::StreamBim => {
+                    for key in offline_streambim_keys(&self.ctx.streambim, &previous, &stored) {
+                        out.extend(offline_hubs(
+                            provider,
+                            Some(&key),
+                            &previous,
+                            &stored,
+                            &subscribed,
+                        ));
+                    }
+                }
+                _ if !self.ctx.signed_in(provider) => {
+                    out.extend(offline_hubs(
+                        provider,
+                        None,
+                        &previous,
+                        &stored,
+                        &subscribed,
+                    ));
+                }
+                _ => {}
             }
         }
         *self.projects.lock().unwrap_or_else(|e| e.into_inner()) = out.clone();
@@ -3460,35 +3653,73 @@ impl Engine {
         }));
     }
 
-    /// One entry per provider, in account order (see IPC.md `status.accounts`).
+    /// The `status.accounts` entries (IPC.md): ACC, then one entry per StreamBIM account that is
+    /// signed in or signing in (sorted by key), then Interaxo.
     fn account_statuses(&self) -> Vec<AccountStatus> {
-        let signing: HashSet<Provider> = self.st().signing_in.clone();
-        Provider::ALL
+        let signing: HashSet<SignInKey> = self.st().signing_in.clone();
+        let mut out = Vec::new();
+        out.push(AccountStatus {
+            provider: Provider::Acc,
+            account: None,
+            label: Provider::Acc.label(),
+            configured: self.ctx.auth.is_configured(),
+            signed_in: self.ctx.auth.is_signed_in(),
+            signing_in: signing.contains(&ACC_KEY),
+            user: self
+                .ctx
+                .auth
+                .is_signed_in()
+                .then(|| self.ctx.user_for(Provider::Acc))
+                .flatten(),
+            host: None,
+        });
+        let mut keys: std::collections::BTreeSet<String> = self
+            .ctx
+            .streambim
+            .signed_in()
             .into_iter()
-            .map(|provider| {
-                let signed_in = self.ctx.signed_in(provider);
-                AccountStatus {
-                    provider,
-                    label: provider.label(),
-                    configured: match provider {
-                        Provider::Acc => self.ctx.auth.is_configured(),
-                        Provider::StreamBim => true,
-                        Provider::Interaxo => self.ctx.interaxo.is_configured(),
-                    },
-                    signed_in,
-                    signing_in: signing.contains(&provider),
-                    user: if signed_in {
-                        self.ctx.user_for(provider)
-                    } else {
-                        None
-                    },
-                    host: match provider {
-                        Provider::StreamBim => self.ctx.streambim.host(),
-                        _ => None,
-                    },
-                }
-            })
-            .collect()
+            .map(|account| account.key)
+            .collect();
+        keys.extend(signing.iter().filter_map(|(provider, key)| {
+            (*provider == Provider::StreamBim)
+                .then(|| key.clone())
+                .flatten()
+        }));
+        for key in keys {
+            let account = self.ctx.streambim.get(&key);
+            let signed_in = account
+                .as_ref()
+                .is_some_and(|account| account.auth.is_signed_in());
+            out.push(AccountStatus {
+                provider: Provider::StreamBim,
+                account: Some(key.clone()),
+                label: Provider::StreamBim.label(),
+                configured: true,
+                signed_in,
+                signing_in: signing.contains(&(Provider::StreamBim, Some(key))),
+                user: account
+                    .as_ref()
+                    .filter(|_| signed_in)
+                    .and_then(|account| account.auth.user()),
+                host: account.map(|account| account.auth.host()),
+            });
+        }
+        out.push(AccountStatus {
+            provider: Provider::Interaxo,
+            account: None,
+            label: Provider::Interaxo.label(),
+            configured: self.ctx.interaxo.is_configured(),
+            signed_in: self.ctx.interaxo.is_signed_in(),
+            signing_in: signing.contains(&(Provider::Interaxo, None)),
+            user: self
+                .ctx
+                .interaxo
+                .is_signed_in()
+                .then(|| self.ctx.user_for(Provider::Interaxo))
+                .flatten(),
+            host: None,
+        });
+        out
     }
 
     /// Latest successful poll: this process, or the newest `last_sync_ms` stored for an enabled
@@ -3575,7 +3806,7 @@ impl Engine {
     /// The APS client id is ACC's: a change waits for ACC to be signed out with no ACC sign-in
     /// pending. StreamBIM and Interaxo keep their own tokens across the restart a change needs.
     fn client_validation_guard(&self, live: &Live) -> std::result::Result<(), String> {
-        if self.ctx.auth.is_signed_in() || live.sign_ins.contains_key(&Provider::Acc) {
+        if self.ctx.auth.is_signed_in() || live.sign_ins.contains_key(&ACC_KEY) {
             Err("Logga ut innan du testar ett APS Client ID. Den sparade inställningen ändrades inte.".into())
         } else if self.client_id_change_busy() {
             Err("Vänta tills pågående synk, återställning och uppdatering är klara. Den sparade inställningen ändrades inte.".into())
@@ -3598,7 +3829,7 @@ impl Engine {
                     // A reconnect may retry a request whose acknowledgement was lost.
                     self.client_validation_event(&request_id, "testing", None);
                 } else {
-                    self.cancel_sign_in(live, Provider::Acc).await;
+                    self.cancel_sign_in(live, &ACC_KEY).await;
                     self.client_validation_event(
                         &request_id,
                         "failed",
@@ -3612,7 +3843,7 @@ impl Engine {
                 return;
             }
         }
-        if live.sign_ins.get(&Provider::Acc).is_some_and(|attempt| {
+        if live.sign_ins.get(&ACC_KEY).is_some_and(|attempt| {
             attempt.started_at.elapsed() < SIGN_IN_BURST && !attempt.task.is_finished()
         }) {
             self.client_validation_event(&request_id, "failed", Some(
@@ -3632,7 +3863,7 @@ impl Engine {
             return;
         }
         // Retrying must release the previous callback listener before the next flow binds.
-        self.cancel_sign_in(live, Provider::Acc).await;
+        self.cancel_sign_in(live, &ACC_KEY).await;
         if let Err(error) = self.client_validation_guard(live) {
             self.client_validation_event(&request_id, "failed", Some(error));
             self.publish();
@@ -3646,7 +3877,7 @@ impl Engine {
             original_effective_id: original.client_id(),
         });
         let generation = next_sign_in_generation(live);
-        self.st().signing_in.insert(Provider::Acc);
+        self.st().signing_in.insert(ACC_KEY);
         self.client_validation_event(&request_id, "testing", None);
         self.publish();
         let http = self.ctx.api.client().clone();
@@ -3660,7 +3891,7 @@ impl Engine {
             });
         });
         live.sign_ins.insert(
-            Provider::Acc,
+            ACC_KEY,
             SignInAttempt {
                 task,
                 generation,
@@ -3680,7 +3911,7 @@ impl Engine {
         if live.restart_pending
             || live
                 .sign_ins
-                .get(&Provider::Acc)
+                .get(&ACC_KEY)
                 .is_none_or(|attempt| attempt.generation != generation)
             || live
                 .client_validation
@@ -3693,8 +3924,8 @@ impl Engine {
             .client_validation
             .take()
             .expect("matched pending validation");
-        live.sign_ins.remove(&Provider::Acc);
-        self.st().signing_in.remove(&Provider::Acc);
+        live.sign_ins.remove(&ACC_KEY);
+        self.st().signing_in.remove(&ACC_KEY);
         let result = match result {
             Ok(()) => self.client_validation_guard(live),
             Err(error) => Err(format!("APS-testet misslyckades: {error:#}")),
@@ -3769,7 +4000,7 @@ impl Engine {
                 );
             }
 
-            self.cancel_sign_in(live, Provider::Acc).await;
+            self.cancel_sign_in(live, &ACC_KEY).await;
             self.publish();
             // The previous worker may have finished committing a complete session
             // just before cancellation. It still requires an explicit sign-out.
@@ -3882,7 +4113,7 @@ impl Engine {
     /// the account keeps tokens for the client it was signed in with.
     fn set_interaxo_setting(self: &Arc<Self>, key: &str, value: &Value) {
         let busy = self.ctx.signed_in(Provider::Interaxo)
-            || self.st().signing_in.contains(&Provider::Interaxo);
+            || self.st().signing_in.contains(&(Provider::Interaxo, None));
         if busy {
             self.ctx.ui.send(UiMsg::notify(
                 Severity::Warning,
@@ -4875,10 +5106,33 @@ pub(crate) fn root_uid(
     first_other.map(|(provider, user)| format!("{}:{}", provider.as_str(), user.user_id))
 }
 
-/// The hubs of a provider that is signed out: the hubs listed before, with their current
-/// subscription flags, plus every subscribed project of that provider missing from them.
+/// The StreamBIM account keys, among the hubs listed and the projects stored, whose account is not
+/// signed in (the hub of an account is keyed by its region).
+fn offline_streambim_keys(
+    streambim: &StreamBimAccounts,
+    previous: &HubList,
+    stored: &[Project],
+) -> std::collections::BTreeSet<String> {
+    previous
+        .iter()
+        .filter(|(hub, _)| hub.provider == Provider::StreamBim)
+        .filter_map(|(hub, _)| hub.region.clone())
+        .chain(
+            stored
+                .iter()
+                .filter(|p| p.provider == Provider::StreamBim)
+                .filter_map(project_key),
+        )
+        .filter(|key| !streambim.get(key).is_some_and(|a| a.auth.is_signed_in()))
+        .collect()
+}
+
+/// The hubs of a provider that is signed out, or of one StreamBIM account (`account`) that is not
+/// signed in: the hubs listed before, with their current subscription flags, plus every subscribed
+/// project of that provider missing from them.
 fn offline_hubs(
     provider: Provider,
+    account: Option<&str>,
     previous: &HubList,
     stored: &[Project],
     subscribed: &HashSet<String>,
@@ -4888,6 +5142,7 @@ fn offline_hubs(
     let mut hubs: HubList = previous
         .iter()
         .filter(|(hub, _)| hub.provider == provider)
+        .filter(|(hub, _)| account.is_none_or(|key| hub.region.as_deref() == Some(key)))
         .filter_map(|(hub, projects)| {
             let kept: Vec<(ProjectInfo, bool)> = projects
                 .iter()
@@ -4900,6 +5155,7 @@ fn offline_hubs(
     for project in stored
         .iter()
         .filter(|p| p.enabled && p.provider == provider)
+        .filter(|p| account.is_none_or(|key| project_key(p).as_deref() == Some(key)))
     {
         let listed = hubs
             .iter()
@@ -4940,17 +5196,14 @@ fn next_sign_in_generation(live: &mut Live) -> u64 {
 
 /// Ends a StreamBIM MFA wait after MFA_WAIT.
 fn mfa_timer(
-    provider: Provider,
+    key: SignInKey,
     generation: u64,
     itx: &UnboundedSender<Internal>,
 ) -> tokio::task::JoinHandle<()> {
     let tx = itx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(MFA_WAIT).await;
-        let _ = tx.send(Internal::SignInExpired {
-            provider,
-            generation,
-        });
+        let _ = tx.send(Internal::SignInExpired { key, generation });
     })
 }
 
@@ -7638,7 +7891,7 @@ pub(crate) mod tests {
     fn set_test_attempt(live: &mut Live, task: tokio::task::JoinHandle<()>) {
         let generation = live.sign_in_generation;
         live.sign_ins.insert(
-            Provider::Acc,
+            ACC_KEY,
             SignInAttempt {
                 task,
                 generation,
@@ -7650,13 +7903,13 @@ pub(crate) mod tests {
 
     /// Test shim: moves the start of the Acc attempt (if one is pending).
     fn set_test_started(live: &mut Live, started: Instant) {
-        if let Some(attempt) = live.sign_ins.get_mut(&Provider::Acc) {
+        if let Some(attempt) = live.sign_ins.get_mut(&ACC_KEY) {
             attempt.started_at = started;
         }
     }
 
     fn test_started(live: &Live) -> Option<Instant> {
-        live.sign_ins.get(&Provider::Acc).map(|a| a.started_at)
+        live.sign_ins.get(&ACC_KEY).map(|a| a.started_at)
     }
 
     fn login_test_live() -> Live {
@@ -7682,7 +7935,7 @@ pub(crate) mod tests {
         // The validation runs as the Acc sign-in attempt (generation 19), started long enough ago
         // that a new click is not a burst.
         live.sign_ins.insert(
-            Provider::Acc,
+            ACC_KEY,
             SignInAttempt {
                 task: tokio::spawn(std::future::pending::<()>()),
                 generation: 19,
@@ -7991,7 +8244,7 @@ pub(crate) mod tests {
             live.client_validation.as_ref().unwrap().request_id,
             VALIDATION_REQUEST
         );
-        assert!(!live.sign_ins[&Provider::Acc].task.is_finished());
+        assert!(!live.sign_ins[&ACC_KEY].task.is_finished());
         assert!(rx.try_recv().is_err());
         assert_eq!(
             f._rx
@@ -8044,7 +8297,7 @@ pub(crate) mod tests {
             live.client_validation.as_ref().unwrap().request_id,
             VALIDATION_REQUEST
         );
-        assert!(!live.sign_ins[&Provider::Acc].task.is_finished());
+        assert!(!live.sign_ins[&ACC_KEY].task.is_finished());
         assert_eq!(
             std::fs::read(f.ctx.paths.state_dir.join("settings.json")).unwrap(),
             settings
@@ -8300,7 +8553,7 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 20;
-        engine.st().signing_in.insert(Provider::Acc);
+        engine.st().signing_in.insert(ACC_KEY);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -8336,7 +8589,7 @@ pub(crate) mod tests {
         assert!(!f.ctx.paths.state_dir.join("user.json").exists());
         engine
             .on_signed_in(
-                Provider::Acc,
+                ACC_KEY,
                 20,
                 Err(anyhow!("stale old-client completion")),
                 &mut live,
@@ -8526,7 +8779,7 @@ pub(crate) mod tests {
         let mut live = login_test_live();
         live.sign_in_generation = 5;
         let started = Instant::now();
-        engine.st().signing_in.insert(Provider::Acc);
+        engine.st().signing_in.insert(ACC_KEY);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -8561,7 +8814,7 @@ pub(crate) mod tests {
             "a click burst replaced the attempt"
         );
         assert_eq!(test_started(&live), Some(started));
-        assert!(!live.sign_ins[&Provider::Acc].task.is_finished());
+        assert!(!live.sign_ins[&ACC_KEY].task.is_finished());
         assert!(
             tokio::net::TcpListener::bind(address).await.is_err(),
             "the first browser's callback listener was dropped during the burst"
@@ -8596,20 +8849,14 @@ pub(crate) mod tests {
             .unwrap()
         {
             Internal::SignedIn {
-                provider,
+                key,
                 generation,
                 result,
             } => {
                 assert_eq!(generation, 6);
                 assert!(result.is_err(), "the empty client ID must fail locally");
                 engine
-                    .on_signed_in(
-                        provider,
-                        generation,
-                        result,
-                        &mut live,
-                        &unbounded_channel().0,
-                    )
+                    .on_signed_in(key, generation, result, &mut live, &unbounded_channel().0)
                     .await;
                 assert!(test_started(&live).is_none());
                 assert!(live.sign_ins.is_empty());
@@ -8639,7 +8886,7 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 7;
-        engine.st().signing_in.insert(Provider::Acc);
+        engine.st().signing_in.insert(ACC_KEY);
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -8681,7 +8928,7 @@ pub(crate) mod tests {
             .expect("login completion channel closed");
         match message {
             Internal::SignedIn {
-                provider,
+                key,
                 generation,
                 result,
             } => {
@@ -8689,13 +8936,7 @@ pub(crate) mod tests {
                 assert!(result.is_err(), "the empty client ID must fail locally");
                 assert!(!engine.st().signing_in.is_empty());
                 engine
-                    .on_signed_in(
-                        provider,
-                        generation,
-                        result,
-                        &mut live,
-                        &unbounded_channel().0,
-                    )
+                    .on_signed_in(key, generation, result, &mut live, &unbounded_channel().0)
                     .await;
                 assert!(engine.st().signing_in.is_empty());
                 assert!(live.sign_ins.is_empty());
@@ -8712,7 +8953,7 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 3;
-        engine.st().signing_in.insert(Provider::Acc);
+        engine.st().signing_in.insert(ACC_KEY);
         let token = f.ctx.paths.state_dir.join("token.bin");
         std::fs::write(&token, b"private existing test token").unwrap();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -8735,7 +8976,14 @@ pub(crate) mod tests {
 
         let (tx, _) = unbounded_channel();
         engine
-            .on_cmd(TrayCmd::SignOut { provider: None }, &mut live, &tx)
+            .on_cmd(
+                TrayCmd::SignOut {
+                    provider: None,
+                    account: None,
+                },
+                &mut live,
+                &tx,
+            )
             .await;
         assert!(
             release.send(()).is_err(),
@@ -8764,11 +9012,11 @@ pub(crate) mod tests {
         let started = Instant::now();
         set_test_attempt(&mut live, tokio::spawn(std::future::pending()));
         set_test_started(&mut live, started);
-        engine.st().signing_in.insert(Provider::Acc);
+        engine.st().signing_in.insert(ACC_KEY);
 
         engine
             .on_signed_in(
-                Provider::Acc,
+                ACC_KEY,
                 8,
                 Err(anyhow!("error from the cancelled attempt")),
                 &mut live,
@@ -8799,7 +9047,7 @@ pub(crate) mod tests {
     fn resilience_login_pending_status_is_visible_without_a_new_protocol_state() {
         let f = fixture("login-status");
         let engine = Engine::new(f.ctx.clone());
-        engine.st().signing_in.insert(Provider::Acc);
+        engine.st().signing_in.insert(ACC_KEY);
         engine.publish_now();
         match f._rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             UiMsg::Status(status) => {
@@ -9459,14 +9707,10 @@ pub(crate) mod tests {
             hub: Arc::new(crate::ipc::IpcHub::new(root.clone())),
         };
         let cfg = crate::config::Config::default();
-        let streambim = Arc::new(crate::streambim_auth::StreamBimAuth::new(
+        let streambim = Arc::new(crate::streambim_auth::StreamBimAccounts::load(
             http.clone(),
             &state,
         ));
-        let streambim_api = crate::http::Api::with_source(
-            http.clone(),
-            crate::http::TokenSource::StreamBim(streambim.clone()),
-        );
         let interaxo = Arc::new(crate::auth::Auth::with_files(
             String::new(),
             http.clone(),
@@ -9483,7 +9727,6 @@ pub(crate) mod tests {
             auth,
             api,
             streambim,
-            streambim_api,
             interaxo,
             interaxo_api,
             ui,
@@ -10314,7 +10557,6 @@ pub(crate) mod tests {
             auth: f.ctx.auth.clone(),
             api: f.ctx.api.clone(),
             streambim: f.ctx.streambim.clone(),
-            streambim_api: f.ctx.streambim_api.clone(),
             interaxo: f.ctx.interaxo.clone(),
             interaxo_api: f.ctx.interaxo_api.clone(),
             ui: f.ctx.ui.clone(),

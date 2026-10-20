@@ -85,6 +85,7 @@ fn summary(ctx: &Ctx) -> serde_json::Value {
         "signed_in": {
             "acc": ctx.signed_in(crate::model::Provider::Acc),
             "streambim": ctx.signed_in(crate::model::Provider::StreamBim),
+            "streambim_accounts": ctx.streambim.signed_in().len(),
             "interaxo": ctx.signed_in(crate::model::Provider::Interaxo),
         },
         "settings": settings_summary(&s),

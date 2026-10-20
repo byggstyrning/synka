@@ -188,7 +188,10 @@ mod tests {
         let old_command = engine.begin_command(&TrayCmd::RetryFailed).unwrap();
         let gate = engine.begin_recovery().unwrap();
         assert!(engine
-            .begin_command(&TrayCmd::SignOut { provider: None })
+            .begin_command(&TrayCmd::SignOut {
+                provider: None,
+                account: None
+            })
             .is_none());
         assert!(engine.try_maintenance_guard().is_none());
         assert!(

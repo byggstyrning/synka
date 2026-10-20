@@ -8,10 +8,14 @@ use crate::ipc::IpcHub;
 use crate::model::{now_ms, HubInfo, Project, ProjectInfo, Provider};
 use crate::paths::Paths;
 use crate::store::Store;
-use crate::streambim_auth::StreamBimAuth;
+use crate::streambim_auth::{sign_in_label, StreamBimAccounts};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// One sign-in attempt or pending wait: the provider, and for StreamBIM the key of its account.
+/// ACC and Interaxo have one account each, so their key has no account.
+pub type SignInKey = (Provider, Option<String>);
 
 pub struct Ctx {
     /// Startup snapshot (paths, client id, update channel). Runtime-changeable settings live in
@@ -23,9 +27,9 @@ pub struct Ctx {
     /// ACC account (APS OAuth).
     pub auth: Arc<Auth>,
     pub api: Api,
-    /// StreamBIM account (its own login, see `crate::streambim_auth`).
-    pub streambim: Arc<StreamBimAuth>,
-    pub streambim_api: Api,
+    /// StreamBIM accounts, one per server (see `crate::streambim_auth`). Each account has its own
+    /// API client; StreamBIM requests go only through them.
+    pub streambim: Arc<StreamBimAccounts>,
     /// Interaxo account: an `Auth` with the Interaxo OIDC spec (empty client id until configured).
     pub interaxo: Arc<Auth>,
     pub interaxo_api: Api,
@@ -41,20 +45,11 @@ impl Ctx {
             .clone()
     }
 
-    /// The API client of one provider's account.
-    pub fn api_for(&self, p: Provider) -> &Api {
-        match p {
-            Provider::Acc => &self.api,
-            Provider::StreamBim => &self.streambim_api,
-            Provider::Interaxo => &self.interaxo_api,
-        }
-    }
-
-    /// True when that provider's account has a usable session.
+    /// True when that provider's account has a usable session. StreamBIM: any account.
     pub fn signed_in(&self, p: Provider) -> bool {
         match p {
             Provider::Acc => self.auth.is_signed_in(),
-            Provider::StreamBim => self.streambim.is_signed_in(),
+            Provider::StreamBim => self.streambim.any_signed_in(),
             Provider::Interaxo => self.interaxo.is_signed_in(),
         }
     }
@@ -64,50 +59,51 @@ impl Ctx {
         Provider::ALL.into_iter().any(|p| self.signed_in(p))
     }
 
-    /// The signed-in user of one provider, if any.
+    /// The signed-in user of one provider, if any. StreamBIM: the first signed-in account's user.
     pub fn user_for(&self, p: Provider) -> Option<UserInfo> {
         match p {
             Provider::Acc => self.auth.user(),
-            Provider::StreamBim => self.streambim.user(),
+            Provider::StreamBim => self
+                .streambim
+                .signed_in()
+                .first()
+                .and_then(|account| account.auth.user()),
             Provider::Interaxo => self.interaxo.user(),
         }
     }
 
-    /// True when the provider can serve this project now: its account is signed in and, for
-    /// StreamBIM, the signed-in account is in the project's own region. A project of another
-    /// region (or of an account that was signed out) is paused like one of a signed-out provider.
+    /// True when the provider can serve this project now. For StreamBIM that is the project's own
+    /// account, signed in; a project of another server (or of a signed-out account) is paused like
+    /// one of a signed-out provider.
     pub fn project_connected(&self, p: &Project) -> bool {
-        if !self.signed_in(p.provider) {
-            return false;
-        }
         match p.provider {
-            Provider::StreamBim => {
-                project_region(p).is_some() && self.streambim.region() == project_region(p)
-            }
-            Provider::Acc | Provider::Interaxo => true,
+            Provider::StreamBim => self
+                .streambim
+                .for_project(p)
+                .is_some_and(|account| account.auth.is_signed_in()),
+            other => self.signed_in(other),
+        }
+    }
+
+    /// True when the StreamBIM account of a hub is signed in (other providers: as `signed_in`).
+    pub fn hub_connected(&self, hub: &HubInfo) -> bool {
+        match hub.provider {
+            Provider::StreamBim => self
+                .streambim
+                .for_hub(hub)
+                .is_some_and(|account| account.auth.is_signed_in()),
+            other => self.signed_in(other),
         }
     }
 
     /// What the user signs in to for this project, in the words of the sign-in messages: the
-    /// provider, or "StreamBIM (<region>)" when the signed-in StreamBIM account is elsewhere.
+    /// provider, or "StreamBIM (<host>)" for a StreamBIM project.
     pub fn sign_in_target(&self, p: &Project) -> String {
-        match project_region(p) {
-            Some(region)
-                if p.provider == Provider::StreamBim
-                    && self.signed_in(p.provider)
-                    && self.streambim.region().as_deref() != Some(region.as_str()) =>
-            {
-                format!("StreamBIM ({region})")
-            }
-            _ => p.provider.label().to_string(),
+        match p.provider {
+            Provider::StreamBim => sign_in_label(p),
+            other => other.label().to_string(),
         }
     }
-}
-
-/// The StreamBIM region a project was made under: `meta` is `{"region":..}` (docs/PROVIDERS.md).
-pub fn project_region(p: &Project) -> Option<String> {
-    let meta: serde_json::Value = serde_json::from_str(p.meta.as_deref()?).ok()?;
-    meta.get("region")?.as_str().map(str::to_string)
 }
 
 /// Snapshot shown in the tray tooltip and sent as the `status` event.
@@ -133,25 +129,28 @@ pub struct Status {
     pub accounts: Vec<AccountStatus>,
 }
 
-/// One provider's account as shown in `status.accounts`.
+/// One account as shown in `status.accounts`: ACC, Interaxo, or one StreamBIM account.
 #[derive(Debug, Clone)]
 pub struct AccountStatus {
     pub provider: Provider,
+    /// The StreamBIM account key; None for ACC and Interaxo.
+    pub account: Option<String>,
     pub label: &'static str,
     /// The provider can sign in (ACC has a client id, Interaxo has `interaxo_client_id`).
     pub configured: bool,
     pub signed_in: bool,
     pub signing_in: bool,
     pub user: Option<UserInfo>,
-    /// StreamBIM: the region host once signed in.
+    /// StreamBIM: the server's host.
     pub host: Option<String>,
 }
 
 impl AccountStatus {
-    /// The entry for a provider that is not signed in (used before the first status).
+    /// The entry for ACC or Interaxo that is not signed in (used before the first status).
     pub fn signed_out(provider: Provider) -> AccountStatus {
         AccountStatus {
             provider,
+            account: None,
             label: provider.label(),
             configured: false,
             signed_in: false,
@@ -183,10 +182,18 @@ impl<'de> Deserialize<'de> for Secret {
     }
 }
 
+/// The StreamBIM server a sign-in is for: a region subdomain, or a custom https address. Both are
+/// checked again by the engine (`streambim_auth::server_from_region` / `server_from_url`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamBimServer {
+    Region(String),
+    Url(String),
+}
+
 /// StreamBIM password sign-in input. The password is used once and never stored.
 #[derive(Clone)]
 pub struct StreamBimLogin {
-    pub region: String,
+    pub server: StreamBimServer,
     pub username: String,
     pub password: Secret,
 }
@@ -194,7 +201,7 @@ pub struct StreamBimLogin {
 impl std::fmt::Debug for StreamBimLogin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamBimLogin")
-            .field("region", &self.region)
+            .field("server", &self.server)
             .field("username", &self.username)
             .field("password", &self.password)
             .finish()
@@ -300,9 +307,11 @@ pub enum UiMsg {
     },
     Settings(SettingsView),
     Activity(ActivityItem),
-    /// Sign-in progress of one provider: browser | mfa_required | signed_in | failed | cancelled.
+    /// Sign-in progress of one provider (of one StreamBIM account, when `account` is set):
+    /// browser | mfa_required | signed_in | failed | cancelled.
     SignInProgress {
         provider: Provider,
+        account: Option<String>,
         state: &'static str,
         error: Option<String>,
     },
@@ -334,18 +343,23 @@ pub enum TrayCmd {
         provider: Provider,
         streambim: Option<StreamBimLogin>,
     },
-    /// The MFA code for a pending StreamBIM sign-in.
+    /// The MFA code for a pending StreamBIM sign-in of the account `account`.
     SignInMfa {
         provider: Provider,
+        account: String,
         code: Secret,
     },
-    /// Cancel a pending sign-in (browser or MFA wait) of one provider.
+    /// Cancel a pending sign-in (browser or MFA wait) of one provider. For StreamBIM, `account`
+    /// names one account; without it every pending StreamBIM sign-in is cancelled.
     CancelSignIn {
         provider: Provider,
+        account: Option<String>,
     },
-    /// Sign out of one provider, or of every provider (`None`).
+    /// Sign out of one provider, or of every provider (`None`). `account` (StreamBIM only) signs
+    /// out that account alone.
     SignOut {
         provider: Option<Provider>,
+        account: Option<String>,
     },
     /// Load the StreamBIM region list and publish it as `streambim_regions`.
     StreamBimRegions,
