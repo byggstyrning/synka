@@ -29,6 +29,8 @@ internal static class Program
             ("activity_error_details_redact_credentials", ActivityErrorDetailsRedactCredentials),
             ("activity_local_paths_with_spaces_are_fully_redacted", ActivityLocalPathsWithSpacesAreFullyRedacted),
             ("provider_messages_parse_and_commands_carry_protocol_fields", ProviderMessagesParseAndCommandsCarryProtocolFields),
+            ("sign_in_progress_is_forgotten_across_connections", SignInProgressIsForgottenAcrossConnections),
+            ("settings_retries_and_cancels_acc_and_interaxo_browser_sign_ins", SettingsRetriesAndCancelsBrowserSignInsPerProvider),
         };
         var selected = args.Length == 0 ? null : args[0];
         if (selected is not null && !scenarios.Any(s => s.Name == selected))
@@ -151,6 +153,60 @@ internal static class Program
 
         return "Accounts, hub provider, provider settings, sign-in progress and regions parsed; an older status fell back to ACC; "
             + "sign_in (StreamBIM, ACC), sign_in_mfa, cancel_sign_in, sign_out (all and one) and streambim_regions sent their protocol fields";
+    }
+
+    /// <summary>
+    /// The cached sign-in progress belongs to one connection: a disconnect and a reconnect both forget
+    /// it, so a StreamBIM code prompt from an engine that is gone is not shown again.
+    /// </summary>
+    private static Task<string> SignInProgressIsForgottenAcrossConnections()
+    {
+        var client = NewClient();
+        var handle = typeof(EngineClient).GetMethod("HandleLine", PrivateInstance)!;
+        var publish = typeof(EngineClient).GetMethod("PublishState", PrivateInstance)!;
+        const string prompt = """{"type":"sign_in_progress","provider":"streambim","state":"mfa_required","error":null}""";
+
+        publish.Invoke(client, new object[] { EngineConnectionState.Connected, true });
+        handle.Invoke(client, new object[] { prompt });
+        Require(client.SignInProgressFor("streambim")?.State == "mfa_required", "The MFA prompt was not kept while connected");
+
+        publish.Invoke(client, new object[] { EngineConnectionState.Disconnected, false });
+        Require(client.SignInProgressFor("streambim") is null, "A disconnect kept the cached MFA prompt");
+
+        handle.Invoke(client, new object[] { prompt });
+        publish.Invoke(client, new object[] { EngineConnectionState.Connected, true });
+        Require(client.SignInProgressFor("streambim") is null, "A reconnect kept the cached MFA prompt");
+
+        return Task.FromResult("A prompt was kept while connected and forgotten by the disconnect and by the reconnect");
+    }
+
+    /// <summary>
+    /// Settings retries an ACC or Interaxo sign-in while its browser is open (sign_in again, which the
+    /// engine answers by replacing the pending attempt), and Avbryt sends cancel_sign_in for that provider only.
+    /// </summary>
+    private static async Task<string> SettingsRetriesAndCancelsBrowserSignInsPerProvider()
+    {
+        using var pipes = await PipePair.Connect();
+        var client = NewClient();
+        _ = Serve(client, pipes.Window);
+        await pipes.AckHello();
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":false,"user":null,"state":"signed_out","accounts":[{"provider":"acc","label":"ACC","configured":true,"signed_in":false,"signing_in":true,"user":null,"host":null},{"provider":"streambim","label":"StreamBIM","configured":true,"signed_in":false,"signing_in":false,"user":null,"host":null},{"provider":"interaxo","label":"Interaxo","configured":true,"signed_in":false,"signing_in":true,"user":null,"host":null}]}""");
+        await Until(() => client.Accounts.Count == 3);
+        Require(client.AccountFor("acc") is { SigningIn: true, SignedIn: false }, "ACC was not seen signing in");
+
+        var retry = await ExpectCommand(pipes, client.SignInAsync("acc"), "sign_in");
+        Require(retry.GetProperty("provider").GetString() == "acc", "A retry while the ACC browser is open did not name ACC");
+
+        var cancelAcc = await ExpectCommand(pipes, client.CancelSignInAsync("acc"), "cancel_sign_in");
+        Require(cancelAcc.GetProperty("provider").GetString() == "acc", "cancel_sign_in did not name ACC");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"sign_in_progress","provider":"acc","state":"cancelled","error":null}""");
+        await Until(() => client.SignInProgressFor("acc")?.State == "cancelled");
+
+        var cancelInteraxo = await ExpectCommand(pipes, client.CancelSignInAsync("interaxo"), "cancel_sign_in");
+        Require(cancelInteraxo.GetProperty("provider").GetString() == "interaxo", "cancel_sign_in did not name Interaxo");
+
+        return "A retry sent sign_in for ACC while signing in; cancel_sign_in named ACC, then Interaxo, and the cancelled progress was kept per provider";
     }
 
     /// <summary>Takes the next command the client writes, checks its name, acks it, and returns it.</summary>

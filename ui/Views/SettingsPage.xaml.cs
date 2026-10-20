@@ -59,8 +59,20 @@ public sealed partial class SettingsPage : Page
     /// <summary>The StreamBIM MFA dialog while it is open. Null otherwise.</summary>
     private ContentDialog? _mfaDialog;
 
-    /// <summary>The engine ended the MFA wait (signed in, failed or cancelled), so closing the dialog must not cancel again.</summary>
+    /// <summary>The code box of the open MFA dialog.</summary>
+    private TextBox? _mfaCode;
+
+    /// <summary>The code has gone to the engine: Verify stays off until the engine's next progress event.</summary>
+    private bool _mfaSubmitted;
+
+    /// <summary>The engine ended the MFA wait (signed in, failed or cancelled, or the connection went), so closing the dialog must not cancel again.</summary>
     private bool _mfaEndedByEngine;
+
+    /// <summary>
+    /// The prompt the user closed with Avbryt. The dialog does not come back for that same
+    /// prompt while the engine still reports it (before its `cancelled` arrives).
+    /// </summary>
+    private SignInProgressInfo? _mfaDismissedFor;
 
     /// <summary>
     /// The failure a provider's card no longer shows: closed by the user, or superseded by a
@@ -118,10 +130,7 @@ public sealed partial class SettingsPage : Page
         InteraxoExpander.IsExpanded = _engine.AccountFor(ProviderNames.Interaxo) is not { SignedIn: true };
 
         // The engine may be waiting for an MFA code that was asked for while this page was closed.
-        if (_engine.SignInProgressFor(ProviderNames.StreamBim) is { State: "mfa_required" })
-        {
-            _ = ShowMfaDialogAsync();
-        }
+        ShowMfaDialogIfWanted();
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs args)
@@ -166,13 +175,22 @@ public sealed partial class SettingsPage : Page
                 break;
 
             // Status (accounts included) comes up to twice a second: the account cards and
-            // the APS editor follow it, and the folder card with the signed-in state.
+            // the APS editor follow it, and the folder card with the signed-in state. The
+            // engine's `signing_in` can arrive after its MFA progress, so the dialog may open here.
             case nameof(EngineClient.Status):
+                RefreshAccounts();
+                ShowMfaDialogIfWanted();
                 RefreshFolder();
                 RefreshApsClientIdControls();
                 break;
 
             case nameof(EngineClient.IsConnected):
+                // The engine's MFA wait does not outlive the connection: the dialog closes with it.
+                if (!_engine.IsConnected)
+                {
+                    HideMfaDialog();
+                }
+                RefreshAccounts();
                 RefreshFolder();
                 RefreshEnabled();
                 ShowUpdate();
@@ -315,11 +333,15 @@ public sealed partial class SettingsPage : Page
             : signedIn ? SignedInAs(account.User)
             : Lang.T("Inte inloggad", "Not signed in"));
 
+        // While the browser is open, Logga in stays usable: the engine replaces the pending
+        // attempt, which is the retry after a closed tab. Avbryt ends that attempt instead.
         Show(AccSignInButton, account is { SignedIn: false });
-        Show(AccSignOutButton, signedIn);
+        Show(AccCancelSignInButton, account is { SignedIn: false, SigningIn: true });
         AccSignInButton.IsEnabled = connected
-            && account is { Configured: true, SignedIn: false, SigningIn: false }
+            && account is { Configured: true, SignedIn: false }
             && !_apsClientIdEdit.IsWaiting;
+        AccCancelSignInButton.IsEnabled = connected;
+        Show(AccSignOutButton, signedIn);
         AccSignOutButton.IsEnabled = connected && signedIn;
         ShowFailure(AccError, ProviderNames.Acc);
     }
@@ -354,7 +376,7 @@ public sealed partial class SettingsPage : Page
         {
             state = _engine.SignInProgressFor(ProviderNames.StreamBim)?.State == "mfa_required"
                 ? Lang.T("Väntar på koden från autentiseringsappen…", "Waiting for the code from your authenticator app…")
-                : Lang.T("Loggar in …", "Signing in …");
+                : Lang.T("Loggar in på StreamBIM…", "Signing in to StreamBIM…");
         }
         else
         {
@@ -412,9 +434,12 @@ public sealed partial class SettingsPage : Page
         }
         SetDescription(InteraxoExpander, state);
 
+        // As ACC: a new Logga in replaces the pending browser sign-in, Avbryt ends it.
         Show(InteraxoSignInButton, account is { SignedIn: false });
+        Show(InteraxoCancelSignInButton, account is { SignedIn: false, SigningIn: true });
+        InteraxoSignInButton.IsEnabled = account is { SignedIn: false, Configured: true };
+        InteraxoCancelSignInButton.IsEnabled = connected;
         Show(InteraxoSignOutButton, signedIn);
-        InteraxoSignInButton.IsEnabled = account is { SignedIn: false, SigningIn: false, Configured: true };
         InteraxoSignOutButton.IsEnabled = connected && signedIn;
 
         // The client settings change only while Interaxo is signed out (docs\IPC.md).
@@ -429,12 +454,15 @@ public sealed partial class SettingsPage : Page
 
     /// <summary>
     /// Shows a provider's failed sign-in in its card, once. A failure the user has closed or
-    /// already retried stays hidden until the engine reports a new one.
+    /// already retried stays hidden until the engine reports a new one. A cancelled sign-in
+    /// shows only when the engine says why (the user's own Avbryt says nothing).
     /// </summary>
     private void ShowFailure(InfoBar bar, string provider)
     {
         var progress = _engine.SignInProgressFor(provider);
-        var failed = progress is { State: "failed" }
+        var reported = progress is { State: "failed" }
+            || (progress is { State: "cancelled" } && !string.IsNullOrEmpty(progress.Error));
+        var failed = reported
             && !(_dismissedFailures.TryGetValue(provider, out var dismissed) && ReferenceEquals(dismissed, progress));
 
         var message = string.Empty;
@@ -509,6 +537,14 @@ public sealed partial class SettingsPage : Page
         DismissFailure(ProviderNames.Acc);
         ReportIfFailed(await _engine.SignInAsync(ProviderNames.Acc),
             Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+        RefreshAccounts();
+    }
+
+    /// <summary>Ends the browser sign-in that is waiting (the tab was closed, say). The engine reports `cancelled`.</summary>
+    private async void OnAccCancelSignIn(object sender, RoutedEventArgs args)
+    {
+        ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.Acc),
+            Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
         RefreshAccounts();
     }
 
@@ -623,8 +659,49 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// The StreamBIM MFA dialog: six digits from the authenticator app. Verify sends the code;
-    /// Cancel (or closing the dialog) cancels the sign-in in the engine.
+    /// The engine is waiting for a StreamBIM code: its latest progress says so, its account is
+    /// signing in, and the user has not closed this very prompt with Avbryt. The dialog opens only then.
+    /// </summary>
+    private bool StreamBimWaitsForCode()
+    {
+        var progress = _engine.SignInProgressFor(ProviderNames.StreamBim);
+        return _engine.IsConnected
+            && progress is { State: "mfa_required" }
+            && !ReferenceEquals(progress, _mfaDismissedFor)
+            && _engine.AccountFor(ProviderNames.StreamBim) is { SigningIn: true };
+    }
+
+    /// <summary>Opens the MFA dialog when the engine waits for a code and no dialog is open yet.</summary>
+    private void ShowMfaDialogIfWanted()
+    {
+        if (_mfaDialog is null && StreamBimWaitsForCode())
+        {
+            _ = ShowMfaDialogAsync();
+        }
+    }
+
+    /// <summary>The engine ended the MFA wait (or the connection went): the dialog closes, and the card shows what the engine said.</summary>
+    private void HideMfaDialog()
+    {
+        if (_mfaDialog is { } dialog)
+        {
+            _mfaEndedByEngine = true;
+            dialog.Hide();
+        }
+    }
+
+    /// <summary>Verify is usable for six digits, and not between the submit and the engine's next progress event.</summary>
+    private void UpdateMfaVerify()
+    {
+        if (_mfaDialog is { } dialog)
+        {
+            dialog.IsPrimaryButtonEnabled = !_mfaSubmitted && _mfaCode is { } box && box.Text.Length == 6;
+        }
+    }
+
+    /// <summary>
+    /// The StreamBIM MFA dialog: six digits from the authenticator app. Verify sends the code once
+    /// and the dialog stays open until the engine answers; Avbryt (or Esc) cancels the sign-in in the engine.
     /// </summary>
     private async Task ShowMfaDialogAsync()
     {
@@ -634,6 +711,7 @@ public sealed partial class SettingsPage : Page
         }
 
         _mfaEndedByEngine = false;
+        _mfaSubmitted = false;
         var code = new TextBox
         {
             MaxLength = 6,
@@ -642,6 +720,7 @@ public sealed partial class SettingsPage : Page
             IsTextPredictionEnabled = false,
         };
         AutomationProperties.SetName(code, Lang.T("Verifieringskod", "Verification code"));
+        _mfaCode = code;
 
         var body = new StackPanel { Spacing = 8 };
         body.Children.Add(Line(Lang.T(
@@ -671,19 +750,33 @@ public sealed partial class SettingsPage : Page
                 code.Text = digits;
                 return;
             }
-            dialog.IsPrimaryButtonEnabled = digits.Length == 6;
+            UpdateMfaVerify();
+        };
+
+        // The dialog does not close on Verify: it stays until the engine answers, so one code goes out.
+        dialog.PrimaryButtonClick += (sender, args) =>
+        {
+            args.Cancel = true;
+            if (_mfaSubmitted || code.Text.Length != 6)
+            {
+                return;
+            }
+
+            _mfaSubmitted = true;
+            UpdateMfaVerify();
+            _ = SubmitMfaCodeAsync(code.Text);
         };
 
         _mfaDialog = dialog;
-        ContentDialogResult answer;
         try
         {
-            answer = await dialog.ShowAsync();
+            await dialog.ShowAsync();
         }
         catch (Exception)
         {
             // Another dialog is open, or the window is closing. Nothing can be asked: the sign-in is cancelled.
             _mfaDialog = null;
+            _mfaCode = null;
             _ = await _engine.CancelSignInAsync(ProviderNames.StreamBim);
             MainWindow.Instance?.ShowMessage(
                 Lang.T("Kodfönstret kunde inte visas", "The code dialog could not be shown"),
@@ -693,22 +786,36 @@ public sealed partial class SettingsPage : Page
         }
 
         _mfaDialog = null;
+        _mfaCode = null;
         if (_mfaEndedByEngine)
         {
             // The engine ended the wait (signed in, failed or cancelled) and closed the dialog itself.
+            // A new prompt that came meanwhile (the dialog was still closing) opens now.
             RefreshAccounts();
+            ShowMfaDialogIfWanted();
             return;
         }
 
-        if (answer == ContentDialogResult.Primary)
+        // Closed by the user (Avbryt or Esc): that prompt is not shown again, and the engine's sign-in ends.
+        _mfaDismissedFor = _engine.SignInProgressFor(ProviderNames.StreamBim);
+        ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.StreamBim),
+            Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
+        RefreshAccounts();
+    }
+
+    /// <summary>
+    /// Sends the typed code once. The engine's next progress event decides what happens next: it
+    /// closes the dialog (signed in, failed, cancelled) or, after a new code prompt, re-enables Verify.
+    /// A refused code brings Verify back at once.
+    /// </summary>
+    private async Task SubmitMfaCodeAsync(string digits)
+    {
+        var ack = await _engine.SignInMfaAsync(ProviderNames.StreamBim, digits);
+        if (!ack.Ok)
         {
-            ReportIfFailed(await _engine.SignInMfaAsync(ProviderNames.StreamBim, code.Text),
-                Lang.T("Koden gick inte att skicka", "The code could not be sent"));
-        }
-        else
-        {
-            ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.StreamBim),
-                Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
+            _mfaSubmitted = false;
+            UpdateMfaVerify();
+            ReportIfFailed(ack, Lang.T("Koden gick inte att skicka", "The code could not be sent"));
         }
         RefreshAccounts();
     }
@@ -718,20 +825,25 @@ public sealed partial class SettingsPage : Page
     {
         if (progress.Provider == ProviderNames.StreamBim)
         {
+            // A new progress event answers the code that was sent: Verify is usable again until the next prompt.
+            _mfaSubmitted = false;
+            UpdateMfaVerify();
+
             switch (progress.State)
             {
                 case "mfa_required":
-                    _ = ShowMfaDialogAsync();
+                    ShowMfaDialogIfWanted();
+                    break;
+
+                case "failed":
+                    // The user starts over: the e-mail stays, the password is typed again.
+                    StreamBimPasswordBox.Password = string.Empty;
+                    HideMfaDialog();
                     break;
 
                 case "signed_in":
-                case "failed":
                 case "cancelled":
-                    if (_mfaDialog is not null)
-                    {
-                        _mfaEndedByEngine = true;
-                        _mfaDialog.Hide();
-                    }
+                    HideMfaDialog();
                     break;
             }
         }
@@ -751,7 +863,8 @@ public sealed partial class SettingsPage : Page
 
     /// <summary>
     /// Sends the Interaxo client id and redirect URI, and the secret when one is typed. The
-    /// secret box is emptied once it has been read: it is sent once, never kept on screen.
+    /// secret box is emptied only once the engine has accepted the secret; a refused save keeps
+    /// what was typed, so the user can correct it and save again.
     /// </summary>
     private async void OnSaveInteraxo(object sender, RoutedEventArgs args)
     {
@@ -764,7 +877,6 @@ public sealed partial class SettingsPage : Page
         var clientId = InteraxoClientIdBox.Text.Trim();
         var redirect = InteraxoRedirectBox.Text.Trim();
         var secret = InteraxoSecretBox.Password;
-        InteraxoSecretBox.Password = string.Empty;
 
         var ack = await _engine.SetSettingAsync("interaxo_client_id", clientId);
         if (ack.Ok)
@@ -774,6 +886,11 @@ public sealed partial class SettingsPage : Page
         if (ack.Ok && secret.Length > 0)
         {
             ack = await _engine.SetSettingAsync("interaxo_client_secret", secret);
+            if (ack.Ok && InteraxoSecretBox.Password == secret)
+            {
+                // Taken by the engine: the box does not keep it. (Text typed meanwhile stays.)
+                InteraxoSecretBox.Password = string.Empty;
+            }
         }
 
         if (ack.Ok)
@@ -799,6 +916,14 @@ public sealed partial class SettingsPage : Page
         DismissFailure(ProviderNames.Interaxo);
         ReportIfFailed(await _engine.SignInAsync(ProviderNames.Interaxo),
             Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+        RefreshAccounts();
+    }
+
+    /// <summary>Ends the browser sign-in that is waiting. The engine reports `cancelled`.</summary>
+    private async void OnInteraxoCancelSignIn(object sender, RoutedEventArgs args)
+    {
+        ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.Interaxo),
+            Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
         RefreshAccounts();
     }
 

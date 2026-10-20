@@ -226,7 +226,7 @@ public sealed partial class OverviewPage : Page
         // Routine progress is already in the transfer and queue cards. Showing its
         // changing one-liner here adds and removes a line in the hero every time a
         // quick transfer starts or finishes.
-        var text = status?.Text?.Trim() ?? string.Empty;
+        var text = StatusLine(status);
         var error = status?.Error;
         var echo = EchoTexts.Contains(text.TrimEnd('…', '.', ' '))
             || (!string.IsNullOrEmpty(error) && text.Contains(error, StringComparison.Ordinal));
@@ -248,7 +248,11 @@ public sealed partial class OverviewPage : Page
         SyncNowButton.IsEnabled = signedIn;
         StartEngineButton.Visibility = canStart ? Visibility.Visible : Visibility.Collapsed;
 
-        SignInCard.Visibility = connected && status is { SignedIn: false } ? Visibility.Visible : Visibility.Collapsed;
+        // Shown while nothing is signed in (ACC is then the account to sign in). Another
+        // provider signed in: the card stays hidden, and Settings has the rest.
+        var noAccount = connected && status is { SignedIn: false };
+        SignInCard.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
+        SignInSettingsButton.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
         if (signedIn)
         {
             SignInHint.Text = _signInHintDefault;
@@ -257,6 +261,27 @@ public sealed partial class OverviewPage : Page
         RefreshTransfers(status?.Transfers);
         RefreshQueue(status);
         RefreshStorage(status);
+    }
+
+    /// <summary>The engine's one-liner while any sign-in waits for a browser. It is generic: StreamBIM has no browser.</summary>
+    private const string BrowserWaitText = "Väntar på inloggning i webbläsaren…";
+
+    /// <summary>
+    /// The engine's one-liner. When StreamBIM is the only sign-in pending, the browser wait is
+    /// not what it is doing: the hero says it signs in to StreamBIM instead.
+    /// </summary>
+    private static string StatusLine(StatusInfo? status)
+    {
+        var text = status?.Text?.Trim() ?? string.Empty;
+        if (text == BrowserWaitText
+            && Engine.AccountFor(ProviderNames.StreamBim) is { SigningIn: true }
+            && Engine.AccountFor(ProviderNames.Acc) is not { SigningIn: true }
+            && Engine.AccountFor(ProviderNames.Interaxo) is not { SigningIn: true })
+        {
+            return Lang.T("Loggar in på StreamBIM…", "Signing in to StreamBIM…");
+        }
+
+        return text;
     }
 
     /// <summary>
@@ -656,6 +681,11 @@ public sealed partial class OverviewPage : Page
     private void OnChooseProjects(object sender, RoutedEventArgs e)
     {
         MainWindow.Instance?.NavigateTo(MainWindow.ProjectsTag);
+    }
+
+    private void OnOpenAccountSettings(object sender, RoutedEventArgs e)
+    {
+        MainWindow.Instance?.NavigateTo(MainWindow.SettingsTag);
     }
 
     /// <summary>A refused command goes to the window's message bar with the engine's reason.</summary>

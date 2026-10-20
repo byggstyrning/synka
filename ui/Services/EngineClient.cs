@@ -591,6 +591,13 @@ public sealed class EngineClient : INotifyPropertyChanged
             _isConnected = connected;
             _connectionState = state;
 
+            if (changedConnection)
+            {
+                // A sign-in progress belongs to the engine that reported it. After a disconnect
+                // or a reconnect the engine's state is read again from its status, not from this cache.
+                _signInProgress.Clear();
+            }
+
             if (!connected)
             {
                 ClearFreeUp();
