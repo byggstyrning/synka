@@ -260,6 +260,9 @@ struct St {
     moving: bool,
     /// A reset/move is draining workers or swapping paths; defer new mutation work.
     recovering: bool,
+    /// Providers that signed in during a reset or move. Their connect step (folders, poll
+    /// schedule, outbox) runs once that work has ended (`resume_deferred_connects`).
+    deferred_connects: HashSet<Provider>,
     /// Commands already admitted before recovery began must finish first.
     commands_running: usize,
     /// Partial recovery keeps affected paths/jobs paused until restart.
@@ -445,6 +448,7 @@ impl Engine {
             if live.restart_pending {
                 break;
             }
+            self.resume_deferred_connects();
             self.sync_provider(&live);
         }
 
@@ -785,7 +789,7 @@ impl Engine {
                     error: None,
                 });
                 if live.conn.is_some() {
-                    self.provider_connected(provider).await;
+                    self.connect_or_defer(provider).await;
                 } else if let Err(e) = self.go_online(live).await {
                     error!("kunde inte starta synk: {e:#}");
                     self.set_error(format!("{e:#}"));
@@ -832,6 +836,43 @@ impl Engine {
             error: Some("Tiden för koden gick ut – logga in igen.".into()),
         });
         self.publish();
+    }
+
+    /// A provider signed in while the sync root is registered. A rebuild or a sync root move
+    /// is running: its folders are made when that ends, not in the middle of it.
+    async fn connect_or_defer(self: &Arc<Self>, provider: Provider) {
+        {
+            let mut st = self.st();
+            if st.recovering || st.moving {
+                st.deferred_connects.insert(provider);
+                return;
+            }
+        }
+        self.provider_connected(provider).await;
+    }
+
+    /// Runs the connects deferred by `connect_or_defer` once no rebuild or move is running. The
+    /// work holds a maintenance guard, so a rebuild that starts later waits for it.
+    fn resume_deferred_connects(self: &Arc<Self>) {
+        if self.st().deferred_connects.is_empty() {
+            return;
+        }
+        let Some(guard) = self.try_maintenance_guard() else {
+            return;
+        };
+        let providers: Vec<Provider> = self.st().deferred_connects.drain().collect();
+        // A provider that signed out in the meantime gets no folders.
+        let providers: Vec<Provider> = providers
+            .into_iter()
+            .filter(|p| self.ctx.signed_in(*p))
+            .collect();
+        let me = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            for provider in providers {
+                me.provider_connected(provider).await;
+            }
+        });
     }
 
     /// A provider signed in while the sync root is already registered: its projects get their

@@ -1034,6 +1034,39 @@ async fn sign_in_steps_are_admitted_during_a_move() {
 }
 
 #[tokio::test]
+async fn a_sign_in_during_a_rebuild_makes_its_folders_after_the_rebuild() {
+    let mut f = fixture("connect-after-rebuild");
+    streambim_signed_in(&mut f, "app");
+    let sb = other_provider_project(&f, Provider::StreamBim);
+    let engine = Engine::new(f.ctx.clone());
+    let gate = engine.begin_recovery().unwrap();
+    engine.connect_or_defer(Provider::StreamBim).await;
+    {
+        let st = engine.st();
+        assert!(st.deferred_connects.contains(&Provider::StreamBim));
+        assert!(st.next_due.is_empty(), "no folder work during the rebuild");
+        assert!(st.outbox_next.is_none());
+    }
+    engine.resume_deferred_connects();
+    assert!(
+        engine.st().deferred_connects.contains(&Provider::StreamBim),
+        "the rebuild still runs"
+    );
+    drop(gate);
+    engine.resume_deferred_connects();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !engine.st().next_due.contains_key(&sb.pid) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deferred connect did not run");
+    let st = engine.st();
+    assert!(st.deferred_connects.is_empty());
+    assert!(st.outbox_next.is_some());
+}
+
+#[tokio::test]
 async fn a_second_code_while_one_is_being_checked_is_a_quiet_repeat() {
     let f = fixture("mfa-repeat");
     let engine = Engine::new(f.ctx.clone());
