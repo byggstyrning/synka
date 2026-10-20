@@ -619,9 +619,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streambim_and_interaxo_calls_reach_their_stubs() {
+    async fn streambim_calls_reach_the_streambim_client() {
+        let f = fixture("streambim");
+        let mut p = project(Provider::StreamBim);
+        p.meta =
+            Some(r#"{"region":"app","base":"https://app.streambim.com","project":"1552"}"#.into());
+        // Not signed in: the client fails with its auth error before any request is sent.
+        let err = folder_contents(&f.ctx, &p, "0").await.unwrap_err();
+        assert!(matches!(err, ApiError::Auth(_)), "{err}");
+        assert!(list_hubs(&f.ctx, Provider::StreamBim)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            set_reserved(&f.ctx, &p, "1", true).await,
+            Err(ApiError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn interaxo_calls_reach_their_stubs() {
         let f = fixture("stubs");
-        for provider in [Provider::StreamBim, Provider::Interaxo] {
+        for provider in [Provider::Interaxo] {
             let p = project(provider);
             let unsupported = |r: Result<(), ApiError>| {
                 assert!(

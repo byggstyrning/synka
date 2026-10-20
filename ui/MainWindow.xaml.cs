@@ -816,8 +816,8 @@ public sealed partial class MainWindow : Window
             "Du är fortfarande bunden av Autodesks egna villkor för ACC och ditt Autodesk-konto.",
             "You remain bound by Autodesk's own terms for ACC and your Autodesk account."));
         stack.Children.Add(NoticeParagraph(
-            "Synka skickar filinnehåll bara mellan den här datorn och Autodesk. Uppdateringskontrollen via internet är avstängd.",
-            "Synka sends file content only between this PC and Autodesk. The online update check is off."));
+            "Synka skickar filinnehåll bara mellan den här datorn och Autodesk.",
+            "Synka sends file content only between this PC and Autodesk."));
         stack.Children.Add(NoticeParagraph(
             "Autodesk, Autodesk Construction Cloud, Autodesk Docs, Autodesk Forma och Revit är registrerade varumärken eller varumärken som tillhör Autodesk, Inc. och/eller dess dotter- eller närstående bolag. Synka är en fristående produkt från Byggstyrning och är inte ansluten till, godkänd av eller sponsrad av Autodesk.",
             "Autodesk, Autodesk Construction Cloud, Autodesk Docs, Autodesk Forma and Revit are registered trademarks or trademarks of Autodesk, Inc., and/or its subsidiaries and/or affiliates. Synka is an independent product of Byggstyrning and is not affiliated with, endorsed by or sponsored by Autodesk.",
