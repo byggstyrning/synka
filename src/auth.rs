@@ -354,13 +354,12 @@ impl Auth {
     }
 
     /// Replace the stored Interaxo client (the caller makes sure the account is signed out).
-    #[allow(dead_code)] // the settings step calls it; tests use it now
     pub fn set_interaxo_client(&self, client: InteraxoClient) {
         *self.interaxo.write().unwrap_or_else(|e| e.into_inner()) = Some(client);
     }
 
     /// The stored Interaxo client; None for the ACC account.
-    #[allow(dead_code)] // the settings step reads it; tests use it now
+    #[cfg(test)]
     pub fn interaxo_client(&self) -> Option<InteraxoClient> {
         self.interaxo
             .read()

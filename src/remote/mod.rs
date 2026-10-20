@@ -16,7 +16,6 @@ use crate::model::{
 use std::path::Path;
 
 /// What a provider can do. The engine checks it to skip work the provider would refuse.
-#[allow(dead_code)] // read by the next step (skipping refused work); tests use it now
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
     pub mkdir: bool,
@@ -29,7 +28,6 @@ pub struct Caps {
 }
 
 /// The operations each provider offers (docs/PROVIDERS.md "Unsupported operations").
-#[allow(dead_code)] // see `Caps`
 pub fn caps(provider: Provider) -> Caps {
     match provider {
         Provider::Acc => Caps {

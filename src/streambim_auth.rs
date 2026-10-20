@@ -8,7 +8,6 @@
 
 // `login`, `verify_mfa`, `sign_out` and `LoginOutcome` are called by the sign-in commands of
 // the IPC layer, which is wired in a later step; until then only the tests call them.
-#![allow(dead_code)]
 
 use crate::auth::{dpapi_protect, dpapi_unprotect, UserInfo};
 use anyhow::{anyhow, bail, Context, Result};
@@ -37,7 +36,8 @@ const CODE_EXPIRED: &str = "Koden har gått ut – logga in igen.";
 /// What a password login leads to.
 #[derive(Debug)]
 pub enum LoginOutcome {
-    SignedIn(UserInfo),
+    /// The engine reads the cached profile (`user()`); the value is for callers that want it.
+    SignedIn(#[allow(dead_code)] UserInfo),
     /// The account has MFA: call `verify_mfa` with the TOTP code.
     MfaRequired,
 }

@@ -23,7 +23,6 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
-#[allow(dead_code)] // see `regions`
 const REGIONS_URL: &str = "https://global.streambim.com/regions.json";
 const REGIONS_TIMEOUT: Duration = Duration::from_secs(10);
 const JSON_API: &str = "application/vnd.api+json";
@@ -80,7 +79,6 @@ pub fn fallback_regions() -> Vec<Region> {
 
 /// The regions offered at sign-in: `regions.json`, or the built-in list when that fails or is
 /// empty.
-#[allow(dead_code)] // the region list of the sign-in form (ipc `streambim_regions`) is wired later
 pub async fn regions(client: &reqwest::Client) -> Vec<Region> {
     regions_from(client, REGIONS_URL).await
 }
