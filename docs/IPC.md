@@ -126,7 +126,8 @@ These pin down details the table above left open. The engine implements them as 
   the request had one. This covers invalid JSON, unknown `cmd`, and bad values.
 - **Validation.** `set_setting` ranges and types are checked in the engine's IPC layer (see
   `config::check_setting`). `open_folder` with `path` requires an absolute path.
-- **`hello`.** Reply order: ack (if `id`), then `status`, `settings` (when known), `projects`
+- **`hello`.** Reply order: ack (if `id`), then `status`, pending `sign_in_progress` (`browser` or
+  `mfa_required` of each provider, until its sign-in ends), `settings` (when known), `projects`
   (empty listing before the first refresh), `activity`. The reply comes from the engine's caches
   and does not wait for the engine. `hello` is never forwarded to the engine.
 - **Lag.** If a client falls behind the event queue, the engine resends `status`, `settings`,

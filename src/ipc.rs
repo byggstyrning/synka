@@ -15,7 +15,7 @@ use crate::model::{HubInfo, ProjectInfo, Provider};
 use crate::sync::sanitize_name;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -131,6 +131,9 @@ struct Cache {
     status: Option<Value>,
     settings: Option<Value>,
     projects: Option<Value>,
+    /// The pending `sign_in_progress` (`browser` or `mfa_required`) of each provider. A reconnecting
+    /// window needs it to reopen the MFA dialog or show the wait for the browser.
+    sign_in: HashMap<Provider, Value>,
     aps_client_id_validation: VecDeque<Value>,
     /// Newest first.
     activity: VecDeque<ActivityItem>,
@@ -205,12 +208,22 @@ impl IpcHub {
                 state,
                 error,
             } => {
-                self.emit(&json!({
+                let v = json!({
                     "type": "sign_in_progress",
                     "provider": provider.as_str(),
                     "state": state,
                     "error": error,
-                }));
+                });
+                {
+                    let mut cache = self.cache();
+                    if matches!(*state, "browser" | "mfa_required") {
+                        cache.sign_in.insert(*provider, v.clone());
+                    } else {
+                        // signed_in, failed or cancelled: the wait is over.
+                        cache.sign_in.remove(provider);
+                    }
+                }
+                self.emit(&v);
             }
             UiMsg::StreamBimRegions(regions) => {
                 self.emit(&json!({
@@ -287,7 +300,8 @@ impl IpcHub {
         self.emit(&json!({ "type": "activity", "items": [] }));
     }
 
-    /// The `hello` replies: status, settings (when known), projects, activity (newest first).
+    /// The `hello` replies: status, pending sign-in progress, settings (when known), projects,
+    /// activity (newest first).
     pub fn snapshot(&self) -> Vec<String> {
         let c = self.cache();
         let status = c.status.clone().unwrap_or_else(|| {
@@ -301,6 +315,11 @@ impl IpcHub {
             })
         });
         let mut out = vec![status];
+        out.extend(
+            Provider::ALL
+                .iter()
+                .filter_map(|p| c.sign_in.get(p).cloned()),
+        );
         if let Some(s) = &c.settings {
             out.push(s.clone());
         }
@@ -1175,6 +1194,84 @@ mod tests {
             "82e8eba6-50d1-4be0-a81f-000000000010"
         );
         assert!(events.iter().all(|event| event["state"] == "cancelled"));
+    }
+
+    #[test]
+    fn a_pending_sign_in_wait_is_replayed_to_a_new_window_until_it_ends() {
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let (cmds, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hello = |hub: &IpcHub| -> Vec<Value> {
+            handle_line(br#"{"cmd":"hello"}"#, hub, &cmds)
+                .iter()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect()
+        };
+        let sign_in =
+            |hub: &IpcHub, provider: Provider, state: &'static str, error: Option<&str>| {
+                hub.on_msg(&UiMsg::SignInProgress {
+                    provider,
+                    state,
+                    error: error.map(str::to_string),
+                });
+            };
+        let pending = |lines: &[Value]| -> Vec<Value> {
+            lines
+                .iter()
+                .filter(|v| v["type"] == "sign_in_progress")
+                .cloned()
+                .collect()
+        };
+        hub.on_msg(&UiMsg::Status(Status {
+            text: "Logga in".into(),
+            state: "signed_out",
+            sync_root: r"C:\Synka".into(),
+            engine_version: "test".into(),
+            ..Default::default()
+        }));
+        sign_in(&hub, Provider::StreamBim, "mfa_required", None);
+        let reply = hello(&hub);
+        assert_eq!(reply[0]["type"], "status", "the replay follows status");
+        assert_eq!(
+            pending(&reply),
+            vec![
+                json!({"type": "sign_in_progress", "provider": "streambim", "state": "mfa_required", "error": null})
+            ]
+        );
+        assert_eq!(reply[1]["type"], "sign_in_progress");
+
+        // Two providers waiting at once: one entry each, in account order.
+        sign_in(&hub, Provider::Acc, "browser", None);
+        let states: Vec<(String, String)> = pending(&hello(&hub))
+            .iter()
+            .map(|v| {
+                (
+                    v["provider"].as_str().unwrap().into(),
+                    v["state"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("acc".into(), "browser".into()),
+                ("streambim".into(), "mfa_required".into())
+            ]
+        );
+
+        // A terminal state ends the wait: it is not replayed any more.
+        sign_in(
+            &hub,
+            Provider::StreamBim,
+            "cancelled",
+            Some("Tiden för koden gick ut – logga in igen."),
+        );
+        assert_eq!(pending(&hello(&hub)).len(), 1);
+        sign_in(&hub, Provider::Acc, "signed_in", None);
+        assert!(pending(&hello(&hub)).is_empty());
+
+        sign_in(&hub, Provider::Interaxo, "browser", None);
+        sign_in(&hub, Provider::Interaxo, "failed", Some("HTTP 401"));
+        assert!(pending(&hello(&hub)).is_empty());
     }
 
     #[test]
