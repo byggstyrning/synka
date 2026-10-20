@@ -333,6 +333,7 @@ impl StreamBimAuth {
 
     /// Make the next `access_token` refresh whatever the current id token is. Prefer
     /// `invalidate_token`, which ignores a failure of a token that was already replaced.
+    #[cfg(test)]
     pub async fn invalidate(&self) {
         let _ = self.cached_tokens();
         if let Some(tokens) = self.st().tokens.as_mut() {

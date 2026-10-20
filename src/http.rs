@@ -7,7 +7,7 @@
 //!   HTTP date, capped 60 s), else exponential backoff 1,2,4 s with ±20 % jitter, max 3 retries.
 //!   Non-idempotent writes retry only explicit 429 rejection or a connection failure
 //!   before delivery. Ambiguous transport/408/5xx failures return to outbox reconciliation.
-//!   401: `auth.invalidate()` then retry once. 403/404/400/409: no retry.
+//!   401: `source.invalidate(token)` then retry once. 403/404/400/409: no retry.
 //! - User-Agent: "synka/<CARGO_PKG_VERSION>".
 //! - Log at debug: method, path (no query), status, elapsed ms. Never log bodies or tokens.
 
@@ -75,11 +75,13 @@ impl TokenSource {
         }
     }
 
-    /// Force a refresh on the next `access_token()` (used after a 401).
-    pub async fn invalidate(&self) {
+    /// Force a refresh on the next `access_token()` (used after a 401 for `failed`). StreamBIM
+    /// skips it when a concurrent refresh already replaced that token, so a burst of 401s
+    /// refreshes once.
+    pub async fn invalidate(&self, failed: &str) {
         match self {
             TokenSource::Aps(auth) => auth.invalidate().await,
-            TokenSource::StreamBim(auth) => auth.invalidate().await,
+            TokenSource::StreamBim(auth) => auth.invalidate_token(failed).await,
         }
     }
 }
@@ -302,7 +304,7 @@ impl Api {
             }
             if status == StatusCode::UNAUTHORIZED && !reauthed {
                 reauthed = true;
-                self.source.invalidate().await;
+                self.source.invalidate(&token).await;
                 continue;
             }
             if retryable(status)
@@ -355,7 +357,7 @@ impl Api {
             }
             if status == StatusCode::UNAUTHORIZED && !reauthed {
                 reauthed = true;
-                self.source.invalidate().await;
+                self.source.invalidate(&token).await;
                 continue;
             }
             return Err(ApiError::Status {
