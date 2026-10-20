@@ -23,7 +23,11 @@ public sealed record HeldDeleteInfo(string? ProjectId, string? Project, long Cou
 /// <summary>
 /// One document provider's account (docs\IPC.md, `status.accounts`). Provider is
 /// `acc`, `streambim` or `interaxo`. Configured is false when the provider cannot
-/// sign in yet (no client id). Host is the StreamBIM region host, or null.
+/// sign in yet (no client id). Host is the StreamBIM server's host (a region's
+/// `<subdomain>.streambim.com` or a custom address's host), or null.
+/// <c>account</c> is the StreamBIM account key (the region subdomain, or the lowercase
+/// host of a custom address) and null for the other providers. It is newer than the
+/// rest: an older engine leaves it out, and it arrives as null.
 /// </summary>
 public sealed record AccountInfo(
     string Provider,
@@ -32,7 +36,8 @@ public sealed record AccountInfo(
     bool SignedIn,
     bool SigningIn,
     UserInfo? User,
-    string? Host);
+    string? Host,
+    string? Account = null);
 
 /// <summary>
 /// The engine's own picture of the sync. Pushed on every change, throttled to 2/s.
@@ -101,8 +106,10 @@ public sealed record SettingsInfo(
 /// <summary>
 /// Progress of a sign-in (docs\IPC.md, `sign_in_progress`). State is `browser`,
 /// `mfa_required` (StreamBIM: send a code), `signed_in`, `failed` (Error set) or `cancelled`.
+/// <c>Account</c> is the StreamBIM account key the progress belongs to (null for the other
+/// providers, and from an older engine). Each StreamBIM account has its own progress.
 /// </summary>
-public sealed record SignInProgressInfo(string Provider, string State, string? Error);
+public sealed record SignInProgressInfo(string Provider, string State, string? Error, string? Account = null);
 
 /// <summary>One StreamBIM region: the subdomain is the region id sent with `sign_in`.</summary>
 public sealed record StreamBimRegion(string Subdomain, string Title, bool IsDefault);

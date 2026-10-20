@@ -118,7 +118,8 @@
                 </tk:SettingsExpander.Items>
             </tk:SettingsExpander>
 
-            <!-- StreamBIM: e-mail and password, with an MFA code when the account asks for one. -->
+            <!-- StreamBIM: one account per server. The cards of the accounts the engine reports (signed in,
+                 or signing in) are inserted above the form by RefreshStreamBimAccounts(); the form adds one more. -->
             <tk:SettingsExpander x:Name="StreamBimExpander"
                                  IsExpanded="True"
                                  Header="StreamBIM">
@@ -126,14 +127,36 @@
                     <FontIcon Glyph="&#xE8A5;" />
                 </tk:SettingsExpander.HeaderIcon>
                 <tk:SettingsExpander.Items>
-                    <tk:SettingsCard x:Name="StreamBimFormCard">
+                    <tk:SettingsCard x:Name="StreamBimFormCard"
+                                     Header="{loc:T Sv='Lägg till konto', En='Add account'}"
+                                     Description="{loc:T Sv='Ett konto per StreamBIM-server. Välj en region eller ange en egen adress.', En='One account per StreamBIM server. Choose a region or enter your own address.'}">
                         <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
                             <ComboBox x:Name="StreamBimRegionBox"
-                                      Header="{loc:T Sv='Region', En='Region'}"
+                                      Header="{loc:T Sv='Server', En='Server'}"
                                       PlaceholderText="{loc:T Sv='Hämtar regioner …', En='Fetching regions …'}"
                                       HorizontalAlignment="Stretch"
                                       SelectionChanged="OnStreamBimRegionChanged"
-                                      AutomationProperties.Name="{loc:T Sv='StreamBIM-region', En='StreamBIM region'}" />
+                                      AutomationProperties.Name="{loc:T Sv='StreamBIM-server', En='StreamBIM server'}" />
+                            <TextBox x:Name="StreamBimUrlBox"
+                                     Visibility="Collapsed"
+                                     Header="{loc:T Sv='Egen adress', En='Your own address'}"
+                                     PlaceholderText="https://streambim.exempel.se"
+                                     AcceptsReturn="False"
+                                     IsSpellCheckEnabled="False"
+                                     IsTextPredictionEnabled="False"
+                                     TextChanged="OnStreamBimFieldChanged"
+                                     AutomationProperties.Name="{loc:T Sv='StreamBIM-adress', En='StreamBIM address'}" />
+                            <TextBlock x:Name="StreamBimUrlWarning"
+                                       Visibility="Collapsed"
+                                       Text="{loc:T Sv='Lösenordet skickas till den här adressen. Använd bara adresser du litar på.', En='The password is sent to this address. Use only addresses you trust.'}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                            <TextBlock x:Name="StreamBimUrlError"
+                                       Visibility="Collapsed"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
                             <TextBox x:Name="StreamBimEmailBox"
                                      Header="{loc:T Sv='E-post', En='E-mail'}"
                                      MaxLength="256"
@@ -147,11 +170,10 @@
                                          PasswordChanged="OnStreamBimPasswordChanged"
                                          AutomationProperties.Name="{loc:T Sv='StreamBIM lösenord', En='StreamBIM password'}" />
                             <InfoBar x:Name="StreamBimError"
-                                     Tag="streambim"
                                      Severity="Error"
                                      IsOpen="False"
                                      IsClosable="True"
-                                     Closed="OnProviderErrorClosed" />
+                                     Closed="OnStreamBimErrorClosed" />
                             <Button x:Name="StreamBimSignInButton"
                                     Content="{loc:T Sv='Logga in', En='Sign in'}"
                                     HorizontalAlignment="Left"
@@ -162,12 +184,6 @@
                                        TextWrapping="Wrap"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         </StackPanel>
-                    </tk:SettingsCard>
-                    <tk:SettingsCard x:Name="StreamBimSignedInCard">
-                        <Button x:Name="StreamBimSignOutButton"
-                                Content="{loc:T Sv='Logga ut', En='Sign out'}"
-                                AutomationProperties.Name="{loc:T Sv='Logga ut från StreamBIM', En='Sign out of StreamBIM'}"
-                                Click="OnStreamBimSignOut" />
                     </tk:SettingsCard>
                 </tk:SettingsExpander.Items>
             </tk:SettingsExpander>
