@@ -1135,6 +1135,7 @@ mod tests {
             id: "b.h1".into(),
             name: "Byggfirma: Syd".into(),
             region: None,
+            provider: crate::model::Provider::Acc,
         };
         let p1 = ProjectInfo {
             id: "b.p1".into(),
@@ -1142,6 +1143,8 @@ mod tests {
             name: "Kv 5".into(),
             root_folder_urn: None,
             scopes: vec![],
+            provider: crate::model::Provider::Acc,
+            meta: None,
         };
         let p2 = ProjectInfo {
             id: "b.p2".into(),
@@ -1149,6 +1152,8 @@ mod tests {
             name: "Aa".into(),
             root_folder_urn: None,
             scopes: vec![],
+            provider: crate::model::Provider::Acc,
+            meta: None,
         };
         let hubs: HubList = vec![(hub, vec![(p1, true), (p2, false)])];
         let v = projects_json(&hubs, false, Path::new(r"C:\Synka"));

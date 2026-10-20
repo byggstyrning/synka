@@ -1,10 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using CommunityToolkit.WinUI.Controls;
 using Synka.Services;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Windows.Storage.Pickers;
 
@@ -44,8 +47,26 @@ public sealed partial class SettingsPage : Page
     /// <summary>A refusal of the last update command, shown until the engine says something newer.</summary>
     private string? _updateProblem;
 
-    /// <summary>Sign-in was started and the engine does not yet report an account.</summary>
-    private bool _signInStarted;
+    /// <summary>The StreamBIM region the user picked (its subdomain). Null until they pick one: the engine's default is used then.</summary>
+    private string? _streamBimRegionChoice;
+
+    /// <summary>True while the region list is rebuilt: the ComboBox's selection is then not the user's choice.</summary>
+    private bool _populatingRegions;
+
+    /// <summary>The user has typed in the Interaxo fields since the last save: the engine's values then wait.</summary>
+    private bool _interaxoEdited;
+
+    /// <summary>The StreamBIM MFA dialog while it is open. Null otherwise.</summary>
+    private ContentDialog? _mfaDialog;
+
+    /// <summary>The engine ended the MFA wait (signed in, failed or cancelled), so closing the dialog must not cancel again.</summary>
+    private bool _mfaEndedByEngine;
+
+    /// <summary>
+    /// The failure a provider's card no longer shows: closed by the user, or superseded by a
+    /// retry. The same failure does not come back on the next status; a new one (a new message) does.
+    /// </summary>
+    private readonly Dictionary<string, SignInProgressInfo> _dismissedFailures = new();
 
     /// <summary>True from Flytta… until the engine has answered: the folder buttons wait meanwhile.</summary>
     private bool _choosingFolder;
@@ -79,11 +100,28 @@ public sealed partial class SettingsPage : Page
         _attached = true;
 
         _engine.PropertyChanged += OnEngineChanged;
+        _engine.SignInProgress += OnSignInProgress;
+        _engine.StreamBimRegionsChanged += OnStreamBimRegionsChanged;
         _engine.Notified += OnApsClientIdNotified;
-        RefreshAccount();
         RefreshSettings();
+        RefreshAccounts();
         RefreshEnabled();
         ShowUpdate();
+
+        // The cached list shows at once; the engine's list follows when it answers.
+        ShowStreamBimRegions(_engine.StreamBimRegions);
+        RequestStreamBimRegions();
+
+        // A signed-in provider's card starts folded; one that needs the user starts open.
+        AccExpander.IsExpanded = _engine.AccountFor(ProviderNames.Acc) is not { SignedIn: true };
+        StreamBimExpander.IsExpanded = _engine.AccountFor(ProviderNames.StreamBim) is not { SignedIn: true };
+        InteraxoExpander.IsExpanded = _engine.AccountFor(ProviderNames.Interaxo) is not { SignedIn: true };
+
+        // The engine may be waiting for an MFA code that was asked for while this page was closed.
+        if (_engine.SignInProgressFor(ProviderNames.StreamBim) is { State: "mfa_required" })
+        {
+            _ = ShowMfaDialogAsync();
+        }
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs args)
@@ -95,6 +133,8 @@ public sealed partial class SettingsPage : Page
         _attached = false;
 
         _engine.PropertyChanged -= OnEngineChanged;
+        _engine.SignInProgress -= OnSignInProgress;
+        _engine.StreamBimRegionsChanged -= OnStreamBimRegionsChanged;
         _engine.Notified -= OnApsClientIdNotified;
     }
 
@@ -125,41 +165,26 @@ public sealed partial class SettingsPage : Page
                 RefreshEnabled();
                 break;
 
+            // Status (accounts included) comes up to twice a second: the account cards and
+            // the APS editor follow it, and the folder card with the signed-in state.
             case nameof(EngineClient.Status):
-                RefreshAccount();
+                RefreshFolder();
+                RefreshApsClientIdControls();
                 break;
 
             case nameof(EngineClient.IsConnected):
+                RefreshFolder();
+                RefreshEnabled();
+                ShowUpdate();
+                RequestStreamBimRegions();
+                break;
+
             case nameof(EngineClient.IsSignedIn):
-                RefreshAccount();
+                RefreshFolder();
                 RefreshEnabled();
                 ShowUpdate();
                 break;
         }
-    }
-
-    private void RefreshAccount()
-    {
-        var status = _engine.IsConnected ? _engine.Status : null;
-        if (status is { SignedIn: true })
-        {
-            _signInStarted = false;
-        }
-
-        AccountText.Text = !_engine.IsConnected
-            ? Lang.T("Ingen kontakt med motorn.", "No contact with the engine.")
-            : status is null
-                ? Lang.T("Hämtar kontot …", "Fetching the account …")
-                : status.SignedIn
-                    ? AccountLabel(status)
-                    : _signInStarted
-                        ? Lang.T("Slutför inloggningen i webbläsaren.", "Finish signing in in the browser.")
-                        : Lang.T("Inte inloggad.", "Not signed in.");
-        SignInButton.Visibility = status is { SignedIn: false } ? Visibility.Visible : Visibility.Collapsed;
-        SignOutButton.Visibility = status is { SignedIn: true } ? Visibility.Visible : Visibility.Collapsed;
-
-        RefreshFolder();
-        RefreshApsClientIdControls();
     }
 
     /// <summary>Copies the engine's last settings into the controls.</summary>
@@ -196,11 +221,43 @@ public sealed partial class SettingsPage : Page
             {
                 AutoUpdateSwitch.IsOn = autoUpdate;
             }
+
+            RefreshInteraxoSettings(settings);
         }
         finally
         {
             _mirroring = false;
         }
+    }
+
+    /// <summary>
+    /// Copies the engine's Interaxo client settings into their boxes, unless the user has
+    /// typed in them since the last save. The redirect URI shows only when it is not the
+    /// default: the default is the box's placeholder, and a blank box saves the default.
+    /// </summary>
+    private void RefreshInteraxoSettings(SettingsInfo settings)
+    {
+        var defaultRedirect = settings.InteraxoRedirectUriDefault ?? string.Empty;
+        if (!_interaxoEdited)
+        {
+            var effective = settings.InteraxoRedirectUri ?? string.Empty;
+            var redirectText = string.Equals(effective, defaultRedirect, StringComparison.Ordinal) ? string.Empty : effective;
+            var clientIdText = settings.InteraxoClientId ?? string.Empty;
+            if (InteraxoClientIdBox.Text != clientIdText)
+            {
+                InteraxoClientIdBox.Text = clientIdText;
+            }
+            if (InteraxoRedirectBox.Text != redirectText)
+            {
+                InteraxoRedirectBox.Text = redirectText;
+            }
+        }
+
+        InteraxoRedirectBox.PlaceholderText = defaultRedirect;
+        InteraxoSecretBox.PlaceholderText = settings.InteraxoClientSecretSet
+            ? Lang.T("Sparad – lämna tomt för att behålla", "Saved – leave blank to keep it")
+            : Lang.T("Valfri, om Interaxo utfärdar en hemlighet", "Optional, if Interaxo issues a secret");
+        Show(InteraxoClearSecretButton, settings.InteraxoClientSecretSet);
     }
 
     private static void SetNumber(NumberBox box, int value)
@@ -215,8 +272,6 @@ public sealed partial class SettingsPage : Page
     private void RefreshEnabled()
     {
         var connected = _engine.IsConnected;
-        SignInButton.IsEnabled = connected;
-        SignOutButton.IsEnabled = connected;
         OpenFolderButton.IsEnabled = connected;
         StartAtLoginSwitch.IsEnabled = connected;
         PropagateSwitch.IsEnabled = connected;
@@ -234,35 +289,526 @@ public sealed partial class SettingsPage : Page
         RefreshApsClientIdControls();
     }
 
-    private static string AccountLabel(StatusInfo status)
+    // ------------------------------------------------------------- accounts
+
+    /// <summary>
+    /// Writes every provider's state into its card and what the user may still do there.
+    /// Runs with each status and sign-in message, so it writes only the values that changed.
+    /// </summary>
+    private void RefreshAccounts()
     {
-        var parts = new[] { status.User?.Name, status.User?.Email }
-            .Where(part => !string.IsNullOrWhiteSpace(part));
-        var label = string.Join(" · ", parts);
-        return label.Length > 0 ? label : Lang.T("Inloggad.", "Signed in.");
+        RefreshAccAccount();
+        RefreshStreamBimAccount();
+        RefreshInteraxoAccount();
     }
 
-    // ----------------------------------------------------------- account, folder
-
-    private async void OnSignIn(object sender, RoutedEventArgs args)
+    private void RefreshAccAccount()
     {
-        var ack = await _engine.SignInAsync();
-        if (ack.Ok)
+        var connected = _engine.IsConnected;
+        var account = connected ? _engine.AccountFor(ProviderNames.Acc) : null;
+        var signedIn = account is { SignedIn: true };
+
+        SetDescription(AccExpander,
+            !connected ? NoContactText
+            : account is null ? Lang.T("Hämtar kontot …", "Fetching the account …")
+            : account.SigningIn ? Lang.T("Väntar på webbläsaren…", "Waiting for the browser…")
+            : signedIn ? SignedInAs(account.User)
+            : Lang.T("Inte inloggad", "Not signed in"));
+
+        Show(AccSignInButton, account is { SignedIn: false });
+        Show(AccSignOutButton, signedIn);
+        AccSignInButton.IsEnabled = connected
+            && account is { Configured: true, SignedIn: false, SigningIn: false }
+            && !_apsClientIdEdit.IsWaiting;
+        AccSignOutButton.IsEnabled = connected && signedIn;
+        ShowFailure(AccError, ProviderNames.Acc);
+    }
+
+    private void RefreshStreamBimAccount()
+    {
+        var connected = _engine.IsConnected;
+        var account = connected ? _engine.AccountFor(ProviderNames.StreamBim) : null;
+        var signedIn = account is { SignedIn: true };
+        var editable = account is { SignedIn: false, SigningIn: false };
+
+        string state;
+        if (!connected)
         {
-            // The answer is a `status` once the browser is done; until then the account line says what to do.
-            _signInStarted = true;
-            RefreshAccount();
+            state = NoContactText;
+        }
+        else if (_engine.Status is null)
+        {
+            state = Lang.T("Hämtar kontot …", "Fetching the account …");
+        }
+        else if (account is null)
+        {
+            // An older engine has no StreamBIM at all.
+            state = Lang.T("Uppdatera motorn för att logga in här.", "Update the engine to sign in here.");
+        }
+        else if (signedIn)
+        {
+            var host = string.IsNullOrWhiteSpace(account.Host) ? string.Empty : " · " + account.Host;
+            state = SignedInAs(account.User) + host;
+        }
+        else if (account.SigningIn)
+        {
+            state = _engine.SignInProgressFor(ProviderNames.StreamBim)?.State == "mfa_required"
+                ? Lang.T("Väntar på koden från autentiseringsappen…", "Waiting for the code from your authenticator app…")
+                : Lang.T("Loggar in …", "Signing in …");
         }
         else
         {
-            ReportIfFailed(ack, Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+            state = Lang.T("Inte inloggad", "Not signed in");
+        }
+        SetDescription(StreamBimExpander, state);
+
+        Show(StreamBimFormCard, !signedIn);
+        Show(StreamBimSignedInCard, signedIn);
+        StreamBimRegionBox.IsEnabled = editable;
+        StreamBimEmailBox.IsEnabled = editable;
+        StreamBimPasswordBox.IsEnabled = editable;
+        StreamBimSignInButton.IsEnabled = editable
+            && SelectedRegion() is not null
+            && StreamBimEmailBox.Text.Trim().Length > 0
+            && StreamBimPasswordBox.Password.Length > 0;
+        StreamBimSignOutButton.IsEnabled = connected && signedIn;
+        ShowFailure(StreamBimError, ProviderNames.StreamBim);
+    }
+
+    private void RefreshInteraxoAccount()
+    {
+        var connected = _engine.IsConnected;
+        var account = connected ? _engine.AccountFor(ProviderNames.Interaxo) : null;
+        var signedIn = account is { SignedIn: true };
+
+        string state;
+        if (!connected)
+        {
+            state = NoContactText;
+        }
+        else if (_engine.Status is null)
+        {
+            state = Lang.T("Hämtar kontot …", "Fetching the account …");
+        }
+        else if (account is null)
+        {
+            state = Lang.T("Uppdatera motorn för att logga in här.", "Update the engine to sign in here.");
+        }
+        else if (signedIn)
+        {
+            state = SignedInAs(account.User);
+        }
+        else if (account.SigningIn)
+        {
+            state = Lang.T("Väntar på webbläsaren…", "Waiting for the browser…");
+        }
+        else if (!account.Configured)
+        {
+            state = Lang.T("Ange en Client ID nedan först.", "Enter a client ID below first.");
+        }
+        else
+        {
+            state = Lang.T("Inte inloggad", "Not signed in");
+        }
+        SetDescription(InteraxoExpander, state);
+
+        Show(InteraxoSignInButton, account is { SignedIn: false });
+        Show(InteraxoSignOutButton, signedIn);
+        InteraxoSignInButton.IsEnabled = account is { SignedIn: false, SigningIn: false, Configured: true };
+        InteraxoSignOutButton.IsEnabled = connected && signedIn;
+
+        // The client settings change only while Interaxo is signed out (docs\IPC.md).
+        var editable = account is { SignedIn: false, SigningIn: false };
+        InteraxoClientIdBox.IsEnabled = editable;
+        InteraxoRedirectBox.IsEnabled = editable;
+        InteraxoSecretBox.IsEnabled = editable;
+        InteraxoSaveButton.IsEnabled = editable;
+        InteraxoClearSecretButton.IsEnabled = editable;
+        ShowFailure(InteraxoError, ProviderNames.Interaxo);
+    }
+
+    /// <summary>
+    /// Shows a provider's failed sign-in in its card, once. A failure the user has closed or
+    /// already retried stays hidden until the engine reports a new one.
+    /// </summary>
+    private void ShowFailure(InfoBar bar, string provider)
+    {
+        var progress = _engine.SignInProgressFor(provider);
+        var failed = progress is { State: "failed" }
+            && !(_dismissedFailures.TryGetValue(provider, out var dismissed) && ReferenceEquals(dismissed, progress));
+
+        var message = string.Empty;
+        if (failed)
+        {
+            message = ErrorDisplay.FriendlyDetail(progress!.Error);
+            if (message.Length == 0)
+            {
+                message = Lang.T("Inloggningen misslyckades.", "Sign-in failed.");
+            }
+        }
+
+        if (bar.Message != message)
+        {
+            bar.Message = message;
+        }
+        if (bar.IsOpen != failed)
+        {
+            bar.IsOpen = failed;
         }
     }
 
-    private async void OnSignOut(object sender, RoutedEventArgs args)
+    /// <summary>Remembers the failure on screen as seen: a new sign-in attempt hides the old message.</summary>
+    private void DismissFailure(string provider)
     {
-        ReportIfFailed(await _engine.SignOutAsync(), Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
+        if (_engine.SignInProgressFor(provider) is { } progress)
+        {
+            _dismissedFailures[provider] = progress;
+        }
     }
+
+    private void OnProviderErrorClosed(InfoBar sender, InfoBarClosedEventArgs args)
+    {
+        if (sender.Tag is string provider)
+        {
+            DismissFailure(provider);
+        }
+    }
+
+    /// <summary>The state of an account in words: "Inloggad som Anna (anna@firma.se)".</summary>
+    private static string SignedInAs(UserInfo? user)
+    {
+        var who = ProviderNames.Who(user);
+        return who.Length == 0
+            ? Lang.T("Inloggad.", "Signed in.")
+            : Lang.T($"Inloggad som {who}", $"Signed in as {who}");
+    }
+
+    private static string NoContactText => Lang.T("Ingen kontakt med motorn.", "No contact with the engine.");
+
+    private static void Show(UIElement element, bool visible)
+    {
+        var wanted = visible ? Visibility.Visible : Visibility.Collapsed;
+        if (element.Visibility != wanted)
+        {
+            element.Visibility = wanted;
+        }
+    }
+
+    private static void SetDescription(SettingsExpander expander, string text)
+    {
+        if (!Equals(expander.Description, text))
+        {
+            expander.Description = text;
+        }
+    }
+
+    // ----------------------------------------------------------- sign-in actions
+
+    private async void OnAccSignIn(object sender, RoutedEventArgs args)
+    {
+        DismissFailure(ProviderNames.Acc);
+        ReportIfFailed(await _engine.SignInAsync(ProviderNames.Acc),
+            Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+        RefreshAccounts();
+    }
+
+    private async void OnAccSignOut(object sender, RoutedEventArgs args)
+    {
+        ReportIfFailed(await _engine.SignOutAsync(ProviderNames.Acc),
+            Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
+    }
+
+    /// <summary>The region the user picked, or the engine's default; null when the list is empty.</summary>
+    private string? SelectedRegion() =>
+        StreamBimRegionBox.SelectedItem is ComboBoxItem { Tag: string tag } && tag.Length > 0 ? tag : null;
+
+    /// <summary>
+    /// The password goes to the engine once. Its box is emptied before the command is built,
+    /// so it is not left on screen, and nothing keeps it after the command has gone.
+    /// </summary>
+    private async void OnStreamBimSignIn(object sender, RoutedEventArgs args)
+    {
+        var region = SelectedRegion();
+        var username = StreamBimEmailBox.Text.Trim();
+        var password = StreamBimPasswordBox.Password;
+        StreamBimPasswordBox.Password = string.Empty;
+        if (region is null || username.Length == 0 || password.Length == 0)
+        {
+            RefreshAccounts();
+            return;
+        }
+
+        DismissFailure(ProviderNames.StreamBim);
+        RefreshAccounts();
+        var ack = await _engine.SignInStreamBimAsync(region, username, password);
+        ReportIfFailed(ack, Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+        RefreshAccounts();
+    }
+
+    private async void OnStreamBimSignOut(object sender, RoutedEventArgs args)
+    {
+        ReportIfFailed(await _engine.SignOutAsync(ProviderNames.StreamBim),
+            Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
+    }
+
+    private void OnStreamBimRegionChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (!_populatingRegions && SelectedRegion() is { } region)
+        {
+            _streamBimRegionChoice = region;
+        }
+        RefreshAccounts();
+    }
+
+    private void OnStreamBimFieldChanged(object sender, TextChangedEventArgs args) => RefreshAccounts();
+
+    private void OnStreamBimPasswordChanged(object sender, RoutedEventArgs args) => RefreshAccounts();
+
+    private void RequestStreamBimRegions()
+    {
+        if (_engine.IsConnected)
+        {
+            _ = RequestStreamBimRegionsAsync();
+        }
+    }
+
+    private async Task RequestStreamBimRegionsAsync()
+    {
+        ReportIfFailed(await _engine.RequestStreamBimRegionsAsync(),
+            Lang.T("Regionerna gick inte att hämta", "The regions could not be fetched"));
+    }
+
+    private void OnStreamBimRegionsChanged(StreamBimRegionsInfo regions) => ShowStreamBimRegions(regions);
+
+    /// <summary>
+    /// Fills the region list. The user's choice stays when the list still has it; otherwise the
+    /// engine's default (is_default) is preselected.
+    /// </summary>
+    private void ShowStreamBimRegions(StreamBimRegionsInfo? info)
+    {
+        var regions = (info?.Regions ?? Array.Empty<StreamBimRegion>())
+            .Where(region => region is not null && !string.IsNullOrWhiteSpace(region.Subdomain))
+            .ToList();
+        var fallback = regions.FirstOrDefault(region => region.IsDefault) ?? regions.FirstOrDefault();
+        var keep = _streamBimRegionChoice is { } chosen && regions.Any(region => region.Subdomain == chosen)
+            ? chosen
+            : fallback?.Subdomain;
+
+        _populatingRegions = true;
+        try
+        {
+            StreamBimRegionBox.Items.Clear();
+            ComboBoxItem? selected = null;
+            foreach (var region in regions)
+            {
+                var item = new ComboBoxItem
+                {
+                    Content = string.IsNullOrWhiteSpace(region.Title) ? region.Subdomain : region.Title,
+                    Tag = region.Subdomain,
+                };
+                StreamBimRegionBox.Items.Add(item);
+                if (region.Subdomain == keep)
+                {
+                    selected = item;
+                }
+            }
+            StreamBimRegionBox.SelectedItem = selected;
+        }
+        finally
+        {
+            _populatingRegions = false;
+        }
+
+        RefreshAccounts();
+    }
+
+    /// <summary>
+    /// The StreamBIM MFA dialog: six digits from the authenticator app. Verify sends the code;
+    /// Cancel (or closing the dialog) cancels the sign-in in the engine.
+    /// </summary>
+    private async Task ShowMfaDialogAsync()
+    {
+        if (_mfaDialog is not null || XamlRoot is not { } root)
+        {
+            return;
+        }
+
+        _mfaEndedByEngine = false;
+        var code = new TextBox
+        {
+            MaxLength = 6,
+            PlaceholderText = "000000",
+            IsSpellCheckEnabled = false,
+            IsTextPredictionEnabled = false,
+        };
+        AutomationProperties.SetName(code, Lang.T("Verifieringskod", "Verification code"));
+
+        var body = new StackPanel { Spacing = 8 };
+        body.Children.Add(Line(Lang.T(
+            "Skriv in de sex siffrorna från din autentiseringsapp för StreamBIM.",
+            "Enter the six digits from your authenticator app for StreamBIM.")));
+        body.Children.Add(code);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = root,
+            // The dialog hangs in the popup root and does not inherit the theme choice.
+            RequestedTheme = MainWindow.CurrentTheme,
+            Title = Lang.T("Ange koden från din autentiseringsapp", "Enter the code from your authenticator app"),
+            Content = body,
+            PrimaryButtonText = Lang.T("Verifiera", "Verify"),
+            CloseButtonText = Lang.T("Avbryt", "Cancel"),
+            DefaultButton = ContentDialogButton.Primary,
+            IsPrimaryButtonEnabled = false,
+        };
+
+        // Digits only, six at most: the engine refuses anything else.
+        code.TextChanged += (_, _) =>
+        {
+            var digits = new string(code.Text.Where(character => character is >= '0' and <= '9').Take(6).ToArray());
+            if (digits != code.Text)
+            {
+                code.Text = digits;
+                return;
+            }
+            dialog.IsPrimaryButtonEnabled = digits.Length == 6;
+        };
+
+        _mfaDialog = dialog;
+        ContentDialogResult answer;
+        try
+        {
+            answer = await dialog.ShowAsync();
+        }
+        catch (Exception)
+        {
+            // Another dialog is open, or the window is closing. Nothing can be asked: the sign-in is cancelled.
+            _mfaDialog = null;
+            _ = await _engine.CancelSignInAsync(ProviderNames.StreamBim);
+            MainWindow.Instance?.ShowMessage(
+                Lang.T("Kodfönstret kunde inte visas", "The code dialog could not be shown"),
+                Lang.T("Logga in på StreamBIM igen för att försöka på nytt.", "Sign in to StreamBIM again to try again."),
+                InfoBarSeverity.Warning);
+            return;
+        }
+
+        _mfaDialog = null;
+        if (_mfaEndedByEngine)
+        {
+            // The engine ended the wait (signed in, failed or cancelled) and closed the dialog itself.
+            RefreshAccounts();
+            return;
+        }
+
+        if (answer == ContentDialogResult.Primary)
+        {
+            ReportIfFailed(await _engine.SignInMfaAsync(ProviderNames.StreamBim, code.Text),
+                Lang.T("Koden gick inte att skicka", "The code could not be sent"));
+        }
+        else
+        {
+            ReportIfFailed(await _engine.CancelSignInAsync(ProviderNames.StreamBim),
+                Lang.T("Inloggningen gick inte att avbryta", "The sign-in could not be cancelled"));
+        }
+        RefreshAccounts();
+    }
+
+    /// <summary>Every sign-in message: the MFA dialog opens or closes, and the cards take the new state.</summary>
+    private void OnSignInProgress(SignInProgressInfo progress)
+    {
+        if (progress.Provider == ProviderNames.StreamBim)
+        {
+            switch (progress.State)
+            {
+                case "mfa_required":
+                    _ = ShowMfaDialogAsync();
+                    break;
+
+                case "signed_in":
+                case "failed":
+                case "cancelled":
+                    if (_mfaDialog is not null)
+                    {
+                        _mfaEndedByEngine = true;
+                        _mfaDialog.Hide();
+                    }
+                    break;
+            }
+        }
+
+        RefreshAccounts();
+    }
+
+    // ---------------------------------------------------------- Interaxo settings
+
+    private void OnInteraxoFieldChanged(object sender, TextChangedEventArgs args)
+    {
+        if (!_mirroring)
+        {
+            _interaxoEdited = true;
+        }
+    }
+
+    /// <summary>
+    /// Sends the Interaxo client id and redirect URI, and the secret when one is typed. The
+    /// secret box is emptied once it has been read: it is sent once, never kept on screen.
+    /// </summary>
+    private async void OnSaveInteraxo(object sender, RoutedEventArgs args)
+    {
+        var account = _engine.IsConnected ? _engine.AccountFor(ProviderNames.Interaxo) : null;
+        if (account is not { SignedIn: false, SigningIn: false })
+        {
+            return;
+        }
+
+        var clientId = InteraxoClientIdBox.Text.Trim();
+        var redirect = InteraxoRedirectBox.Text.Trim();
+        var secret = InteraxoSecretBox.Password;
+        InteraxoSecretBox.Password = string.Empty;
+
+        var ack = await _engine.SetSettingAsync("interaxo_client_id", clientId);
+        if (ack.Ok)
+        {
+            ack = await _engine.SetSettingAsync("interaxo_redirect_uri", redirect);
+        }
+        if (ack.Ok && secret.Length > 0)
+        {
+            ack = await _engine.SetSettingAsync("interaxo_client_secret", secret);
+        }
+
+        if (ack.Ok)
+        {
+            // The engine's settings event brings the saved values back into the boxes.
+            _interaxoEdited = false;
+        }
+        else
+        {
+            ReportIfFailed(ack, Lang.T("Interaxo-inställningen gick inte igenom", "The Interaxo setting did not go through"));
+        }
+    }
+
+    /// <summary>Removes the saved client secret. The engine refuses it while Interaxo is signed in.</summary>
+    private async void OnClearInteraxoSecret(object sender, RoutedEventArgs args)
+    {
+        ReportIfFailed(await _engine.SetSettingAsync("interaxo_client_secret", string.Empty),
+            Lang.T("Hemligheten gick inte att ta bort", "The secret could not be removed"));
+    }
+
+    private async void OnInteraxoSignIn(object sender, RoutedEventArgs args)
+    {
+        DismissFailure(ProviderNames.Interaxo);
+        ReportIfFailed(await _engine.SignInAsync(ProviderNames.Interaxo),
+            Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
+        RefreshAccounts();
+    }
+
+    private async void OnInteraxoSignOut(object sender, RoutedEventArgs args)
+    {
+        ReportIfFailed(await _engine.SignOutAsync(ProviderNames.Interaxo),
+            Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
+    }
+
+    // ----------------------------------------------------------- folder
 
     private async void OnOpenFolder(object sender, RoutedEventArgs args)
     {
@@ -322,7 +868,8 @@ public sealed partial class SettingsPage : Page
         ApsClientIdCancelButton.Visibility = _apsClientIdEdit.IsTesting ? Visibility.Visible : Visibility.Collapsed;
         ApsClientIdCancelButton.IsEnabled = connected && _apsClientIdEdit.IsTesting;
         ApsClientIdProgress.IsActive = _apsClientIdEdit.IsWaiting;
-        SignInButton.IsEnabled = connected && !_apsClientIdEdit.IsWaiting;
+        // ACC sign-in waits for an APS test or save in progress: the account cards follow it here.
+        RefreshAccounts();
 
         ApsClientIdStatus.Text = !connected
             ? Lang.T("Ingen kontakt med motorn. Ditt utkast behålls.", "No contact with the engine. Your draft is kept.")
@@ -575,8 +1122,8 @@ public sealed partial class SettingsPage : Page
             IsTextSelectionEnabled = true,
         });
         body.Children.Add(Line(Lang.T(
-            "Alla projekt byggs om där från ACC. Filerna laddas ner igen när du öppnar dem.",
-            "Every project is rebuilt there from ACC. The files are downloaded again when you open them.")));
+            "Alla projekt byggs om där från molnet. Filerna laddas ner igen när du öppnar dem.",
+            "Every project is rebuilt there from the cloud. The files are downloaded again when you open them.")));
         body.Children.Add(Line(Lang.T(
             "Ändringar som inte hunnit synkas sparas först i mappen \"Synka - återställda filer\".",
             "Changes that have not been synced yet are first saved in the folder \"Synka - återställda filer\".")));
@@ -800,15 +1347,15 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// Every project rebuilt from ACC where it is, once the user has said yes. Each
+    /// Every project rebuilt from the cloud where it is, once the user has said yes. Each
     /// project reports in its own notify, so nothing more is shown here on success.
     /// </summary>
     private async void OnRebuildAll(object sender, RoutedEventArgs args)
     {
         var body = new StackPanel { Spacing = 8 };
         body.Children.Add(Line(Lang.T(
-            "Varje projekt byggs om från ACC där det ligger. Filerna laddas ner igen när du öppnar dem. Ändringar som inte hunnit synkas sparas först i \"Synka - återställda filer\".",
-            "Every project is rebuilt from ACC where it is. The files are downloaded again when you open them. Changes that have not been synced yet are first saved in \"Synka - återställda filer\".")));
+            "Varje projekt byggs om från molnet där det ligger. Filerna laddas ner igen när du öppnar dem. Ändringar som inte hunnit synkas sparas först i \"Synka - återställda filer\".",
+            "Every project is rebuilt from the cloud where it is. The files are downloaded again when you open them. Changes that have not been synced yet are first saved in \"Synka - återställda filer\".")));
 
         if (!await ConfirmAsync(
                 Lang.T("Bygga om alla projekt?", "Rebuild all projects?"),

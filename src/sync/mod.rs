@@ -23,7 +23,7 @@
 //!
 //! Remote poll per project (by Project.change_source):
 //!   PublicWalk (always when Config::desktop_sync_feed is false, the default) -> for every populated
-//!     folder (store.populated_folders): dm::folder_contents, diff against store.children: build
+//!     folder (store.populated_folders): remote::folder_contents, diff against store.children: build
 //!     Delta (upserts for new/changed, deletes for missing). Never write when identical.
 //!   DesktopSync/Unknown, only when desktop_sync_feed is true -> api::syncfeed::poll; on
 //!     FeedError::NotSupported -> set PublicWalk. With the flag off, a project stored as
@@ -41,7 +41,7 @@
 //!   locked_by -> set_read_only(true/false).
 //!
 //! FETCH_PLACEHOLDERS(dir): hub dir -> projects of that hub. Folder/root -> if never listed
-//!   fetch dm::folder_contents first, then answer with children and set populated = true.
+//!   fetch remote::folder_contents first, then answer with children and set populated = true.
 //! FETCH_DATA(file): signeds3download -> stream into one reusable 1 MiB buffer ->
 //!   CfExecute(TRANSFER_DATA) at 4 KiB-aligned offsets. Semaphore(cfg.max_downloads), cancel by
 //!   AbortHandle keyed by file_id/transfer_key. On success set base_version = remote_version.
@@ -69,8 +69,8 @@ pub use naming::sanitize_name;
 pub(crate) use relocate::check as check_new_root;
 pub(crate) use reset::project_resetting;
 
+use crate::api::syncfeed;
 use crate::api::syncfeed::FeedError;
-use crate::api::{dm, oss, syncfeed};
 use crate::app::{
     Ctx, CtxRef, HeldDeletes, HubList, SettingsView, Severity, Status, Transfer, TrayCmd, UiMsg,
 };
@@ -84,6 +84,7 @@ use crate::cf::{
 };
 use crate::http::ApiError;
 use crate::model::*;
+use crate::remote::{self, DownloadUrl};
 use crate::store::Store;
 use crate::sync::watcher::{LocalChange, WatchHandle};
 use crate::update::{self, UpdateInfo};
@@ -880,33 +881,35 @@ impl Engine {
             p.change_source = ChangeSourceKind::PublicWalk;
             p.cursor = None;
         }
-        let mut delta = if p.change_source == ChangeSourceKind::PublicWalk {
-            self.walk_delta(&p).await?
-        } else {
-            match syncfeed::poll(&self.ctx.api, &p).await {
-                Ok(d) => {
-                    if p.change_source == ChangeSourceKind::Unknown {
+        // The dm/v3 desktop-sync feed is ACC's alone: other providers always list.
+        let mut delta =
+            if p.change_source == ChangeSourceKind::PublicWalk || p.provider != Provider::Acc {
+                self.walk_delta(&p).await?
+            } else {
+                match syncfeed::poll(&self.ctx.api, &p).await {
+                    Ok(d) => {
+                        if p.change_source == ChangeSourceKind::Unknown {
+                            db(&self.ctx, move |s| {
+                                s.set_change_source(pid, ChangeSourceKind::DesktopSync)
+                            })
+                            .await?;
+                        }
+                        d
+                    }
+                    Err(FeedError::NotSupported(code)) => {
+                        info!(
+                            "{}: desktop-sync ej tillgänglig (HTTP {code}), använder listning",
+                            p.name
+                        );
                         db(&self.ctx, move |s| {
-                            s.set_change_source(pid, ChangeSourceKind::DesktopSync)
+                            s.set_change_source(pid, ChangeSourceKind::PublicWalk)
                         })
                         .await?;
+                        self.walk_delta(&p).await?
                     }
-                    d
+                    Err(FeedError::Api(e)) => return Err(e.into()),
                 }
-                Err(FeedError::NotSupported(code)) => {
-                    info!(
-                        "{}: desktop-sync ej tillgänglig (HTTP {code}), använder listning",
-                        p.name
-                    );
-                    db(&self.ctx, move |s| {
-                        s.set_change_source(pid, ChangeSourceKind::PublicWalk)
-                    })
-                    .await?;
-                    self.walk_delta(&p).await?
-                }
-                Err(FeedError::Api(e)) => return Err(e.into()),
-            }
-        };
+            };
         for u in delta.upserts.iter_mut() {
             u.pid = pid;
         }
@@ -929,10 +932,11 @@ impl Engine {
         .await??;
         let (count, work) = work;
         if count > 0 {
-            info!("{}: {count} ändringar från ACC", p.name);
+            let from = p.provider.label();
+            info!("{}: {count} ändringar från {from}", p.name);
             self.ctx.ui.activity(
                 "remote_change",
-                &format!("{count} ändringar från ACC"),
+                &format!("{count} ändringar från {from}"),
                 &p.name,
                 "",
             );
@@ -955,7 +959,7 @@ impl Engine {
         if !due {
             return Ok(p);
         }
-        let found = match dm::top_folders(&self.ctx.api, &p.hub_id, &p.project_id).await {
+        let found = match remote::top_folders(&self.ctx, &p).await {
             Ok(found) => found,
             Err(e) if !p.tops.is_empty() => {
                 debug!(
@@ -968,12 +972,7 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         self.st().tops_at.insert(p.pid, Instant::now());
-        let tops = unique_tops(
-            found
-                .iter()
-                .map(|(urn, name)| (urn_suffix(urn).to_string(), name.clone()))
-                .collect(),
-        );
+        let tops = unique_tops(found);
         if tops.is_empty() {
             if p.tops.is_empty() {
                 return Err(anyhow!("du har inte åtkomst till någon mapp i {}", p.name));
@@ -1024,16 +1023,14 @@ impl Engine {
             .into_iter()
             .filter(|f| !is_local_id(&f.id) && f.local_state != LocalState::New)
             .collect();
-        let api = self.ctx.api.clone();
         let ctx = self.ctx.clone();
         let results: Vec<Result<Delta>> = futures_util::stream::iter(folders)
             .map(|f| {
-                let api = api.clone();
                 let ctx = ctx.clone();
                 let p = p.clone();
                 let me = self.clone();
                 async move {
-                    let mut remote = match dm::folder_contents(&api, &p, &f.id).await {
+                    let mut remote = match remote::folder_contents(&ctx, &p, &f.id).await {
                         Ok(r) => r,
                         // Deleted or no longer visible to us: the parent's listing reports
                         // it missing, which removes it. A top folder goes when the top folders
@@ -1288,7 +1285,7 @@ impl Engine {
             && !item.populated
             && (proj.change_source != ChangeSourceKind::DesktopSync || kids_empty);
         if needs_fetch {
-            let mut items = dm::folder_contents(&self.ctx.api, &proj, &id).await?;
+            let mut items = remote::folder_contents(&self.ctx, &proj, &id).await?;
             for it in items.iter_mut() {
                 it.pid = pid;
             }
@@ -1497,16 +1494,17 @@ impl Engine {
             .storage_urn
             .clone()
             .ok_or_else(|| anyhow!("saknar lagringsobjekt"))?;
-        let (url, size) = oss::download_url(&self.ctx.api, &proj, &storage).await?;
-        if size > 0 && size != req.file_size {
+        let download = remote::download_url(&self.ctx, &proj, id, &storage).await?;
+        if download.size > 0 && download.size != req.file_size {
             // The signed download describes a different byte length than the callback's
             // placeholder, even if the database has not caught up yet. Streaming those
             // bytes into the callback's range could corrupt the file. Refresh the
             // placeholder so the next open can use the current size.
             self.refresh_soon(pid, id.to_string());
             return Err(anyhow!(
-                "filen har ändrats i ACC ({} → {size} byte), öppna den igen",
-                req.file_size
+                "filen har ändrats i ACC ({} → {} byte), öppna den igen",
+                req.file_size,
+                download.size
             ));
         }
 
@@ -1525,24 +1523,13 @@ impl Engine {
         );
 
         let total = req.file_size;
-        // Large files: several byte ranges in parallel. One S3 stream is usually capped well
-        // below the link speed; cldflt accepts TRANSFER_DATA for any aligned offset, in any
-        // order. Each segment holds one CHUNK buffer, so memory stays at SEGMENTS × 1 MiB.
-        let remaining = total.saturating_sub(start);
-        let segments = if remaining >= SEGMENT_MIN {
-            SEGMENTS
-        } else {
-            1
-        };
-        let seg_len = remaining.div_ceil(segments).div_ceil(CHUNK as u64) * CHUNK as u64;
+        // Large files: several byte ranges in parallel (see `segment_plan`). Each segment holds
+        // one CHUNK buffer, so memory stays at SEGMENTS × 1 MiB.
         let progress = std::sync::atomic::AtomicU64::new(start);
         let last = std::sync::Mutex::new(None::<Instant>);
         let mut parts = Vec::new();
-        let mut a = start;
-        while a < total {
-            let b = (a + seg_len).min(total);
-            parts.push(self.stream_segment(&keys, &url, a, b, total, &progress, &last));
-            a = b;
+        for (a, b) in segment_plan(start, total, download.ranges) {
+            parts.push(self.stream_segment(&keys, &proj, &download, a, b, total, &progress, &last));
         }
         if parts.is_empty() {
             // Zero-length file (or nothing left): complete with an empty transfer.
@@ -1563,11 +1550,16 @@ impl Engine {
 
     /// Stream `[a, b)` of the object into the placeholder. `a` is 4 KiB aligned and `b` is
     /// either aligned too or the end of the file, so every TRANSFER_DATA is valid.
+    ///
+    /// Without Range support (`!download.ranges`) the object is read from its start and the
+    /// first `a` bytes are dropped before any data is transferred. `segment_plan` gives one
+    /// segment in that case.
     #[allow(clippy::too_many_arguments)]
     async fn stream_segment(
         self: &Arc<Self>,
         keys: &OpKeys,
-        url: &str,
+        proj: &Project,
+        download: &DownloadUrl,
         a: u64,
         b: u64,
         total: u64,
@@ -1575,16 +1567,22 @@ impl Engine {
         last: &std::sync::Mutex<Option<Instant>>,
     ) -> Result<()> {
         use std::sync::atomic::Ordering;
-        let mut resp = if a == 0 && b == total {
-            oss::open_download(&self.ctx.api, url, 0).await?
+        let mut resp = if download.ranges && (a != 0 || b != total) {
+            remote::open_range(&self.ctx, proj, download, a, b).await?
         } else {
-            oss::open_range(&self.ctx.api, url, a, b).await?
+            remote::open_download(&self.ctx, proj, download, 0).await?
         };
+        let mut skip = if download.ranges { 0 } else { a };
         let tk = keys.transfer_key;
         let mut buf: Vec<u8> = Vec::with_capacity(CHUNK);
         let mut off = a;
         while let Some(chunk) = resp.chunk().await? {
             let mut rest: &[u8] = &chunk;
+            if skip > 0 {
+                let n = skip.min(rest.len() as u64) as usize;
+                rest = &rest[n..];
+                skip -= n as u64;
+            }
             while !rest.is_empty() {
                 let n = (CHUNK - buf.len()).min(rest.len());
                 buf.extend_from_slice(&rest[..n]);
@@ -2095,8 +2093,10 @@ impl Engine {
         }
     }
 
+    /// Hubs and projects of every signed-in provider. A provider whose hubs cannot be listed
+    /// keeps the hubs it had before (one notice); the other providers are listed as usual.
     async fn refresh_projects(self: &Arc<Self>) {
-        if !self.ctx.auth.is_signed_in() {
+        if !self.ctx.any_signed_in() {
             return; // nothing to list before sign-in
         }
         let previous = self
@@ -2105,36 +2105,9 @@ impl Engine {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         self.ctx.ui.send(UiMsg::Projects {
-            hubs: previous,
+            hubs: previous.clone(),
             loading: true,
         });
-        let hubs = match dm::list_hubs(&self.ctx.api).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("kunde inte lista hubbar: {e:#}");
-                self.ctx.ui.send(UiMsg::notify(
-                    Severity::Error,
-                    format!("Kunde inte hämta projekt: {e}"),
-                ));
-                let previous = self
-                    .projects
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                self.ctx.ui.send(UiMsg::Projects {
-                    hubs: previous,
-                    loading: false,
-                });
-                return;
-            }
-        };
-        let api = self.ctx.api.clone();
-        let lists = futures_util::future::join_all(hubs.iter().map(|h| {
-            let api = api.clone();
-            let hid = h.id.clone();
-            async move { dm::list_projects(&api, &hid).await }
-        }))
-        .await;
         let subscribed: HashSet<String> = match db(&self.ctx, |s| s.projects()).await {
             Ok(ps) => ps
                 .into_iter()
@@ -2143,22 +2116,34 @@ impl Engine {
                 .collect(),
             Err(_) => HashSet::new(),
         };
-        let mut out = Vec::new();
-        for (h, l) in hubs.into_iter().zip(lists) {
-            match l {
-                Ok(ps) => {
-                    let v: Vec<(ProjectInfo, bool)> = ps
-                        .into_iter()
-                        .map(|p| {
-                            let s = subscribed.contains(&p.id);
-                            (p, s)
-                        })
-                        .collect();
-                    out.push((h, v));
-                }
+        let lists = futures_util::future::join_all(
+            Provider::ALL
+                .into_iter()
+                .filter(|provider| self.ctx.signed_in(*provider))
+                .map(|provider| {
+                    let subscribed = &subscribed;
+                    async move { (provider, self.provider_hubs(provider, subscribed).await) }
+                }),
+        )
+        .await;
+        let mut out: HubList = Vec::new();
+        for (provider, listed) in lists {
+            match listed {
+                Ok(hubs) => out.extend(hubs),
                 Err(e) => {
-                    warn!("kunde inte lista projekt i hubben {}: {e:#}", h.name);
-                    out.push((h, Vec::new()));
+                    warn!("kunde inte lista hubbar ({}): {e:#}", provider.label());
+                    let text = if provider == Provider::Acc {
+                        format!("Kunde inte hämta projekt: {e}")
+                    } else {
+                        format!("Kunde inte hämta projekt från {}: {e}", provider.label())
+                    };
+                    self.ctx.ui.send(UiMsg::notify(Severity::Error, text));
+                    out.extend(
+                        previous
+                            .iter()
+                            .filter(|(hub, _)| hub.provider == provider)
+                            .cloned(),
+                    );
                 }
             }
         }
@@ -2167,6 +2152,40 @@ impl Engine {
             hubs: out,
             loading: false,
         });
+    }
+
+    /// The hubs of one provider with their projects. A hub whose projects cannot be listed
+    /// comes with none (logged). `subscribed` holds the ids of the projects in the store.
+    async fn provider_hubs(
+        &self,
+        provider: Provider,
+        subscribed: &HashSet<String>,
+    ) -> Result<HubList, ApiError> {
+        let hubs = remote::list_hubs(&self.ctx, provider).await?;
+        let lists = futures_util::future::join_all(
+            hubs.iter().map(|h| remote::list_projects(&self.ctx, h)),
+        )
+        .await;
+        Ok(hubs
+            .into_iter()
+            .zip(lists)
+            .map(|(h, l)| match l {
+                Ok(ps) => {
+                    let v: Vec<(ProjectInfo, bool)> = ps
+                        .into_iter()
+                        .map(|p| {
+                            let s = subscribed.contains(&p.id);
+                            (p, s)
+                        })
+                        .collect();
+                    (h, v)
+                }
+                Err(e) => {
+                    warn!("kunde inte lista projekt i hubben {}: {e:#}", h.name);
+                    (h, Vec::new())
+                }
+            })
+            .collect())
     }
 
     async fn toggle_project(self: Arc<Self>, hub: HubInfo, project: ProjectInfo, subscribe: bool) {
@@ -2186,41 +2205,28 @@ impl Engine {
     }
 
     async fn subscribe(self: &Arc<Self>, hub: &HubInfo, project: &ProjectInfo) -> Result<()> {
-        let api = &self.ctx.api;
-        let info = dm::get_project(api, &hub.id, &project.id).await?;
-        let found = dm::top_folders(api, &hub.id, &project.id).await?;
-        let root_urn = found
-            .first()
-            .map(|(urn, _)| urn.clone())
-            .ok_or_else(|| anyhow!("du har inte åtkomst till någon mapp i {}", project.name))?;
-        let urn_ns = urn_namespace(&root_urn)
-            .ok_or_else(|| anyhow!("okänd URN: {root_urn}"))?
-            .to_string();
-        let tops = unique_tops(
-            found
-                .iter()
-                .map(|(urn, name)| (urn_suffix(urn).to_string(), name.clone()))
-                .collect(),
-        );
-        let scopes = if info.scopes.is_empty() {
-            None
-        } else {
-            Some(info.scopes.join(","))
-        };
+        let setup = remote::project_setup(&self.ctx, hub, project).await?;
         let p = Project {
             pid: 0,
             hub_id: hub.id.clone(),
             hub_name: hub.name.clone(),
             project_id: project.id.clone(),
             name: project.name.clone(),
-            root_folder_urn: root_urn,
-            urn_ns,
-            tops,
-            oss_scopes: scopes,
-            change_source: ChangeSourceKind::Unknown,
+            root_folder_urn: setup.root_folder_urn,
+            urn_ns: setup.urn_ns,
+            tops: unique_tops(setup.tops),
+            oss_scopes: setup.oss_scopes,
+            // Only ACC has the desktop-sync feed to probe; the other providers always list.
+            change_source: if hub.provider == Provider::Acc {
+                ChangeSourceKind::Unknown
+            } else {
+                ChangeSourceKind::PublicWalk
+            },
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: hub.provider,
+            meta: setup.meta,
         };
         let pid = db(&self.ctx, move |s| s.upsert_project(&p)).await?;
         self.st().tops_at.insert(pid, Instant::now());
@@ -4555,6 +4561,27 @@ fn keep_pending_local(store: &Store, pid: Pid, delta: &mut Delta) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// The byte ranges `[a, b)` that fill `[start, total)` of a placeholder. A server that
+/// answers Range requests gets parallel segments for large files; one without them gets a
+/// single segment (the stream starts at 0 and skips to `a`, see `stream_segment`).
+fn segment_plan(start: u64, total: u64, ranged: bool) -> Vec<(u64, u64)> {
+    let remaining = total.saturating_sub(start);
+    let segments = if ranged && remaining >= SEGMENT_MIN {
+        SEGMENTS
+    } else {
+        1
+    };
+    let seg_len = remaining.div_ceil(segments).div_ceil(CHUNK as u64) * CHUNK as u64;
+    let mut plan = Vec::new();
+    let mut a = start;
+    while a < total {
+        let b = (a + seg_len).min(total);
+        plan.push((a, b));
+        a = b;
+    }
+    plan
 }
 
 /// Diff a fresh listing of one folder against the DB rows. Only changed or new items and
@@ -8437,7 +8464,7 @@ pub(crate) mod tests {
         let store = Arc::new(Store::open(&paths.db_file).unwrap());
         let http = crate::http::build_client();
         let auth = Arc::new(crate::auth::Auth::new("test".into(), http.clone(), &state));
-        let api = crate::http::Api::new(http, auth.clone());
+        let api = crate::http::Api::new(http.clone(), auth.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         let ui = crate::app::UiSender {
             tx,
@@ -8445,6 +8472,22 @@ pub(crate) mod tests {
             hub: Arc::new(crate::ipc::IpcHub::new(root.clone())),
         };
         let cfg = crate::config::Config::default();
+        let streambim = Arc::new(crate::streambim_auth::StreamBimAuth::new(
+            http.clone(),
+            &state,
+        ));
+        let streambim_api = crate::http::Api::with_source(
+            http.clone(),
+            crate::http::TokenSource::StreamBim(streambim.clone()),
+        );
+        let interaxo = Arc::new(crate::auth::Auth::with_files(
+            String::new(),
+            http.clone(),
+            &state,
+            "token-interaxo.bin",
+            "user-interaxo.json",
+        ));
+        let interaxo_api = crate::http::Api::new(http, interaxo.clone());
         let ctx = Arc::new(Ctx {
             settings: std::sync::RwLock::new(cfg.clone()),
             cfg,
@@ -8452,6 +8495,10 @@ pub(crate) mod tests {
             store,
             auth,
             api,
+            streambim,
+            streambim_api,
+            interaxo,
+            interaxo_api,
             ui,
         });
         let mut p = Project {
@@ -8471,6 +8518,8 @@ pub(crate) mod tests {
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: Provider::Acc,
+            meta: None,
         };
         p.pid = ctx.store.upsert_project(&p).unwrap();
         let pdir = project_dir(&root, &p);
@@ -8748,6 +8797,27 @@ pub(crate) mod tests {
         assert_eq!(it.parent.as_deref(), Some("co.A"));
         let kinds: Vec<String> = jobs(&f).into_iter().map(|j| j.0).collect();
         assert_eq!(kinds, vec!["rename".to_string(), "move".to_string()]);
+    }
+
+    #[test]
+    fn segment_plan_uses_parallel_ranges_only_when_the_server_ranges() {
+        let big = SEGMENT_MIN * 2 + 17;
+        // Ranged: several segments that tile [start, total) in order, each chunk aligned.
+        let plan = segment_plan(0, big, true);
+        assert_eq!(plan.len() as u64, SEGMENTS);
+        assert_eq!(plan.first().unwrap().0, 0);
+        assert_eq!(plan.last().unwrap().1, big);
+        for pair in plan.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+            assert_eq!(pair[0].1 % CHUNK as u64, 0);
+        }
+        // Without Range: one segment from the requested start, however large the file.
+        let start = 3 * ALIGN;
+        assert_eq!(segment_plan(start, big, false), vec![(start, big)]);
+        // Small files and empty remainders.
+        assert_eq!(segment_plan(0, 5, true), vec![(0, 5)]);
+        assert!(segment_plan(big, big, true).is_empty());
+        assert!(segment_plan(big, big, false).is_empty());
     }
 
     #[test]
@@ -9256,6 +9326,10 @@ pub(crate) mod tests {
             store: f.ctx.store.clone(),
             auth: f.ctx.auth.clone(),
             api: f.ctx.api.clone(),
+            streambim: f.ctx.streambim.clone(),
+            streambim_api: f.ctx.streambim_api.clone(),
+            interaxo: f.ctx.interaxo.clone(),
+            interaxo_api: f.ctx.interaxo_api.clone(),
             ui: f.ctx.ui.clone(),
         };
         assert_eq!(relocate::forget_old_root(&ctx2), None);

@@ -446,8 +446,8 @@ public sealed partial class ProjectsPage : Page
         body.Children.Add(new TextBlock
         {
             Text = Lang.T(
-                "Projektmappen byggs om från ACC. Filer laddas ner igen när du öppnar dem. Lokala ändringar som inte har synkats sparas först i mappen \"Synka - återställda filer\" bredvid synkmappen.",
-                "The project folder is rebuilt from ACC. Files are downloaded again when you open them. Local changes that have not been synced are first saved in the folder \"Synka - återställda filer\" next to the sync folder."),
+                "Projektmappen byggs om från molnet. Filer laddas ner igen när du öppnar dem. Lokala ändringar som inte har synkats sparas först i mappen \"Synka - återställda filer\" bredvid synkmappen.",
+                "The project folder is rebuilt from the cloud. Files are downloaded again when you open them. Local changes that have not been synced are first saved in the folder \"Synka - återställda filer\" next to the sync folder."),
             TextWrapping = TextWrapping.Wrap,
         });
 
@@ -456,7 +456,7 @@ public sealed partial class ProjectsPage : Page
             XamlRoot = root,
             // The dialog hangs in the popup root and does not inherit the theme choice.
             RequestedTheme = MainWindow.CurrentTheme,
-            Title = Lang.T("Bygg om projektet från ACC?", "Rebuild the project from ACC?"),
+            Title = Lang.T("Bygg om projektet från molnet?", "Rebuild the project from the cloud?"),
             Content = body,
             PrimaryButtonText = Lang.T("Bygg om", "Rebuild"),
             CloseButtonText = Lang.T("Avbryt", "Cancel"),
@@ -594,7 +594,7 @@ public sealed partial class ProjectsPage : Page
                 if (_hubExpanders.TryGetValue(hub.Id, out var expander))
                 {
                     var synced = all.Count(p => p.Subscribed);
-                    expander.Header = hub.Name;
+                    expander.Header = HubTitle(hub);
                     expander.Description = Lang.T(
                         $"{synced} av {all.Count} projekt synkas",
                         $"{synced} of {all.Count} projects synced");
@@ -652,13 +652,13 @@ public sealed partial class ProjectsPage : Page
         {
             var expander = new SettingsExpander
             {
-                Header = hub.Name,
+                Header = HubTitle(hub),
                 HeaderIcon = new FontIcon { Glyph = "" },
                 IsExpanded = filtered
                     || (_expanded.TryGetValue(hub.Id, out var remembered) ? remembered : all.Any(p => p.Subscribed)),
                 Tag = hub.Id,
             };
-            AutomationProperties.SetName(expander, hub.Name);
+            AutomationProperties.SetName(expander, HubTitle(hub));
 
             foreach (var project in visible)
             {
@@ -771,10 +771,10 @@ public sealed partial class ProjectsPage : Page
 
         var reset = new MenuFlyoutItem
         {
-            Text = Lang.T("Bygg om från ACC …", "Rebuild from ACC …"),
+            Text = Lang.T("Bygg om från molnet …", "Rebuild from the cloud …"),
             Tag = "r|" + key,
         };
-        AutomationProperties.SetName(reset, Lang.T($"Återställ {project.Name} från ACC", $"Reset {project.Name} from ACC"));
+        AutomationProperties.SetName(reset, Lang.T($"Återställ {project.Name} från molnet", $"Reset {project.Name} from the cloud"));
         reset.Click += OnResetProject;
         var menu = new MenuFlyout();
         menu.Items.Add(openInMenu);
@@ -894,7 +894,9 @@ public sealed partial class ProjectsPage : Page
         }
         else if (!Engine.IsSignedIn)
         {
-            text = Lang.T("Logga in för att se dina ACC-projekt.", "Sign in to see your ACC projects.");
+            text = Lang.T(
+                "Logga in på ACC, StreamBIM eller Interaxo under Inställningar → Konton.",
+                "Sign in to ACC, StreamBIM or Interaxo under Settings → Accounts.");
             signIn = true;
         }
         else if (filtered)
@@ -903,21 +905,43 @@ public sealed partial class ProjectsPage : Page
         }
         else if (loading)
         {
-            text = Lang.T("Hämtar projekt från ACC …", "Fetching projects from ACC …");
+            text = Lang.T("Hämtar projekt från molnet …", "Fetching projects from the cloud …");
             spin = true;
         }
         else
         {
+            // Custom Integration is an ACC rule. StreamBIM and Interaxo need no such step.
             text = Lang.T(
-                $"Inga projekt hittades. {AppInfo.Name} måste vara tillagt som Custom Integration i ACC-kontot. Tryck sedan på Uppdatera.",
-                $"No projects found. {AppInfo.Name} has to be added as a Custom Integration in the ACC account. Then press Refresh.");
+                $"Inga projekt hittades. För ACC-projekt måste {AppInfo.Name} vara tillagt som Custom Integration i ACC-kontot. Tryck sedan på Uppdatera.",
+                $"No projects found. For ACC projects, {AppInfo.Name} has to be added as a Custom Integration in the ACC account. Then press Refresh.");
         }
 
         EmptyText.Text = text;
         EmptySpinner.IsActive = spin;
         EmptySpinner.Visibility = spin ? Visibility.Visible : Visibility.Collapsed;
         EmptySignInButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
+        EmptySettingsButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
         EmptyPanel.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>The hub's heading, with the provider in front: "ACC · Byggbolaget". A name that already starts with the provider is kept as it is.</summary>
+    private static string HubTitle(HubInfo hub)
+    {
+        var label = ProviderNames.Label(hub.Provider);
+        var name = hub.Name ?? string.Empty;
+        if (name.Length == 0)
+        {
+            return label;
+        }
+
+        var starts = name.StartsWith(label, StringComparison.OrdinalIgnoreCase)
+            && (name.Length == label.Length || !char.IsLetter(name[label.Length]));
+        return starts ? name : $"{label} · {name}";
+    }
+
+    private void OnOpenSettings(object sender, RoutedEventArgs e)
+    {
+        MainWindow.Instance?.NavigateTo(MainWindow.SettingsTag);
     }
 
     /// <summary>

@@ -26,6 +26,9 @@ public sealed partial class MainWindow : Window
 
     public const string AboutTag = "about";
 
+    /// <summary>The settings gear: NavigationView's own entry, not one of the tagged items.</summary>
+    public const string SettingsTag = "settings";
+
     /// <summary>At most this many messages stand in the bar area; the oldest goes first.</summary>
     private const int MaxNotices = 3;
 
@@ -331,8 +334,8 @@ public sealed partial class MainWindow : Window
             var project = string.IsNullOrWhiteSpace(entry.Project) ? Lang.T("projektet", "the project") : entry.Project;
             var count = Fmt.Count(entry.Count);
             var message = Lang.T(
-                $"Du tog bort {count} objekt i {project}. De tas inte bort i ACC förrän du bekräftar.",
-                $"You deleted {count} items in {project}. They are not deleted in ACC until you confirm.");
+                $"Du tog bort {count} objekt i {project}. De tas inte bort i molnet förrän du bekräftar.",
+                $"You deleted {count} items in {project}. They are not deleted in the cloud until you confirm.");
 
             if (_heldBars.TryGetValue(id, out var shown))
             {
@@ -362,8 +365,8 @@ public sealed partial class MainWindow : Window
             IsOpen = true,
         };
 
-        var delete = new Button { Content = Lang.T("Ta bort i ACC", "Delete in ACC") };
-        AutomationProperties.SetName(delete, Lang.T($"Ta bort i ACC, {project}", $"Delete in ACC, {project}"));
+        var delete = new Button { Content = Lang.T("Ta bort i molnet", "Delete in the cloud") };
+        AutomationProperties.SetName(delete, Lang.T($"Ta bort i molnet, {project}", $"Delete in the cloud, {project}"));
         var restore = new Button { Content = Lang.T("Återställ", "Restore") };
         AutomationProperties.SetName(restore, Lang.T($"Återställ filerna, {project}", $"Restore the files, {project}"));
 
@@ -1051,6 +1054,24 @@ public sealed partial class MainWindow : Window
     /// </summary>
     public void NavigateTo(string tag)
     {
+        if (tag == SettingsTag)
+        {
+            if (Navigation.SettingsItem is null)
+            {
+                Go(typeof(SettingsPage));
+            }
+            else if (ReferenceEquals(Navigation.SelectedItem, Navigation.SettingsItem))
+            {
+                Go(typeof(SettingsPage));
+            }
+            else
+            {
+                // Raises SelectionChanged, which navigates (IsSettingsSelected).
+                Navigation.SelectedItem = Navigation.SettingsItem;
+            }
+            return;
+        }
+
         NavigationViewItem? item = tag switch
         {
             OverviewTag => OverviewNavItem,
