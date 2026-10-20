@@ -4,7 +4,7 @@
 //!
 //! A room's calls go to its own API base (`Meta::base`, one of `HOSTS`). Bodies are plain
 //! JSON, not JSON:API. Listings take `limit`, `skip` and `sort=id` and answer a bare array with
-//! no total: a page shorter than `PAGE` is the last one.
+//! no total. A listing is read until an empty page: a server may cap `limit` below `PAGE`.
 //!
 //! Interaxo's public API has no folder create, rename or move, and no file locks. Those calls
 //! return `ApiError::Unsupported`; the engine checks `remote::caps` before it asks.
@@ -19,6 +19,7 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -26,8 +27,10 @@ use tracing::{debug, info, warn};
 
 /// The two API hosts. One token works on both, and a community lives on one of them.
 const HOSTS: [&str; 2] = ["https://api.interaxo.com/v1", "https://api.interaxo.se/v1"];
-/// Page size of every listing. A shorter page is the last one.
+/// Page size asked for in every listing. The server may send fewer; only an empty page ends one.
 const PAGE: usize = 500;
+/// Pages one listing may take before it is refused (at most `MAX_PAGES * PAGE` items).
+const MAX_PAGES: usize = 1000;
 /// Prefix of hub ids, project ids and storage handles.
 const PREFIX: &str = "interaxo:";
 /// What `create_storage` returns: the bytes travel with the commit (docs/PROVIDERS.md).
@@ -158,17 +161,79 @@ struct Content {
     lock_info: Option<LockInfo>,
 }
 
-/// Every item of a collection, page by page. `skip` is the number of items read so far.
-async fn list_all<T: DeserializeOwned>(api: &Api, url: &str) -> Result<Vec<T>, ApiError> {
+impl Listed for Community {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Listed for Room {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Listed for Content {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// A listed object, told apart from the others by its id.
+trait Listed {
+    fn id(&self) -> &str;
+}
+
+/// Every item of a collection, page by page (see `list_pages`).
+async fn list_all<T: Listed + DeserializeOwned>(api: &Api, url: &str) -> Result<Vec<T>, ApiError> {
+    list_pages(url, move |page_url: String| async move {
+        api.json::<Vec<T>>(Method::GET, &page_url, None)
+            .await
+            .map_err(scrub)
+    })
+    .await
+}
+
+/// Reads a listing until a page comes back empty. A server may cap `limit` below `PAGE`, so a
+/// short page is not the last one. `skip` counts the raw items the server has sent, which keeps
+/// it on the server's offsets when an item repeats across pages; repeats are dropped by `id`.
+async fn list_pages<T, F, Fut>(url: &str, fetch: F) -> Result<Vec<T>, ApiError>
+where
+    T: Listed,
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Vec<T>, ApiError>>,
+{
     let mut out = Vec::new();
-    loop {
-        let page_url = format!("{url}?limit={PAGE}&skip={}&sort=id", out.len());
-        let page: Vec<T> = api.json(Method::GET, &page_url, None).await?;
-        let n = page.len();
-        out.extend(page);
-        if n < PAGE {
+    let mut seen = HashSet::new();
+    let mut skip = 0usize;
+    for _ in 0..MAX_PAGES {
+        let page = fetch(format!("{url}?limit={PAGE}&skip={skip}&sort=id")).await?;
+        if page.is_empty() {
             return Ok(out);
         }
+        skip += page.len();
+        for item in page {
+            if seen.insert(item.id().to_string()) {
+                out.push(item);
+            }
+        }
+    }
+    Err(ApiError::Message(
+        "Interaxo: för många sidor i listningen".into(),
+    ))
+}
+
+/// Drops the URL from a reqwest error. Request URLs are the place a token could end up, so
+/// nothing that reaches an error text or a log keeps one.
+fn transport(e: reqwest::Error) -> ApiError {
+    ApiError::Transport(e.without_url())
+}
+
+/// `transport` for an error that already is an `ApiError` (from `Api`, whose errors carry the URL).
+fn scrub(e: ApiError) -> ApiError {
+    match e {
+        ApiError::Transport(e) => transport(e),
+        other => other,
     }
 }
 
@@ -961,10 +1026,13 @@ mod tests {
     #[tokio::test]
     async fn list_hubs_skips_a_host_that_does_not_know_the_community() {
         let com = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
-        let se = Server::scripted(vec![json_reply(json!([
-            {"id": "example-corp", "name": "Example Corp"},
-            {"id": "other", "name": "Other"}
-        ]))])
+        let se = Server::scripted(vec![
+            json_reply(json!([
+                {"id": "example-corp", "name": "Example Corp"},
+                {"id": "other", "name": "Other"}
+            ])),
+            json_reply(json!([])),
+        ])
         .await;
         let (com_base, se_base) = (format!("{}/v1", com.origin), format!("{}/v1", se.origin));
         let hubs = list_hubs_on(
@@ -983,7 +1051,7 @@ mod tests {
         // The 401 is retried once with a fresh token, then counts as "not on this host".
         assert_eq!(com.requests().len(), 2);
         let se_requests = se.requests();
-        assert_eq!(se_requests.len(), 1);
+        assert_eq!(se_requests.len(), 2);
         assert_eq!(
             se_requests[0].target,
             "/v1/communities?limit=500&skip=0&sort=id"
@@ -993,8 +1061,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_hubs_lists_a_community_on_both_hosts_once_under_the_first() {
-        let com = Server::scripted(vec![json_reply(json!([{"id": "c1", "name": "Com"}]))]).await;
-        let se = Server::scripted(vec![json_reply(json!([{"id": "c1", "name": "Se"}]))]).await;
+        let com = Server::scripted(vec![
+            json_reply(json!([{"id": "c1", "name": "Com"}])),
+            json_reply(json!([])),
+        ])
+        .await;
+        let se = Server::scripted(vec![
+            json_reply(json!([{"id": "c1", "name": "Se"}])),
+            json_reply(json!([])),
+        ])
+        .await;
         let (com_base, se_base) = (format!("{}/v1", com.origin), format!("{}/v1", se.origin));
         let hubs = list_hubs_on(
             &api_for(&com.origin),
@@ -1051,6 +1127,7 @@ mod tests {
             "/v1/example-corp/rooms?limit=500&skip=500&sort=id" => {
                 Fault::reply(200, last_body.clone())
             }
+            "/v1/example-corp/rooms?limit=500&skip=502&sort=id" => Fault::reply(200, "[]"),
             "/v1/example-corp/rooms/nofix" => json_reply(
                 json!({"id": "nofix", "name": "No Fix", "content": {"root_id": "root-nofix"}}),
             ),
@@ -1094,6 +1171,7 @@ mod tests {
             [
                 "/v1/example-corp/rooms?limit=500&skip=0&sort=id",
                 "/v1/example-corp/rooms?limit=500&skip=500&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=502&sort=id",
                 "/v1/example-corp/rooms/nofix",
             ]
         );
@@ -1107,6 +1185,7 @@ mod tests {
         ]);
         let server = Server::scripted(vec![
             json_reply(rooms),
+            json_reply(json!([])),
             Fault::reply(403, "{\"code\":\"forbidden\"}"),
         ])
         .await;
@@ -1119,6 +1198,110 @@ mod tests {
         let projects = list_projects(&api_for(&server.origin), &hub).await.unwrap();
         let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["interaxo:example-corp:open"]);
+    }
+
+    /// The number of query parameter `key` in a request target (`skip=100` gives 100).
+    fn query_number(target: &str, key: &str) -> Option<usize> {
+        let prefix = format!("{key}=");
+        target
+            .split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(prefix.as_str())?.parse().ok())
+    }
+
+    /// The page a server answers for `target` when it caps `limit` at `cap`: from `skip`, at
+    /// most `cap` items.
+    fn capped_page(target: &str, items: &[Value], cap: usize) -> Fault {
+        let skip = query_number(target, "skip").unwrap_or(0);
+        let limit = query_number(target, "limit").unwrap_or(usize::MAX).min(cap);
+        let page: Vec<Value> = items.iter().skip(skip).take(limit).cloned().collect();
+        json_reply(Value::Array(page))
+    }
+
+    fn listed_room(id: &str) -> Value {
+        json!({"id": id, "name": id, "content": {"root_id": format!("root-{id}")}})
+    }
+
+    fn hub_at(base: &str) -> HubInfo {
+        HubInfo {
+            id: "interaxo:example-corp".into(),
+            name: "Interaxo – Example Corp".into(),
+            region: Some(base.to_string()),
+            provider: Provider::Interaxo,
+        }
+    }
+
+    #[tokio::test]
+    async fn listings_read_past_a_server_that_caps_the_page_size() {
+        let rooms: Vec<Value> = (0..250).map(|i| listed_room(&format!("r{i}"))).collect();
+        let server =
+            Server::new(move |req: &Request, _| capped_page(&req.target, &rooms, 100)).await;
+        let hub = hub_at(&format!("{}/v1", server.origin));
+        let projects = list_projects(&api_for(&server.origin), &hub).await.unwrap();
+
+        assert_eq!(projects.len(), 250);
+        assert_eq!(projects[0].id, "interaxo:example-corp:r0");
+        assert_eq!(projects[249].id, "interaxo:example-corp:r249");
+        let targets: Vec<String> = server.requests().into_iter().map(|r| r.target).collect();
+        assert_eq!(
+            targets,
+            [
+                "/v1/example-corp/rooms?limit=500&skip=0&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=100&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=200&sort=id",
+                "/v1/example-corp/rooms?limit=500&skip=250&sort=id",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn listings_drop_an_item_repeated_across_pages() {
+        let server = Server::new(|req: &Request, _| match req.target.as_str() {
+            "/v1/example-corp/rooms?limit=500&skip=0&sort=id" => json_reply(json!([
+                listed_room("r0"),
+                listed_room("r1"),
+                listed_room("r2")
+            ])),
+            // r2 moved from the end of the first page to the start of this one.
+            "/v1/example-corp/rooms?limit=500&skip=3&sort=id" => {
+                json_reply(json!([listed_room("r2"), listed_room("r3")]))
+            }
+            "/v1/example-corp/rooms?limit=500&skip=5&sort=id" => json_reply(json!([])),
+            _ => Fault::reply(404, ""),
+        })
+        .await;
+        let hub = hub_at(&format!("{}/v1", server.origin));
+        let projects = list_projects(&api_for(&server.origin), &hub).await.unwrap();
+
+        let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "interaxo:example-corp:r0",
+                "interaxo:example-corp:r1",
+                "interaxo:example-corp:r2",
+                "interaxo:example-corp:r3",
+            ]
+        );
+        // The offset follows the raw items sent, so the repeat does not shift the next page.
+        let targets: Vec<String> = server.requests().into_iter().map(|r| r.target).collect();
+        assert_eq!(targets.len(), 3);
+        assert!(targets[2].contains("skip=5&"), "{targets:?}");
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_ends_is_refused() {
+        let page = json_reply(json!([listed_room("r0")]));
+        let server = Server::new(move |_, _| page.clone()).await;
+        let hub = hub_at(&format!("{}/v1", server.origin));
+        let err = list_projects(&api_for(&server.origin), &hub)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiError::Message(text) if text == "Interaxo: för många sidor i listningen"),
+            "{err:?}"
+        );
+        assert_eq!(server.count(), MAX_PAGES);
     }
 
     #[tokio::test]
@@ -1215,11 +1398,12 @@ mod tests {
             {"type": "external-link", "id": "l-2", "parent_id": "root-1", "name": "Extern",
              "url": "https://example.com"}
         ]);
-        let server = Server::scripted(vec![json_reply(children)]).await;
+        let server = Server::scripted(vec![json_reply(children), json_reply(json!([]))]).await;
         let p = project(&format!("{}/v1", server.origin), Some("root-1"));
         let items = folder_contents(&api_for(&server.origin), &p, "root-1")
             .await
             .unwrap();
+        assert_eq!(server.count(), 2, "a listing ends on an empty page");
 
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["Ritningar", "Plan.pdf", "Notes.txt", "Lock.txt"]);
