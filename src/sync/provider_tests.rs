@@ -735,9 +735,15 @@ fn a_lock_held_by_the_users_own_interaxo_account_is_not_read_only() {
 /// Makes StreamBIM look signed in to `region`, the way a sign-in leaves its profile and token.
 fn streambim_signed_in(f: &mut Fixture, region: &str) {
     let state = f.ctx.paths.state_dir.clone();
+    // The account reads its token file through DPAPI; an unreadable file means signed out.
+    let tokens = json!({
+        "refresh_token": "test-only-refresh",
+        "id_token": "test-only-id",
+        "expires_at": 4_102_444_800i64,
+    });
     std::fs::write(
         state.join("token-streambim.bin"),
-        b"test-only-streambim-credentials",
+        crate::auth::dpapi_protect(tokens.to_string().as_bytes()).unwrap(),
     )
     .unwrap();
     let profile = json!({
