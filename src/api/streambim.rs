@@ -9,15 +9,14 @@
 
 use crate::api::dm::{self, UploadInfo};
 use crate::http::{error_body, Api, ApiError, Body};
-use crate::model::{
-    now_ms, HubInfo, Item, Kind, LocalState, Pid, Project, ProjectInfo, Provider,
-};
+use crate::model::{now_ms, HubInfo, Item, Kind, LocalState, Pid, Project, ProjectInfo, Provider};
 use crate::remote::{DownloadUrl, ProjectSetup};
 use crate::streambim_auth::{region_base, valid_region, StreamBimAuth};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, RANGE};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,8 +27,10 @@ use tracing::{info, warn};
 const REGIONS_URL: &str = "https://global.streambim.com/regions.json";
 const REGIONS_TIMEOUT: Duration = Duration::from_secs(10);
 const JSON_API: &str = "application/vnd.api+json";
-/// `page[limit]` of the document listing. Paging ends at `meta.total`.
+/// `page[limit]` of the document listing. Paging ends at `meta.total`, or at an empty page.
 const PAGE_LIMIT: usize = 500;
+/// The most pages one folder listing reads. A listing that does not end before this is refused.
+const MAX_DOC_PAGES: usize = 1000;
 /// The largest file one presigned PUT takes here. The multipart signer is undocumented.
 const MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -267,8 +268,11 @@ pub async fn folder_contents(
         out.extend(folder_item(p.pid, row, folder_id, None));
     }
 
+    // Pages run to `meta.total` when the reply has it, else to the first empty page. A row that
+    // comes again on a later page is read once.
+    let mut seen = HashSet::new();
     let mut skip = 0usize;
-    loop {
+    for _ in 0..MAX_DOC_PAGES {
         let url = format!(
             "{root}/documents?filter%5BfolderId%5D={fid}&filter%5BisDeleted%5D=false\
              &page%5Bskip%5D={skip}&page%5Blimit%5D={PAGE_LIMIT}"
@@ -276,6 +280,9 @@ pub async fn folder_contents(
         let doc = get_json(api, &url).await?;
         let rows = resource_list(&doc)?;
         for row in rows {
+            if res_id(row).is_some_and(|id| !seen.insert(id)) {
+                continue;
+            }
             if attr_flag(row, "is-deleted") || moved_away(row, folder_id) {
                 continue;
             }
@@ -287,14 +294,16 @@ pub async fn folder_contents(
         }
         skip += rows.len();
         let more = match doc.pointer("/meta/total").and_then(Value::as_u64) {
-            Some(total) => (skip as u64) < total,
-            None => rows.len() == PAGE_LIMIT,
+            Some(total) => !rows.is_empty() && (skip as u64) < total,
+            None => !rows.is_empty(),
         };
-        if rows.is_empty() || !more {
-            break;
+        if !more {
+            return Ok(out);
         }
     }
-    Ok(out)
+    Err(user_error(
+        "StreamBIM-mappen har fler dokument än synken läser; listningen avbröts.",
+    ))
 }
 
 /// A download link for the current revision. The link is relative to the project's v1 root,
@@ -304,7 +313,7 @@ pub async fn download_url(
     api: &Api,
     p: &Project,
     item_id: &str,
-    _storage_urn: &str,
+    storage_urn: &str,
 ) -> Result<DownloadUrl, ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
     let doc = server_doc_id(item_id)?;
@@ -315,8 +324,20 @@ pub async fn download_url(
     let resp = api
         .request_with_headers(Method::GET, &url, None, headers)
         .await?;
-    let link = parse_download_link(&resp.bytes().await?)?;
+    let link = parse_download_link(&read_body(resp).await?)?;
     let full = join_download_link(&root, &link);
+    // The engine asked for the revision in `storage_urn`. A link to another revision would stream
+    // other bytes than the ones the engine is about to store, so the engine asks again instead.
+    if let (Some(linked), Some(wanted)) =
+        (revision_in_link(&full, doc)?, handle_revision(storage_urn))
+    {
+        if linked != wanted {
+            return Err(ApiError::Status {
+                status: 409,
+                body: "revision changed".into(),
+            });
+        }
+    }
     let bearer = if needs_bearer(&full, &meta.base)? {
         Some(api.bearer().await?)
     } else {
@@ -437,11 +458,7 @@ pub async fn create_item(
         Ok(bytes) => parse_body(&bytes).unwrap_or(Value::Null),
         Err(_) => Value::Null,
     };
-    let Some(server_id) = reply
-        .get("data")
-        .and_then(res_id)
-        .filter(|id| plain_id(id))
-    else {
+    let Some(server_id) = reply.get("data").and_then(res_id).filter(|id| plain_id(id)) else {
         // No usable id: the newest file of that name and size in the folder is the one just made.
         return newest_file_named(api, p, parent_id, name, size)
             .await
@@ -1011,6 +1028,30 @@ fn join_download_link(api_v1: &str, link: &str) -> String {
         api_v1.trim_end_matches('/'),
         link.trim_start_matches('/')
     )
+}
+
+/// The revision that a download link names, for `.../documents/{id}/{rev}/download...`. None for
+/// the other link forms (no revision in the path) and for a link to another document.
+fn revision_in_link(full: &str, doc: &str) -> Result<Option<i64>, ApiError> {
+    let link = url::Url::parse(full).map_err(|_| decode("downloadlink: ogiltig länk"))?;
+    let path: Vec<&str> = link.path().split('/').collect();
+    let Some(at) = path.iter().position(|segment| *segment == "documents") else {
+        return Ok(None);
+    };
+    if path.get(at + 1) != Some(&doc) {
+        return Ok(None);
+    }
+    let revision = path.get(at + 2).and_then(|rev| rev.parse::<i64>().ok());
+    let download = path
+        .get(at + 3)
+        .is_some_and(|seg| seg.starts_with("download"));
+    Ok(revision.filter(|_| download))
+}
+
+/// The revision of a content handle `streambim:{id}:{revision}`. None for any other handle.
+fn handle_revision(storage_urn: &str) -> Option<i64> {
+    let (_, revision) = storage_urn.strip_prefix("streambim:")?.rsplit_once(':')?;
+    revision.parse().ok()
 }
 
 /// False for another origin (a presigned S3 link) and for links with `token` or `microtoken`.
@@ -1878,7 +1919,9 @@ mod tests {
         if req.target.contains("/folders?") {
             reply(200, json!({"data": []}))
         } else if req.target.contains("/documents?") {
-            reply(200, json!({"data": docs}))
+            // One page holding every row, with the total, so the listing ends after it.
+            let total = docs.as_array().map_or(0, Vec::len);
+            reply(200, json!({"data": docs, "meta": {"total": total}}))
         } else {
             Fault::reply(404, "unexpected")
         }
@@ -1928,8 +1971,16 @@ mod tests {
         let created = json!({"id": "1002", "type": "documents", "attributes": {"filename": "plan.pdf", "filesize": 300000, "revision": 1, "is-deleted": false}, "relationships": {"parent": {"data": {"id": "7", "type": "folders"}}}});
         // Listed: the newest file of that name and size is the one just made.
         for (commit, docs, expect) in [
-            (reply(200, json!({})), json!([older.clone(), created.clone()]), Some("d1002")),
-            (Fault::reply(200, "not json"), json!([created.clone()]), Some("d1002")),
+            (
+                reply(200, json!({})),
+                json!([older.clone(), created.clone()]),
+                Some("d1002"),
+            ),
+            (
+                Fault::reply(200, "not json"),
+                json!([created.clone()]),
+                Some("d1002"),
+            ),
             // Not listed (the older file has another size): a message, never a retry.
             (reply(200, json!({})), json!([older.clone()]), None),
             (Fault::reply(200, "not json"), json!([]), None),
@@ -1989,6 +2040,125 @@ mod tests {
         assert!(err.to_string().contains("document is deleted"), "{err}");
         // Only the two reads: no ticket and no upload.
         assert_eq!(server.count(), 2);
+    }
+
+    /// The `page[skip]` of a document listing request (`usize::MAX` when there is none).
+    fn skip_of(target: &str) -> usize {
+        target
+            .split("page%5Bskip%5D=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(usize::MAX)
+    }
+
+    fn doc_row(n: u32) -> Value {
+        json!({"id": n.to_string(), "type": "documents",
+               "attributes": {"filename": format!("f{n}.pdf"), "filesize": 1, "revision": 1, "is-deleted": false},
+               "relationships": {"parent": {"data": {"id": "7", "type": "folders"}}}})
+    }
+
+    #[tokio::test]
+    async fn a_listing_without_a_total_reads_until_an_empty_page() {
+        let server = Server::new(|req, _| {
+            if req.target.contains("/folders?") {
+                return reply(200, json!({"data": []}));
+            }
+            let ids = match skip_of(&req.target) {
+                0 => 1..=500,
+                500 => 500..=999, // 500 comes again: it is read once
+                1000 => 1000..=1002,
+                _ => return reply(200, json!({"data": []})),
+            };
+            reply(200, json!({"data": ids.map(doc_row).collect::<Vec<_>>()}))
+        })
+        .await;
+        let items = folder_contents(&api_for(&server), &project(&server.origin), "7")
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1002);
+        let docs: Vec<String> = server
+            .requests()
+            .into_iter()
+            .map(|r| r.target)
+            .filter(|t| t.contains("/documents?"))
+            .collect();
+        assert_eq!(docs.len(), 4, "three pages, then the empty one");
+        assert!(docs[3].contains("page%5Bskip%5D=1003&"), "{}", docs[3]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_ends_is_refused_after_the_page_limit() {
+        let server = Server::new(|req, _| {
+            if req.target.contains("/folders?") {
+                return reply(200, json!({"data": []}));
+            }
+            reply(200, json!({"data": [doc_row(1)]}))
+        })
+        .await;
+        let err = folder_contents(&api_for(&server), &project(&server.origin), "7")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Message(_)), "{err:?}");
+        let pages = server
+            .requests()
+            .iter()
+            .filter(|r| r.target.contains("/documents?"))
+            .count();
+        assert_eq!(pages, MAX_DOC_PAGES);
+    }
+
+    #[tokio::test]
+    async fn a_link_to_another_revision_is_refused_with_a_409() {
+        let server = Server::scripted(vec![Fault::reply(
+            200,
+            r#"{"data": "/documents/1002/2/download?token=abc"}"#,
+        )])
+        .await;
+        let p = project(&server.origin);
+        let err = download_url(&api_for(&server), &p, "d1002", "streambim:1002:1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), Some(409));
+        assert!(err.to_string().contains("revision changed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_link_to_the_handle_revision_is_used() {
+        let server = Server::scripted(vec![Fault::reply(
+            200,
+            r#"{"data": "/documents/1002/2/download?token=abc"}"#,
+        )])
+        .await;
+        let d = download_url(
+            &api_for(&server),
+            &project(&server.origin),
+            "d1002",
+            "streambim:1002:2",
+        )
+        .await
+        .unwrap();
+        assert!(d.url.ends_with("/documents/1002/2/download?token=abc"));
+    }
+
+    #[test]
+    fn the_revision_of_a_link_and_of_a_handle() {
+        let base = "https://app.streambim.com/project-1552/api/v1";
+        assert_eq!(
+            revision_in_link(&format!("{base}/documents/1002/3/download?token=t"), "1002").unwrap(),
+            Some(3)
+        );
+        // Other forms name no revision, or another document.
+        for link in [
+            format!("{base}/documents/1002/download/plan.pdf"),
+            format!("{base}/documents/1003/3/download"),
+            "https://bucket.example.invalid/x?X-Amz=1".to_string(),
+        ] {
+            assert_eq!(revision_in_link(&link, "1002").unwrap(), None, "{link}");
+        }
+        assert_eq!(handle_revision("streambim:1002:7"), Some(7));
+        assert_eq!(handle_revision("streambim:pending"), None);
+        assert_eq!(handle_revision("plan"), None);
     }
 
     #[test]
