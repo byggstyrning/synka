@@ -107,11 +107,16 @@ async fn regions_from(client: &reqwest::Client, url: &str) -> Vec<Region> {
 }
 
 async fn fetch_regions(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<Region>> {
-    let resp = client.get(url).timeout(REGIONS_TIMEOUT).send().await?;
+    let resp = client
+        .get(url)
+        .timeout(REGIONS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {}", resp.status().as_u16());
     }
-    let doc: Value = resp.json().await?;
+    let doc: Value = resp.json().await.map_err(|e| e.without_url())?;
     let rows = doc
         .get("regions")
         .and_then(Value::as_array)
@@ -848,7 +853,8 @@ async fn get_download(
     if let Some(range) = range {
         req = req.header(RANGE, range);
     }
-    let resp = req.send().await?;
+    // The link may carry a token or a signature: its URL never reaches the error.
+    let resp = req.send().await.map_err(transport)?;
     let status = resp.status();
     if !status.is_success() {
         return Err(ApiError::Status {
@@ -1151,7 +1157,8 @@ async fn put_presigned(
     let mut tick = tokio::time::interval(PROGRESS_TICK);
     let resp = loop {
         tokio::select! {
-            reply = &mut request => break reply?,
+            // The presigned URL is signed: its error is returned without the URL.
+            reply = &mut request => break reply.map_err(transport)?,
             _ = tick.tick() => progress(sent.load(Ordering::Relaxed), size),
         }
     };
@@ -2040,6 +2047,67 @@ mod tests {
         assert!(err.to_string().contains("document is deleted"), "{err}");
         // Only the two reads: no ticket and no upload.
         assert_eq!(server.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_never_shows_the_presigned_url() {
+        let server = Server::new(|req, _| {
+            let host = req.header("host").unwrap_or_default();
+            match (req.method.as_str(), req.target.as_str()) {
+                ("POST", "/project-1552/api/v1/v2/upload-tickets") => reply(
+                    200,
+                    json!({"data": {"id": "ticket-uuid", "type": "upload-tickets",
+                        "attributes": {"s3presignedurl": format!("http://{host}/s3/bucket/key?X-Amz-Signature=secret-sig")}}}),
+                ),
+                // The storage hangs up on the PUT.
+                ("PUT", _) => Fault::Disconnect,
+                _ => Fault::reply(404, "unexpected"),
+            }
+        })
+        .await;
+        let file = TestFile::new(&pattern(10));
+        let progress = |_: u64, _: u64| {};
+        let err = create_item(
+            &api_for(&server),
+            &project(&server.origin),
+            "7",
+            "plan.pdf",
+            PENDING_STORAGE,
+            &file.0,
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("secret-sig") && !shown.contains("X-Amz"),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_never_shows_the_token_link() {
+        let server = Server::new(|_, _| Fault::Disconnect).await;
+        let d = DownloadUrl {
+            url: format!(
+                "{}/project-1552/api/v1/documents/1002/download/plan.pdf?token=tok-secret",
+                server.origin
+            ),
+            size: 0,
+            bearer: None,
+            ranges: false,
+        };
+        let err = open_download(&api_for(&server), &project(&server.origin), &d, 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("tok-secret") && !shown.contains("plan.pdf"),
+            "{shown}"
+        );
     }
 
     /// The `page[skip]` of a document listing request (`usize::MAX` when there is none).
