@@ -460,6 +460,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_refusal_text_reaches_the_user_unchanged() {
+        // A provider's own "not offered" text is user-facing already: no HTTP or ACC rewording.
+        let raw = "Kunde inte synkronisera rapport.pdf: Interaxo stöds inte ännu";
+        let (title, body, severity, help) = friendly_notification("Synka", raw, Severity::Info);
+        assert_eq!(title, "Synka");
+        assert_eq!(body, raw);
+        assert_eq!(severity, Severity::Info);
+        assert!(!help);
+    }
+
+    #[test]
     fn unsupported_acc_error_is_calm_and_links_to_help() {
         let raw = r#"Kunde inte synkronisera unsupported-1736.svg: HTTP 403: {"jsonapi":{"version":"1.0"},"errors":[{"code":"ERR_NOT_ALLOWED","detail":"File with extension svg is not allowed to upload."}]}"#;
         let (title, body, severity, help) = friendly_notification("Synka", raw, Severity::Error);

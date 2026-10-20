@@ -17,8 +17,8 @@
 //! Upload flow: if the local copy was made from an older version than ACC has now
 //!   (base_version set and != remote_version) -> keep both (`sync::keep_both`): the local file
 //!   becomes "name (konflikt YYYY-MM-DD HHMM).ext" and is uploaded as a new file, the original
-//!   name gets the cloud version back. Else: dm::create_storage -> oss::upload_file ->
-//!   dm::create_version (existing; the ACC name is kept) or dm::create_item (new; a 409 "name
+//!   name gets the cloud version back. Else: remote::create_storage -> remote::upload_file ->
+//!   remote::create_version (existing; the ACC name is kept) or remote::create_item (new; a 409 "name
 //!   exists" preserves the local file as a separately uploaded conflict copy). Then store row: base_version =
 //!   remote_version = new number, LocalState::Clean; on disk the file becomes (or is re-pointed
 //!   as) an in-sync placeholder of the item, with watcher::suppress around it.
@@ -39,11 +39,12 @@ mod resilience_tests;
 #[path = "upload_metadata_tests.rs"]
 mod metadata_tests;
 
-use crate::api::{dm, oss};
+use crate::api::dm;
 use crate::app::{CtxRef, Severity, Transfer, UiMsg};
 use crate::cf::placeholder;
 use crate::http::ApiError;
 use crate::model::*;
+use crate::remote;
 use crate::store::OutboxJob;
 use crate::sync::{self, naming, sanitize_name, watcher};
 use anyhow::anyhow;
@@ -298,8 +299,9 @@ fn is_transient(err: &anyhow::Error) -> bool {
     }
     match err.downcast_ref::<ApiError>() {
         Some(ApiError::Status { status, .. }) => *status == 408 || *status == 429 || *status >= 500,
-        // The provider does not offer this operation: the same request fails the same way.
-        Some(ApiError::Unsupported(_)) => false,
+        // The provider does not offer this operation, or the engine's own message: the same
+        // request fails the same way.
+        Some(ApiError::Unsupported(_) | ApiError::Message(_)) => false,
         // Transport, auth and decode problems are retried.
         Some(_) => true,
         // Local I/O and "parent folder not synced yet" are retried.
@@ -312,6 +314,15 @@ fn is_offline(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ApiError>(),
         Some(ApiError::Transport(_) | ApiError::Auth(_))
+    )
+}
+
+/// The provider's API does not offer the operation (`ApiError::Unsupported`). Retrying cannot
+/// help, so the job is parked like a refused file type (`handle_failure`).
+fn unsupported_operation(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<ApiError>(),
+        Some(ApiError::Unsupported(_))
     )
 }
 
@@ -368,14 +379,17 @@ fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error) {
         );
         return;
     }
-    if job.kind == "upload" && unsupported_file_type(err) {
+    // Parked for good (dead = 3, local change kept, one notice): ACC refused the file type, or
+    // the provider does not offer the operation.
+    let refused_file_type = job.kind == "upload" && unsupported_file_type(err);
+    if refused_file_type || unsupported_operation(err) {
         if let Err(e) = ctx.store.job_unsupported(job.id, &msg) {
             tracing::warn!("outbox: job_unsupported {}: {e:#}", job.id);
         }
         if let Some(id) = row_id(ctx, job) {
             let _ = ctx.store.set_local_state(job.pid, &id, LocalState::Error);
         }
-        tracing::info!("outbox: unsupported file type for job {}: {msg}", job.id);
+        tracing::info!("outbox: unsupported job {} ({}): {msg}", job.id, job.kind);
         let project = ctx
             .store
             .project(job.pid)
@@ -1037,7 +1051,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     let saved_intent = CreateIntent::from_payload(&fields)?;
     let (mut checked_tip, upload_info) =
         if let Some(remote) = existing.as_ref().filter(|item| !is_local_id(&item.id)) {
-            let (tip, info) = dm::get_item_upload_info(&ctx.api, p, &remote.id).await?;
+            let (tip, info) = remote::get_item_upload_info(ctx, p, &remote.id).await?;
             // Check even a resumed intent before it can create another version.
             info.ensure_writable()
                 .map_err(|error| perm(error.to_string()))?;
@@ -1113,7 +1127,6 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         }
     }
 
-    let api = &ctx.api;
     let tracked = Tracked::start(&loc.name, &p.name);
     let meta = std::fs::metadata(&path)?;
     let (mtime, size, storage, uploaded_usn) = if let Some(intent) = &saved_intent {
@@ -1124,10 +1137,10 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             intent.usn,
         )
     } else {
-        let storage = dm::create_storage(api, p, &loc.parent, &loc.name).await?;
+        let storage = remote::create_storage(ctx, p, &loc.parent, &loc.name).await?;
         let uploaded_usn = available_usn(&path);
-        oss::upload_file(
-            api,
+        remote::upload_file(
+            ctx,
             p,
             &storage,
             &path,
@@ -1153,7 +1166,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     // This POST carries no atomic tip precondition, so a narrower race still
     // remains between this GET and POST /versions.
     if let Some(ex) = existing.as_mut().filter(|e| !is_local_id(&e.id)) {
-        let (tip, info) = dm::get_item_upload_info(api, p, &ex.id).await?;
+        let (tip, info) = remote::get_item_upload_info(ctx, p, &ex.id).await?;
         info.ensure_writable()
             .map_err(|error| perm(error.to_string()))?;
         if ex.base_version.is_some() && ex.remote_version.is_some() && apply_remote_tip(ex, tip) {
@@ -1204,7 +1217,12 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             // may still wait for the file to close here).
             let acc_name =
                 sync::pending_remote_name(ctx, pid, &ex.id).unwrap_or_else(|| ex.name.clone());
-            let (ver, vurn) = match dm::create_version(api, p, &ex.id, &acc_name, &storage).await {
+            let version =
+                remote::create_version(ctx, p, &ex.id, &acc_name, &storage, &path, &|d, t| {
+                    tracked.progress(d, t)
+                })
+                .await;
+            let (ver, vurn) = match version {
                 Ok(version) => version,
                 Err(error) => {
                     let error: anyhow::Error = error.into();
@@ -1234,14 +1252,17 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             (row, "new_version")
         }
         stale => {
-            let (created, kind) = match dm::create_item(api, p, &loc.parent, &loc.name, &storage)
-                .await
-            {
+            let created =
+                remote::create_item(ctx, p, &loc.parent, &loc.name, &storage, &path, &|d, t| {
+                    tracked.progress(d, t)
+                })
+                .await;
+            let (created, kind) = match created {
                 Ok(c) => (c, "upload"),
                 // A persisted OSS object is an exact marker for our own create whose
                 // response was lost. A different object remains a genuine collision.
                 Err(e) if e.status() == Some(409) => {
-                    let found = dm::folder_contents(api, p, &loc.parent)
+                    let found = remote::folder_contents(ctx, p, &loc.parent)
                         .await?
                         .into_iter()
                         .find(|r| {
@@ -1413,10 +1434,10 @@ async fn mkdir(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     if is_local_id(&loc.parent) {
         return Err(anyhow!("parent folder is not created in ACC yet"));
     }
-    let created = match dm::create_folder(&ctx.api, p, &loc.parent, &loc.name).await {
+    let created = match remote::create_folder(ctx, p, &loc.parent, &loc.name).await {
         Ok(c) => c,
         // Created meanwhile (by someone else, or by an attempt whose answer was lost): use it.
-        Err(e) if e.status() == Some(409) => dm::folder_contents(&ctx.api, p, &loc.parent)
+        Err(e) if e.status() == Some(409) => remote::folder_contents(ctx, p, &loc.parent)
             .await?
             .into_iter()
             .find(|r| {
@@ -1495,16 +1516,16 @@ fn queue_unsynced_children(ctx: &CtxRef, pid: Pid, folder_id: &str, dir: &Path) 
     }
 }
 
-/// Rename a remote file (via its tip version) or folder.
+/// Rename a remote file or folder. ACC renames a file through its tip version, so a file
+/// without one cannot be renamed there yet. The other providers have no version URNs.
 async fn rename_remote(ctx: &CtxRef, p: &Project, it: &Item, new_name: &str) -> anyhow::Result<()> {
     if it.kind.is_dir() {
-        dm::patch_folder(&ctx.api, p, &it.id, Some(new_name), None).await?;
+        remote::patch_folder(ctx, p, &it.id, Some(new_name), None).await?;
     } else {
-        let vurn = it
-            .version_urn
-            .as_deref()
-            .ok_or_else(|| anyhow!("file {} has no remote version yet", it.name))?;
-        dm::rename_file(&ctx.api, p, vurn, new_name).await?;
+        if p.provider == Provider::Acc && it.version_urn.is_none() {
+            return Err(anyhow!("file {} has no remote version yet", it.name));
+        }
+        remote::rename_file(ctx, p, &it.id, it.version_urn.as_deref(), new_name).await?;
     }
     Ok(())
 }
@@ -1546,9 +1567,9 @@ async fn move_item(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         return Err(anyhow!("target folder is not created in ACC yet"));
     }
     if it.kind.is_dir() {
-        dm::patch_folder(&ctx.api, &p, &it.id, Some(&it.name), Some(&parent)).await?;
+        remote::patch_folder(ctx, &p, &it.id, Some(&it.name), Some(&parent)).await?;
     } else {
-        dm::move_file(&ctx.api, &p, &it.id, &parent).await?;
+        remote::move_file(ctx, &p, &it.id, &parent).await?;
         rename_remote(ctx, &p, &it, &it.name).await?;
     }
     Ok(Step::Done)
@@ -1611,9 +1632,9 @@ async fn delete(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         .is_some_and(|pa| pa.local_state == LocalState::Deleted);
     if !parent_deleted {
         if is_dir {
-            dm::delete_folder(&ctx.api, &p, id).await?;
+            remote::delete_folder(ctx, &p, id).await?;
         } else {
-            dm::delete_file(&ctx.api, &p, id).await?;
+            remote::delete_file(ctx, &p, id).await?;
         }
     }
     // Gone remotely and locally: forget the row (and, for folders, everything under it).
@@ -1985,6 +2006,33 @@ mod tests {
         ));
         assert!(is_transient(&anyhow!(
             "CfGetPlaceholderInfo sharing violation"
+        )));
+    }
+
+    #[test]
+    fn provider_refusals_park_the_job_without_retry() {
+        // A provider without the operation: permanent, never a network pause, and the parked
+        // text is the provider's own message, verbatim.
+        let refused = anyhow::Error::from(ApiError::Unsupported("Interaxo stöds inte ännu".into()));
+        assert!(unsupported_operation(&refused));
+        assert!(!is_transient(&refused));
+        assert!(!is_offline(&refused));
+        assert_eq!(format!("{refused:#}"), "Interaxo stöds inte ännu");
+
+        // The engine's own messages are permanent as well, but are not provider refusals.
+        let message = anyhow::Error::from(ApiError::Message("ingen ACC-mapp".into()));
+        assert!(!unsupported_operation(&message));
+        assert!(!is_transient(&message));
+        assert!(!is_offline(&message));
+        assert_eq!(format!("{message:#}"), "ingen ACC-mapp");
+
+        let forbidden = anyhow::Error::from(ApiError::Status {
+            status: 403,
+            body: String::new(),
+        });
+        assert!(!unsupported_operation(&forbidden));
+        assert!(!unsupported_operation(&anyhow!(
+            "parent folder is not created in ACC yet"
         )));
     }
 

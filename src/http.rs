@@ -43,6 +43,10 @@ pub enum ApiError {
     /// Not a transient or offline failure: retrying does not help.
     #[error("{0}")]
     Unsupported(String),
+    /// A user-facing engine message that is not a decode failure (shown bare, no prefix).
+    /// Not a transient or offline failure: the same request fails the same way.
+    #[error("{0}")]
+    Message(String),
 }
 
 impl ApiError {

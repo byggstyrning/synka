@@ -127,13 +127,12 @@ fn run() -> anyhow::Result<()> {
         http.clone(),
         http::TokenSource::StreamBim(streambim.clone()),
     );
-    // Empty client id = not configured; the Interaxo OIDC settings are wired in a later step.
-    let interaxo = Arc::new(Auth::with_files(
-        String::new(),
+    // Not configured (empty client id) until the user gives one; applying the settings at
+    // runtime comes in a later step.
+    let interaxo = Arc::new(Auth::interaxo(
+        cfg.interaxo_client(),
         http.clone(),
         &paths.state_dir,
-        "token-interaxo.bin",
-        "user-interaxo.json",
     ));
     let interaxo_api = http::Api::new(http, interaxo.clone());
 

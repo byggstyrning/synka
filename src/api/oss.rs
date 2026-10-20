@@ -113,13 +113,28 @@ pub async fn download_url(
 }
 
 /// Start streaming `url` from `offset`. Caller reads with `resp.chunk().await`.
+/// Presigned URL: deliberately no Authorization header.
+#[cfg_attr(not(test), allow(dead_code))] // the engine calls `open_download_with` via remote
 pub async fn open_download(
     api: &Api,
     url: &str,
     offset: u64,
 ) -> Result<reqwest::Response, ApiError> {
-    // Presigned URL: deliberately no Authorization header.
+    open_download_with(api, url, offset, None).await
+}
+
+/// `open_download` for a URL that may need a bearer token (`bearer` Some, e.g. a provider's
+/// own download route). `None` sends no Authorization header, as for presigned URLs.
+pub(crate) async fn open_download_with(
+    api: &Api,
+    url: &str,
+    offset: u64,
+    bearer: Option<&str>,
+) -> Result<reqwest::Response, ApiError> {
     let mut req = api.transfer_client().get(url).timeout(TRANSFER_TIMEOUT);
+    if let Some(token) = bearer {
+        req = req.bearer_auth(token);
+    }
     if offset > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={offset}-"));
     }
@@ -194,22 +209,36 @@ fn validate_range_response(
 }
 
 /// Stream the byte range `[start, end)` of a presigned URL (used for parallel segments).
+#[cfg_attr(not(test), allow(dead_code))] // the engine calls `open_range_with` via remote
 pub async fn open_range(
     api: &Api,
     url: &str,
     start: u64,
     end: u64,
 ) -> Result<reqwest::Response, ApiError> {
+    open_range_with(api, url, start, end, None).await
+}
+
+/// `open_range` with an optional bearer token; see `open_download_with`.
+pub(crate) async fn open_range_with(
+    api: &Api,
+    url: &str,
+    start: u64,
+    end: u64,
+    bearer: Option<&str>,
+) -> Result<reqwest::Response, ApiError> {
     if start >= end {
         return Err(decode("download: range must have start < end"));
     }
-    let resp = api
+    let mut req = api
         .transfer_client()
         .get(url)
         .timeout(TRANSFER_TIMEOUT)
-        .header(reqwest::header::RANGE, format!("bytes={start}-{}", end - 1))
-        .send()
-        .await?;
+        .header(reqwest::header::RANGE, format!("bytes={start}-{}", end - 1));
+    if let Some(token) = bearer {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     if !status.is_success() {
         let body = error_body(resp).await;
@@ -540,6 +569,40 @@ mod tests {
         .unwrap();
         assert_eq!(r.upload_key, "K1");
         assert_eq!(r.urls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bearer_is_sent_only_when_one_is_given() {
+        let server = Server::scripted(vec![
+            Fault::reply(200, "a"),
+            Fault::reply(200, "b"),
+            Fault::reply(206, "c").header("Content-Range", "bytes 2-2/3"),
+            Fault::reply(206, "d").header("Content-Range", "bytes 0-0/3"),
+        ])
+        .await;
+        let api = loopback_api(&server);
+        let url = format!("{}/object?fake-signature=local-only", server.origin);
+        // Presigned-style download without a token: no Authorization header at all.
+        open_download_with(&api, &url, 0, None).await.unwrap();
+        open_download_with(&api, &url, 0, Some("synka-test-bearer"))
+            .await
+            .unwrap();
+        open_range_with(&api, &url, 2, 3, Some("synka-test-bearer"))
+            .await
+            .unwrap();
+        open_range(&api, &url, 0, 1).await.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].header("authorization"), None);
+        assert_eq!(
+            requests[1].header("authorization"),
+            Some("Bearer synka-test-bearer")
+        );
+        assert_eq!(
+            requests[2].header("authorization"),
+            Some("Bearer synka-test-bearer")
+        );
+        assert_eq!(requests[3].header("authorization"), None);
     }
 
     #[tokio::test]

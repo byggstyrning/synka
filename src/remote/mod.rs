@@ -5,9 +5,7 @@
 //! for the others. The ACC arms pass the arguments the engine passed before, so ACC behaviour
 //! does not change. See docs/PROVIDERS.md "The dispatch module".
 //!
-//! Not called by the engine yet (the next step switches the call sites), hence `dead_code`.
-
-#![allow(dead_code)]
+//! The engine (`sync`) reaches every provider only through these functions.
 
 use crate::api::{dm, interaxo, oss, streambim};
 use crate::app::Ctx;
@@ -18,6 +16,7 @@ use crate::model::{
 use std::path::Path;
 
 /// What a provider can do. The engine checks it to skip work the provider would refuse.
+#[allow(dead_code)] // read by the next step (skipping refused work); tests use it now
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
     pub mkdir: bool,
@@ -30,6 +29,7 @@ pub struct Caps {
 }
 
 /// The operations each provider offers (docs/PROVIDERS.md "Unsupported operations").
+#[allow(dead_code)] // see `Caps`
 pub fn caps(provider: Provider) -> Caps {
     match provider {
         Provider::Acc => Caps {
@@ -128,13 +128,13 @@ async fn acc_project_setup(
     let info = dm::get_project(api, &hub.id, &project.id).await?;
     let found = dm::top_folders(api, &hub.id, &project.id).await?;
     let root_folder_urn = found.first().map(|(urn, _)| urn.clone()).ok_or_else(|| {
-        ApiError::Decode(format!(
+        ApiError::Message(format!(
             "du har inte åtkomst till någon mapp i {}",
             project.name
         ))
     })?;
     let urn_ns = urn_namespace(&root_folder_urn)
-        .ok_or_else(|| ApiError::Decode(format!("okänd URN: {root_folder_urn}")))?
+        .ok_or_else(|| ApiError::Message(format!("okänd URN: {root_folder_urn}")))?
         .to_string();
     let tops = found
         .iter()
@@ -193,6 +193,7 @@ pub async fn download_url(
 ) -> Result<DownloadUrl, ApiError> {
     let api = ctx.api_for(p.provider);
     match p.provider {
+        // A presigned S3 URL: no bearer token, and ranges are answered.
         Provider::Acc => {
             let (url, size) = oss::download_url(api, p, storage_urn).await?;
             Ok(DownloadUrl {
@@ -207,7 +208,8 @@ pub async fn download_url(
     }
 }
 
-/// Start streaming the bytes of `d` from `offset`.
+/// Start streaming the bytes of `d` from `offset`. `d.bearer`, when set, is sent as
+/// `Authorization: Bearer`; ACC's presigned URLs never get one.
 pub async fn open_download(
     ctx: &Ctx,
     p: &Project,
@@ -216,13 +218,13 @@ pub async fn open_download(
 ) -> Result<reqwest::Response, ApiError> {
     let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => oss::open_download(api, &d.url, offset).await,
+        Provider::Acc => oss::open_download_with(api, &d.url, offset, d.bearer.as_deref()).await,
         Provider::StreamBim => streambim::open_download(api, p, d, offset).await,
         Provider::Interaxo => interaxo::open_download(api, p, d, offset).await,
     }
 }
 
-/// Stream the byte range `[start, end)` of `d`.
+/// Stream the byte range `[start, end)` of `d` (same bearer rule as `open_download`).
 pub async fn open_range(
     ctx: &Ctx,
     p: &Project,
@@ -232,7 +234,7 @@ pub async fn open_range(
 ) -> Result<reqwest::Response, ApiError> {
     let api = ctx.api_for(p.provider);
     match p.provider {
-        Provider::Acc => oss::open_range(api, &d.url, start, end).await,
+        Provider::Acc => oss::open_range_with(api, &d.url, start, end, d.bearer.as_deref()).await,
         Provider::StreamBim => streambim::open_range(api, p, d, start, end).await,
         Provider::Interaxo => interaxo::open_range(api, p, d, start, end).await,
     }
@@ -362,7 +364,7 @@ pub async fn rename_file(
     match p.provider {
         Provider::Acc => {
             let vurn = version_urn
-                .ok_or_else(|| ApiError::Decode("file has no remote version yet".to_string()))?;
+                .ok_or_else(|| ApiError::Message("file has no remote version yet".to_string()))?;
             dm::rename_file(api, p, vurn, new_name).await
         }
         Provider::StreamBim => streambim::rename_file(api, p, id, version_urn, new_name).await,
@@ -443,11 +445,11 @@ async fn acc_web_link(api: &Api, p: &Project, item: &Item) -> Result<String, Api
         // The project directory is ACC's first top folder.
         Kind::ProjectRoot => {
             let top = p.tops.first().ok_or_else(|| {
-                ApiError::Decode("projektets mappar är inte kända än".to_string())
+                ApiError::Message("projektets mappar är inte kända än".to_string())
             })?;
             dm::folder_web_view(api, p, &top.id).await
         }
-        Kind::Hub => Err(ApiError::Decode("ingen ACC-mapp".to_string())),
+        Kind::Hub => Err(ApiError::Message("ingen ACC-mapp".to_string())),
     }
 }
 
@@ -663,10 +665,13 @@ mod tests {
             list_hubs(&f.ctx, Provider::Acc).await,
             Err(ApiError::Auth(_))
         ));
-        // Without a version there is nothing to rename on ACC.
-        assert!(matches!(
-            rename_file(&f.ctx, &p, "L1", None, "new.pdf").await,
-            Err(ApiError::Decode(_))
-        ));
+        // Without a version there is nothing to rename on ACC. The engine's message is shown
+        // bare, as it was before the provider split.
+        let err = rename_file(&f.ctx, &p, "L1", None, "new.pdf")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Message(_)), "{err:?}");
+        assert_eq!(err.to_string(), "file has no remote version yet");
+        assert_eq!(err.status(), None);
     }
 }

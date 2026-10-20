@@ -16,6 +16,38 @@ use std::path::Path;
 
 const NOT_YET: &str = "StreamBIM stöds inte ännu";
 
+/// A StreamBIM region: the host is `https://<subdomain>.streambim.com`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Region {
+    pub subdomain: String,
+    pub title: String,
+    pub is_default: bool,
+}
+
+/// The regions of `global.streambim.com/regions.json` as shipped with the app, used when the
+/// list cannot be fetched. "app" (Europe) is the default.
+pub fn fallback_regions() -> Vec<Region> {
+    [
+        ("app", "Europe", true),
+        ("sweden", "Sweden", false),
+        ("japan", "Japan", false),
+        ("australia", "Australia", false),
+        ("spf", "SPF", false),
+    ]
+    .into_iter()
+    .map(|(subdomain, title, is_default)| Region {
+        subdomain: subdomain.into(),
+        title: title.into(),
+        is_default,
+    })
+    .collect()
+}
+
+/// The regions offered at sign-in. STUB: the fallback list until the regions document is read.
+pub async fn regions(_client: &reqwest::Client) -> Vec<Region> {
+    fallback_regions()
+}
+
 fn not_yet<T>() -> Result<T, ApiError> {
     Err(ApiError::Unsupported(NOT_YET.into()))
 }

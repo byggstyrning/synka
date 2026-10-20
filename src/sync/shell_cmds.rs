@@ -7,11 +7,11 @@
 //! the item, and the project is polled.
 
 use super::{hydrate_later, is_local_id, watcher, Engine};
-use crate::api::dm;
 use crate::app::{Severity, UiMsg};
 use crate::cf::placeholder as ph;
 use crate::http::ApiError;
 use crate::model::{Item, Kind, Pid, Project};
+use crate::remote;
 use crate::shell::{self, ShellVerb};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -192,7 +192,7 @@ impl Engine {
             }
             _ => {}
         }
-        match dm::set_reserved(&self.ctx.api, &p, &it.id, lock).await {
+        match remote::set_reserved(&self.ctx, &p, &it.id, lock).await {
             Ok(by) => {
                 let locked_by =
                     lock.then(|| by.or_else(|| me.map(str::to_string)).unwrap_or_default());
@@ -237,20 +237,10 @@ impl Engine {
         if is_local_id(&it.id) {
             return Err(anyhow!("finns inte i ACC ännu"));
         }
-        let api = &self.ctx.api;
-        Ok(match it.kind {
-            Kind::File => dm::item_web_view(api, p, &it.id).await?,
-            Kind::Folder => dm::folder_web_view(api, p, &it.id).await?,
-            // The project directory is ours: ACC's page for it is its first top folder's.
-            Kind::ProjectRoot => {
-                let top = p
-                    .tops
-                    .first()
-                    .ok_or_else(|| anyhow!("projektets mappar är inte kända än"))?;
-                dm::folder_web_view(api, p, &top.id).await?
-            }
-            Kind::Hub => return Err(anyhow!("ingen ACC-mapp")),
-        })
+        if it.kind == Kind::Hub {
+            return Err(anyhow!("ingen ACC-mapp"));
+        }
+        Ok(remote::web_link(&self.ctx, p, it).await?)
     }
 
     async fn shell_resolve(&self, paths: Vec<PathBuf>) -> Vec<Target> {
