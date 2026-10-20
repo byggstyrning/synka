@@ -277,6 +277,8 @@ impl Api {
             let resp = match rb.send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    // The URL can carry a signed link: the log and the error keep none.
+                    let e = e.without_url();
                     debug!(method = %method, path = %log_path, error = %e, "transport error");
                     // A lost response does not mean a write failed: ACC may have
                     // committed it already. Replaying POST/PATCH can create another
@@ -622,6 +624,26 @@ mod tests {
                 .await
                 .expect("refused connection must be bounded");
         assert!(matches!(result, Err(ApiError::Transport(_))));
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_does_not_keep_the_request_url() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let api = Api::for_test(&origin, Duration::from_millis(100));
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            api.request(Method::GET, "/signed?sig=test-only-secret-link", None),
+        )
+        .await
+        .expect("refused connection must be bounded")
+        .unwrap_err();
+        let ApiError::Transport(e) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(e.url().is_none(), "{e:?}");
+        assert!(!error.to_string().contains("test-only-secret-link"));
     }
 
     #[tokio::test]
