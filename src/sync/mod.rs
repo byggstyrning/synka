@@ -232,7 +232,9 @@ struct St {
     /// transfer_key -> active download.
     transfers: HashMap<i64, Transfer>,
     last_error: Option<String>,
-    offline: bool,
+    /// Providers whose last request failed for lack of a network. Their projects do not poll, and
+    /// their jobs wait (without an attempt). Cleared by a good poll of the provider.
+    offline: HashSet<Provider>,
     outbox_running: bool,
     outbox_next: Option<Instant>,
     update_due: Option<Instant>,
@@ -939,7 +941,7 @@ impl Engine {
             st.activity.clear();
             st.fails.clear();
             st.last_error = None;
-            st.offline = false;
+            st.offline.clear();
             st.provider = None;
         }
         info!("utloggad");
@@ -952,14 +954,37 @@ impl Engine {
         self.wake.notify_one();
     }
 
+    /// True when every signed-in provider is offline. Only then does the whole engine report
+    /// "offline" and hold its queue; one provider without a connection pauses its own work.
+    fn connectivity_lost(&self) -> bool {
+        let signed: Vec<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|p| self.ctx.signed_in(*p))
+            .collect();
+        let st = self.st();
+        !signed.is_empty() && signed.iter().all(|p| st.offline.contains(p))
+    }
+
+    /// The provider of a project (ACC when the project is unknown).
+    fn provider_of(&self, pid: Pid) -> Provider {
+        self.ctx
+            .store
+            .project(pid)
+            .ok()
+            .flatten()
+            .map(|p| p.provider)
+            .unwrap_or_default()
+    }
+
     fn sync_provider(&self, live: &Live) {
         let Some(conn) = live.conn.as_ref() else {
             return;
         };
+        let lost = self.connectivity_lost();
         let (code, status) = {
             let st = self.st();
             let busy = !st.polling.is_empty() || !st.downloads.is_empty() || st.outbox_running;
-            if st.offline {
+            if lost {
                 (3u8, ProviderStatus::ConnectivityLost)
             } else if st.last_error.is_some() {
                 (4, ProviderStatus::Error)
@@ -986,6 +1011,7 @@ impl Engine {
     // ------------------------------------------------------------------ scheduler
 
     fn next_wake(&self) -> Instant {
+        let lost = self.connectivity_lost();
         let st = self.st();
         let mut t = Instant::now() + Duration::from_secs(3600);
         for (pid, due) in &st.next_due {
@@ -993,8 +1019,8 @@ impl Engine {
                 t = *due;
             }
         }
-        // While offline the queue waits for the next good poll (no wake-ups for it).
-        if !st.recovering && !st.moving && !st.outbox_running && !st.offline {
+        // While every provider is offline the queue waits for the next good poll (no wake-ups).
+        if !st.recovering && !st.moving && !st.outbox_running && !lost {
             if let Some(o) = st.outbox_next {
                 if o < t {
                     t = o;
@@ -1050,6 +1076,7 @@ impl Engine {
             }
         }
         let signed_in = self.ctx.any_signed_in();
+        let lost = self.connectivity_lost();
         let run_outbox = {
             let mut st = self.st();
             match st.outbox_next {
@@ -1058,7 +1085,7 @@ impl Engine {
                         && !st.recovering
                         && !st.moving
                         && !st.outbox_running
-                        && !st.offline
+                        && !lost
                         && signed_in =>
                 {
                     st.outbox_running = true;
@@ -1155,13 +1182,14 @@ impl Engine {
 
     fn finish_poll(self: &Arc<Self>, pid: Pid, r: Result<()>) {
         let now = Instant::now();
+        let provider = self.provider_of(pid);
         {
             let mut st = self.st();
             st.polling.remove(&pid);
             let delay = match r {
                 Ok(()) => {
                     st.fails.remove(&pid);
-                    st.offline = false;
+                    st.offline.remove(&provider);
                     st.last_error = None;
                     st.last_ok_ms = Some(now_ms());
                     let (d, idle) = interval_secs(self.ctx.cfg_now().poll_active_secs, &st, pid);
@@ -1175,7 +1203,7 @@ impl Engine {
                         *c
                     };
                     if is_transport(&e) {
-                        st.offline = true;
+                        st.offline.insert(provider);
                         debug!("nätverksfel, backoff: {e:#}");
                     } else {
                         warn!("synk misslyckades: {e:#}");
@@ -1523,7 +1551,9 @@ impl Engine {
             }
             Err(e) => {
                 let status = if is_transport(&e) {
-                    self.st().offline = true;
+                    let provider = ph::decode_identity(&req.identity)
+                        .map_or(Provider::Acc, |(_, pid, _)| self.provider_of(pid));
+                    self.st().offline.insert(provider);
                     STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE
                 } else {
                     STATUS_CLOUD_FILE_UNSUCCESSFUL
@@ -1629,7 +1659,7 @@ impl Engine {
         }
         let id2 = id.clone();
         let kids = db(&self.ctx, move |s| s.children(pid, &id2)).await?;
-        let me = me(&self.ctx);
+        let me = me_for_project(&self.ctx, pid);
         let mut seen = HashSet::new();
         let mut specs = Vec::new();
         let mut file_versions = Vec::new();
@@ -1779,7 +1809,7 @@ impl Engine {
             Ok(()) => debug!("hämtning klar (transfer {tk})"),
             Err(e) => {
                 let status = if is_transport(&e) {
-                    self.st().offline = true;
+                    self.st().offline.insert(provider);
                     STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE
                 } else {
                     STATUS_CLOUD_FILE_UNSUCCESSFUL
@@ -2187,7 +2217,8 @@ impl Engine {
                     }
                 })
             };
-            let processed = upload::process_due(&me.ctx).await;
+            let offline = me.st().offline.clone();
+            let processed = upload::process_due_except(&me.ctx, &offline).await;
             ticker.abort();
             match processed {
                 Ok(n) if n > 0 => debug!("kö: {n} jobb behandlade"),
@@ -2732,7 +2763,7 @@ impl Engine {
             ));
             return;
         };
-        if !self.ctx.signed_in(p.provider) || self.st().offline {
+        if !self.ctx.signed_in(p.provider) || self.st().offline.contains(&p.provider) {
             self.ctx.ui.send(UiMsg::notify(
                 Severity::Warning,
                 "Återställning kräver att du är inloggad och online",
@@ -2751,7 +2782,7 @@ impl Engine {
             self.ctx.ui.send(UiMsg::notify(Severity::Warning, "Kunde inte återställa: synkarbetet blev inte klart i tid. Lokala filer är kvar. Försök igen när överföringarna är klara."));
             return;
         }
-        if !self.ctx.signed_in(p.provider) || self.st().offline {
+        if !self.ctx.signed_in(p.provider) || self.st().offline.contains(&p.provider) {
             self.ctx.ui.send(UiMsg::notify(Severity::Warning, "Återställningen avbröts eftersom anslutningen eller inloggningen ändrades. Dina lokala filer finns kvar."));
             return;
         }
@@ -3239,6 +3270,24 @@ impl Engine {
         } else {
             None
         };
+        let lost = self.connectivity_lost();
+        let signed: Vec<Provider> = accounts
+            .iter()
+            .filter(|a| a.signed_in)
+            .map(|a| a.provider)
+            .collect();
+        // Which signed-in provider each project belongs to (the offline retry counts only theirs).
+        let project_providers: HashMap<Pid, Provider> = if lost {
+            self.ctx
+                .store
+                .projects()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.pid, p.provider))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let (state, text, error, transfers) = {
             let mut st = self.st();
             st.last_status = Some(Instant::now());
@@ -3266,15 +3315,21 @@ impl Engine {
                 ("signed_out", text.to_string())
             } else if let Some(e) = &st.last_error {
                 ("error", format!("Fel: {e}"))
-            } else if st.offline {
+            } else if lost {
                 let now = Instant::now();
                 let retry = st
                     .next_due
                     .iter()
                     .filter(|(pid, _)| !st.polling.contains(pid))
+                    .filter(|(pid, _)| {
+                        project_providers
+                            .get(pid)
+                            .is_some_and(|p| signed.contains(p))
+                    })
                     .map(|(_, due)| due.saturating_duration_since(now).as_secs())
                     .min();
-                ("offline", offline_text(retry))
+                let names: Vec<&str> = signed.iter().map(|p| p.label()).collect();
+                ("offline", offline_status_text(&names, retry))
             } else {
                 match sync_phase(
                     active,
@@ -3998,6 +4053,19 @@ fn waiting_text(pending: i64) -> String {
     )
 }
 
+/// The offline status when every signed-in provider is offline (`names`, their labels). With ACC
+/// alone it is the text ACC always had; otherwise it names the providers.
+fn offline_status_text(names: &[&str], retry_in_secs: Option<u64>) -> String {
+    if names == ["ACC"] {
+        return offline_text(retry_in_secs);
+    }
+    let who = names.join(" och ");
+    match retry_in_secs.filter(|secs| *secs > 0) {
+        Some(secs) => format!("Ingen anslutning till {who}. Försöker igen om {secs} s"),
+        None => format!("Ingen anslutning till {who}"),
+    }
+}
+
 /// Swedish status line while offline: "Försöker igen om 40 s" when a retry is scheduled.
 fn offline_text(retry_in_secs: Option<u64>) -> String {
     match retry_in_secs {
@@ -4565,12 +4633,29 @@ pub(crate) fn rel_components(root: &Path, path: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Display name of the signed-in user, to tell "locked by me" from "locked by someone else".
+/// Display name of the signed-in ACC user, to tell "locked by me" from "locked by someone else".
 pub(crate) fn me(ctx: &Ctx) -> Option<String> {
-    ctx.auth
-        .user()
+    me_for(ctx, Provider::Acc)
+}
+
+/// Display name of the signed-in user of `provider`: the holder a lock of that provider names is
+/// compared with this (a project's own provider, see `me_for_project`).
+pub(crate) fn me_for(ctx: &Ctx, provider: Provider) -> Option<String> {
+    ctx.user_for(provider)
         .map(|u| u.name)
         .filter(|n| !n.trim().is_empty())
+}
+
+/// `me_for` for the provider of the project `pid`.
+fn me_for_project(ctx: &Ctx, pid: Pid) -> Option<String> {
+    let provider = ctx
+        .store
+        .project(pid)
+        .ok()
+        .flatten()
+        .map(|p| p.provider)
+        .unwrap_or_default();
+    me_for(ctx, provider)
 }
 
 /// Locked in ACC by someone other than the signed-in user: the local copy is read-only. ACC
@@ -5290,7 +5375,7 @@ fn deleted_path(
 /// effects to run afterwards.
 fn disk_apply(ctx: &Ctx, p: &Project, changes: &[(Option<Item>, Option<Item>)]) -> Work {
     let mut w = Work::default();
-    let me = me(ctx);
+    let me = me_for(ctx, p.provider);
     let me = me.as_deref();
     let deleted: HashSet<String> = changes
         .iter()
@@ -6092,7 +6177,7 @@ pub(crate) fn keep_both(
     ctx.store.upsert_item(&clean)?;
     watcher::suppress(path, SUPPRESS);
     if let Some(dir) = path.parent() {
-        ph::create_placeholders(dir, &[spec_for(&clean, me(ctx).as_deref())])?;
+        ph::create_placeholders(dir, &[spec_for(&clean, me_for(ctx, p.provider).as_deref())])?;
         ctx.store
             .set_base_version(p.pid, &clean.id, clean.remote_version)?;
     }
@@ -6355,7 +6440,7 @@ fn refresh_placeholder(ctx: &Ctx, pid: Pid, id: &str) -> bool {
         pid,
         id,
         &path,
-        &spec_for(&it, me(ctx).as_deref()),
+        &spec_for(&it, me_for_project(ctx, pid).as_deref()),
         info.pin_state,
     ) {
         Ok(()) => {
@@ -7049,7 +7134,7 @@ fn restore_held(ctx: &Ctx, p: &Project) -> Result<usize> {
 /// Bring locally deleted items back as placeholders (their content is still in ACC), parents
 /// first. Caller holds `local_lock()`. Returns how many rows came back.
 pub(crate) fn restore_rows(ctx: &Ctx, p: &Project, ids: &[String]) -> Result<usize> {
-    let me = me(ctx);
+    let me = me_for(ctx, p.provider);
     let mut rows: Vec<Item> = ids
         .iter()
         .filter_map(|id| ctx.store.item(p.pid, id).ok().flatten())
@@ -7416,7 +7501,10 @@ fn reconcile(ctx: &Ctx) -> Work {
                 let mut fresh = it.clone();
                 fresh.populated = false;
                 let _ = ctx.store.set_populated(p.pid, &it.id, false);
-                let _ = ph::create_placeholders(&pdir, &[spec_for(&fresh, me(ctx).as_deref())]);
+                let _ = ph::create_placeholders(
+                    &pdir,
+                    &[spec_for(&fresh, me_for(ctx, p.provider).as_deref())],
+                );
                 continue;
             }
             let Some(path) = found.get(&it.id) else {
@@ -7441,7 +7529,9 @@ fn reconcile(ctx: &Ctx) -> Work {
                     }
                     let mut fresh = it.clone();
                     fresh.populated = false;
-                    if let Err(e) = create_item(ctx, &p, &fresh, me(ctx).as_deref(), &mut w) {
+                    if let Err(e) =
+                        create_item(ctx, &p, &fresh, me_for(ctx, p.provider).as_deref(), &mut w)
+                    {
                         warn!("kunde inte lägga tillbaka {}: {e:#}", it.name);
                     }
                 }

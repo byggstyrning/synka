@@ -183,13 +183,23 @@ enum Step {
     Locked,
 }
 
-/// Run all due jobs (respecting concurrency). Returns the number processed.
+/// Run all due jobs with every provider connected (the engine calls `process_due_except`).
+#[cfg(test)]
 pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
+    process_due_except(ctx, &HashSet::new()).await
+}
+
+/// `process_due` for an engine in which the providers in `offline` have no connection: their
+/// jobs wait without a request and without an attempt, and the other providers' jobs run.
+pub async fn process_due_except(
+    ctx: &CtxRef,
+    offline: &HashSet<Provider>,
+) -> anyhow::Result<usize> {
     let jobs: Vec<OutboxJob> = ctx
         .store
         .due_jobs(now_ms(), BATCH)?
         .into_iter()
-        .filter(|job| !waits_for_sign_in(ctx, job))
+        .filter(|job| !waits_for_sign_in(ctx, job) && !waits_while_offline(ctx, job, offline))
         .collect();
     if jobs.is_empty() {
         return Ok(0);
@@ -218,20 +228,38 @@ pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
     Ok(processed)
 }
 
-/// A job of a signed-out provider waits like offline work: it is postponed without a request and
-/// without spending an attempt. True when it waits.
-fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
-    let provider = ctx
-        .store
+/// The provider of a job's project (ACC when the project is gone).
+fn job_provider(ctx: &CtxRef, job: &OutboxJob) -> Provider {
+    ctx.store
         .project(job.pid)
         .ok()
         .flatten()
         .map(|p| p.provider)
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// A job of a signed-out provider waits like offline work: it is postponed without a request and
+/// without spending an attempt. True when it waits.
+fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
+    let provider = job_provider(ctx, job);
     if ctx.signed_in(provider) {
         return false;
     }
     let waiting = format!("Logga in på {} för att synka.", provider.label());
+    let _ = ctx
+        .store
+        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
+    true
+}
+
+/// A job of a provider without a connection waits like offline work (see `handle_failure`): no
+/// request, no attempt. The other providers' jobs are not affected. True when it waits.
+fn waits_while_offline(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
+    let provider = job_provider(ctx, job);
+    if !offline.contains(&provider) {
+        return false;
+    }
+    let waiting = format!("Ingen anslutning till {}.", provider.label());
     let _ = ctx
         .store
         .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);

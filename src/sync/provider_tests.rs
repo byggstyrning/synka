@@ -641,3 +641,93 @@ fn acc_keeps_its_own_matching_rules_for_a_same_name_listing() {
         "a foreign ACC object stays a remote file"
     );
 }
+
+#[tokio::test]
+async fn an_offline_provider_pauses_only_its_own_jobs() {
+    let mut f = fixture("provider-offline-jobs");
+    client_override_signed_in(&mut f);
+    interaxo_signed_in(&mut f);
+    let interaxo = other_provider_project(&f, Provider::Interaxo);
+    f.ctx
+        .store
+        .enqueue(interaxo.pid, "upload", None, "{}")
+        .unwrap();
+    f.ctx.store.enqueue(f.p.pid, "upload", None, "{}").unwrap();
+
+    let offline = HashSet::from([Provider::Interaxo]);
+    let processed = upload::process_due_except(&f.ctx, &offline).await.unwrap();
+    assert_eq!(processed, 1, "the ACC job ran although Interaxo is offline");
+    let summary = f.ctx.store.job_summary().unwrap();
+    let waiting = summary
+        .iter()
+        .find(|(_, _, _, error)| error.as_deref() == Some("Ingen anslutning till Interaxo."))
+        .expect("the Interaxo job waits with the offline reason");
+    assert_eq!(waiting.2, 0, "waiting spends no attempt");
+    assert!(!waiting.1, "and is not dead");
+}
+
+/// The last status event the engine sent.
+fn last_status(f: &Fixture) -> Status {
+    f._rx
+        .try_iter()
+        .filter_map(|m| match m {
+            UiMsg::Status(status) => Some(status),
+            _ => None,
+        })
+        .last()
+        .expect("a status event")
+}
+
+#[test]
+fn the_engine_is_offline_only_when_every_signed_in_provider_is() {
+    let mut f = fixture("provider-offline-status");
+    client_override_signed_in(&mut f);
+    interaxo_signed_in(&mut f);
+    other_provider_project(&f, Provider::Interaxo);
+    let engine = Engine::new(f.ctx.clone());
+
+    engine.st().offline.insert(Provider::Interaxo);
+    engine.publish_now();
+    let status = last_status(&f);
+    assert_ne!(
+        status.state, "offline",
+        "ACC still works, so the engine is online"
+    );
+
+    engine.st().offline.insert(Provider::Acc);
+    engine.publish_now();
+    let status = last_status(&f);
+    assert_eq!(status.state, "offline");
+    assert_eq!(status.text, "Ingen anslutning till ACC och Interaxo");
+
+    // With ACC alone, the status keeps the text it always had.
+    let mut acc_only = fixture("provider-offline-acc-only");
+    client_override_signed_in(&mut acc_only);
+    let engine = Engine::new(acc_only.ctx.clone());
+    engine.st().offline.insert(Provider::Acc);
+    engine.publish_now();
+    let status = last_status(&acc_only);
+    assert_eq!(status.state, "offline");
+    assert_eq!(status.text, "Ingen anslutning till ACC");
+}
+
+#[test]
+fn a_lock_held_by_the_users_own_interaxo_account_is_not_read_only() {
+    let mut f = fixture("interaxo-lock-owner");
+    interaxo_signed_in(&mut f);
+    make_interaxo(&f);
+    let p = f.ctx.store.project(f.p.pid).unwrap().unwrap();
+    let me = me_for(&f.ctx, Provider::Interaxo);
+    assert_eq!(me.as_deref(), Some("Testanvändare"));
+
+    let mut own = row(&p, "I1", Some("co.ROOT"), "a.pdf", Kind::File);
+    own.locked_by = Some("Testanvändare".into());
+    assert!(
+        !spec_for(&own, me.as_deref()).read_only,
+        "the user's own lock"
+    );
+
+    let mut other = row(&p, "I2", Some("co.ROOT"), "b.pdf", Kind::File);
+    other.locked_by = Some("Bo Ek".into());
+    assert!(spec_for(&other, me.as_deref()).read_only);
+}
