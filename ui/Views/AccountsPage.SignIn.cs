@@ -180,12 +180,6 @@ public sealed partial class AccountsPage
         /// <summary>The server the user picked last. Kept when the list changes.</summary>
         private string? _choice;
 
-        /// <summary>
-        /// The engine has not answered the attempt yet (no progress for it has come). A warning
-        /// notify then refuses it: the engine refuses an account that is signed in already that way.
-        /// </summary>
-        private bool _awaitingAnswer;
-
         public StreamBimSignIn(AccountsPage page, XamlRoot root)
         {
             _page = page;
@@ -294,9 +288,7 @@ public sealed partial class AccountsPage
                 ShowCode(codeFor);
             }
 
-            _page._engine.Notified += OnNotified;
             await _page.ShowDialogAsync(_dialog);
-            _page._engine.Notified -= OnNotified;
             _closed = true;
             if (_ended || _attempt is not { } key)
             {
@@ -323,7 +315,6 @@ public sealed partial class AccountsPage
             }
 
             var key = _attempt;
-            _awaitingAnswer = false;
             switch (progress.State)
             {
                 case "mfa_required":
@@ -368,24 +359,6 @@ public sealed partial class AccountsPage
                     Refresh();
                     break;
             }
-        }
-
-        /// <summary>
-        /// A warning or error notify while the form waits for the engine's answer: the engine refused the
-        /// sign-in (an account already signed in that way, say). The form is editable again, with the reason.
-        /// </summary>
-        private void OnNotified(object? sender, NotifyInfo notify)
-        {
-            if (_onCode || !_awaitingAnswer || _attempt is null || notify.Severity is not ("warning" or "error"))
-            {
-                return;
-            }
-
-            _attempt = null;
-            _awaitingAnswer = false;
-            var text = ErrorDisplay.FriendlyDetail(notify.Body);
-            ShowFormError(text.Length > 0 ? text : Lang.T("Inloggningen gick inte att starta.", "Sign-in could not be started."));
-            Refresh();
         }
 
         /// <summary>The engine sent its region list: the server list follows it, unless the code step is showing.</summary>
@@ -589,7 +562,6 @@ public sealed partial class AccountsPage
 
             _password.Password = string.Empty;
             _attempt = key;
-            _awaitingAnswer = true;
             _page._streamBimFailureKey = null;
             _page.DismissFailure(ProviderNames.StreamBim, key);
             ShowFormError(null);
@@ -605,7 +577,6 @@ public sealed partial class AccountsPage
             if (_attempt == key)
             {
                 _attempt = null;
-                _awaitingAnswer = false;
             }
             if (_closed)
             {

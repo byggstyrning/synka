@@ -751,10 +751,42 @@ impl Engine {
         self.publish();
     }
 
+    /// Ends a StreamBIM sign-in that is refused before its attempt starts: a terminal
+    /// `sign_in_progress` `failed` with the reason, for its account (None when the server text names
+    /// none). No attempt is made or removed, so other attempts and a signed-in account keep their
+    /// state. Nothing enters `sign_ins` or `signing_in` for it, and `failed` is never kept for the
+    /// hello replay (only a pending wait is).
+    fn sign_in_refused(&self, account: Option<String>, text: &str) {
+        self.ctx.ui.send(UiMsg::SignInProgress {
+            provider: Provider::StreamBim,
+            account,
+            state: "failed",
+            error: Some(text.to_string()),
+        });
+    }
+
+    /// Refuses a command before it runs. A StreamBIM sign-in ends with `sign_in_refused`; every
+    /// other command keeps its warning notify.
+    fn refuse_command(&self, cmd: &TrayCmd, text: &str) {
+        match cmd {
+            TrayCmd::SignIn {
+                provider: Provider::StreamBim,
+                streambim,
+            } => {
+                let account = streambim
+                    .as_ref()
+                    .and_then(|login| streambim_server(login).ok())
+                    .map(|(key, _)| key);
+                self.sign_in_refused(account, text);
+            }
+            _ => self.ctx.ui.send(UiMsg::notify(Severity::Warning, text)),
+        }
+    }
+
     /// Password sign-in to one StreamBIM server. The server (a region or a custom address) gives
     /// the account key. An account that is signed in is not signed in again; the user signs out
-    /// first. Nothing is sent to the UI when the login starts: the next event is `mfa_required`,
-    /// `signed_in` or `failed`.
+    /// first, and that refusal is a `failed` progress for the account. Nothing is sent to the UI
+    /// when the login starts: the next event is `mfa_required`, `signed_in` or `failed`.
     async fn sign_in_streambim(
         self: &Arc<Self>,
         login: Option<StreamBimLogin>,
@@ -762,21 +794,17 @@ impl Engine {
         itx: &UnboundedSender<Internal>,
     ) {
         let Some(login) = login else {
-            self.ctx.ui.send(UiMsg::notify(
-                Severity::Warning,
+            self.sign_in_refused(
+                None,
                 "Ange region, e-postadress och lösenord för StreamBIM.",
-            ));
+            );
             self.publish();
             return;
         };
-        let server = match &login.server {
-            StreamBimServer::Region(region) => server_from_region(region),
-            StreamBimServer::Url(url) => server_from_url(url),
-        };
-        let (account_key, base) = match server {
+        let (account_key, base) = match streambim_server(&login) {
             Ok(server) => server,
             Err(text) => {
-                self.ctx.ui.send(UiMsg::notify(Severity::Warning, text));
+                self.sign_in_refused(None, &text);
                 self.publish();
                 return;
             }
@@ -792,13 +820,11 @@ impl Engine {
             .get(&account_key)
             .filter(|account| account.auth.is_signed_in())
         {
-            self.ctx.ui.send(UiMsg::notify(
-                Severity::Warning,
-                format!(
-                    "Du är redan inloggad på {} – logga ut först.",
-                    account.auth.host()
-                ),
-            ));
+            let text = format!(
+                "Du är redan inloggad på {} – logga ut först.",
+                account.auth.host()
+            );
+            self.sign_in_refused(Some(account_key), &text);
             self.publish();
             return;
         }
@@ -2480,13 +2506,23 @@ impl Engine {
         itx: &UnboundedSender<Internal>,
     ) {
         if live.restart_pending {
+            // A StreamBIM sign-in that the restart overtakes still ends for its dialog.
+            if matches!(
+                cmd,
+                TrayCmd::SignIn {
+                    provider: Provider::StreamBim,
+                    ..
+                }
+            ) {
+                self.refuse_command(&cmd, "Synka startar redan om. Försök igen efter omstarten.");
+            }
             return;
         }
         let Some(_command) = self.begin_command(&cmd) else {
-            self.ctx.ui.send(UiMsg::notify(
-                Severity::Warning,
+            self.refuse_command(
+                &cmd,
                 "Vänta tills den pågående återställningen eller flytten är klar.",
-            ));
+            );
             return;
         };
         match cmd {
@@ -5192,6 +5228,14 @@ fn offline_hubs(
 fn next_sign_in_generation(live: &mut Live) -> u64 {
     live.sign_in_generation = live.sign_in_generation.wrapping_add(1);
     live.sign_in_generation
+}
+
+/// The account key and the origin of a login's server (a region or a custom address).
+fn streambim_server(login: &StreamBimLogin) -> Result<(String, String), String> {
+    match &login.server {
+        StreamBimServer::Region(region) => server_from_region(region),
+        StreamBimServer::Url(url) => server_from_url(url),
+    }
 }
 
 /// Ends a StreamBIM MFA wait after MFA_WAIT.

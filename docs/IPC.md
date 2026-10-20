@@ -90,9 +90,12 @@ See `docs/PROVIDERS.md`. Clarifications:
   (as the ACC rule: clicks within one second share it). StreamBIM requires exactly one of
   `region` (matching `^[a-z0-9-]{1,32}$`) or `url` (a valid custom https address, see above),
   plus `username` and `password`; anything else is refused in the ack. Signing in to a StreamBIM
-  server that already has a signed-in account is refused with a warning `notify` ("Du är redan
-  inloggad på … – logga ut först."). The password goes only to that server. The password is used once and never
-  stored or logged. `sign_in_progress` reports `browser` (ACC/Interaxo, waiting for the browser),
+  server that already has a signed-in account answers `sign_in_progress` `failed` for that account
+  with the error text ("Du är redan inloggad på … – logga ut först."); the account stays signed in.
+  Any other refusal after the ack (a rebuild or move in progress, a server text that is not usable)
+  also ends with a `failed` progress, with a null `account` when the server text names none. The
+  password goes only to that server. The password is used once and never stored or logged.
+  `sign_in_progress` reports `browser` (ACC/Interaxo, waiting for the browser),
   `mfa_required` (StreamBIM, send `sign_in_mfa` within five minutes), then `signed_in`, `failed`
   (with `error`) or `cancelled`. A failed MFA code gives `failed`; the user starts over.
 - **`sign_out`.** Signing out of one provider stops polling and uploading its projects; their

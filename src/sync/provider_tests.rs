@@ -1148,10 +1148,29 @@ fn streambim_project_of(f: &Fixture, key: &str) -> Project {
     p
 }
 
+/// The `sign_in_progress` messages sent so far, as (account, state, error); the other messages are
+/// dropped. Used where a refusal must end the window's dialog and nothing else may be sent.
+fn sign_in_progress_sent(f: &Fixture) -> Vec<(Option<String>, &'static str, Option<String>)> {
+    f._rx
+        .try_iter()
+        .filter_map(|m| match m {
+            UiMsg::SignInProgress {
+                provider: Provider::StreamBim,
+                account,
+                state,
+                error,
+            } => Some((account, state, error)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn a_second_sign_in_to_a_signed_in_server_is_refused_with_a_notice() {
+async fn a_second_sign_in_to_a_signed_in_server_ends_as_a_failed_progress() {
     let mut f = fixture("sign-in-refused");
     streambim_signed_in(&mut f, "app");
+    let session = f.ctx.paths.state_dir.join("token-streambim-app.bin");
+    let session_before = std::fs::read(&session).unwrap();
     let engine = Engine::new(f.ctx.clone());
     let mut live = test_live();
     let (itx, _irx) = unbounded_channel();
@@ -1171,17 +1190,33 @@ async fn a_second_sign_in_to_a_signed_in_server_is_refused_with_a_notice() {
         )
         .await;
     assert!(live.sign_ins.is_empty(), "no attempt is started");
-    assert_eq!(
-        notices(
-            &f,
-            "Du är redan inloggad på app.streambim.com – logga ut först."
-        ),
-        1
+    assert!(
+        engine.st().signing_in.is_empty(),
+        "nothing is marked as signing in"
     );
+    assert_eq!(
+        sign_in_progress_sent(&f),
+        vec![(
+            Some("app".to_string()),
+            "failed",
+            Some("Du är redan inloggad på app.streambim.com – logga ut först.".to_string()),
+        )]
+    );
+    assert_eq!(
+        notices(&f, "redan inloggad"),
+        0,
+        "the refusal is no longer a notify"
+    );
+    let account = f.ctx.streambim.get("app").expect("the account stays");
+    assert!(
+        account.auth.is_signed_in(),
+        "the signed-in account keeps its session"
+    );
+    assert_eq!(std::fs::read(&session).unwrap(), session_before);
 }
 
 #[tokio::test]
-async fn a_custom_address_that_is_not_https_is_refused_before_any_request() {
+async fn a_custom_address_that_is_not_https_ends_as_a_failed_progress_without_an_account() {
     let f = fixture("sign-in-url");
     let engine = Engine::new(f.ctx.clone());
     let mut live = test_live();
@@ -1202,7 +1237,117 @@ async fn a_custom_address_that_is_not_https_is_refused_before_any_request() {
         )
         .await;
     assert!(live.sign_ins.is_empty());
-    assert_eq!(notices(&f, "Adressen måste börja med https://"), 1);
+    let sent = sign_in_progress_sent(&f);
+    assert_eq!(sent.len(), 1, "one terminal progress: {sent:?}");
+    assert_eq!(sent[0].0, None);
+    assert_eq!(sent[0].1, "failed");
+    assert!(sent[0]
+        .2
+        .as_deref()
+        .is_some_and(|e| e.starts_with("Adressen måste börja med https://")));
+    assert_eq!(notices(&f, "Adressen måste börja med https://"), 0);
+}
+
+#[tokio::test]
+async fn a_streambim_sign_in_without_a_login_ends_as_a_failed_progress() {
+    let f = fixture("sign-in-no-login");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::StreamBim,
+                streambim: None,
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert!(live.sign_ins.is_empty());
+    assert_eq!(
+        sign_in_progress_sent(&f),
+        vec![(
+            None,
+            "failed",
+            Some("Ange region, e-postadress och lösenord för StreamBIM.".to_string()),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_streambim_sign_in_refused_by_a_move_or_a_restart_ends_as_a_failed_progress() {
+    let f = fixture("sign-in-refused-move");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    let login = || StreamBimLogin {
+        server: StreamBimServer::Region("app".into()),
+        username: "ada@example.com".into(),
+        password: Secret("pw-test".into()),
+    };
+    let sign_in = || TrayCmd::SignIn {
+        provider: Provider::StreamBim,
+        streambim: Some(login()),
+    };
+
+    engine.st().moving = true;
+    engine.on_cmd(sign_in(), &mut live, &itx).await;
+    engine.st().moving = false;
+    assert!(live.sign_ins.is_empty());
+    assert!(engine.st().signing_in.is_empty());
+    assert_eq!(
+        sign_in_progress_sent(&f),
+        vec![(
+            Some("app".to_string()),
+            "failed",
+            Some("Vänta tills den pågående återställningen eller flytten är klar.".to_string()),
+        )]
+    );
+
+    live.restart_pending = true;
+    engine.on_cmd(sign_in(), &mut live, &itx).await;
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::Acc,
+                streambim: None,
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert!(live.sign_ins.is_empty());
+    assert_eq!(
+        sign_in_progress_sent(&f),
+        vec![(
+            Some("app".to_string()),
+            "failed",
+            Some("Synka startar redan om. Försök igen efter omstarten.".to_string()),
+        )],
+        "a restart ends a StreamBIM sign-in only; an ACC command stays silent"
+    );
+}
+
+#[tokio::test]
+async fn an_acc_sign_in_refused_during_a_move_keeps_its_warning_notify() {
+    let f = fixture("acc-sign-in-refused-move");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (itx, _irx) = unbounded_channel();
+    engine.st().moving = true;
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::Acc,
+                streambim: None,
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert_eq!(notices(&f, "Vänta tills den pågående återställningen"), 1);
+    assert!(sign_in_progress_sent(&f).is_empty());
 }
 
 #[tokio::test]
