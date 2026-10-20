@@ -3,8 +3,9 @@
 //!
 //! Files in the state directory: `token-streambim.bin` (DPAPI-protected JSON with the refresh
 //! material) and `user-streambim.json` (plain JSON profile with the region and base URL). The
-//! password, the tokens and the MFA session are never logged or put in an error message; only
-//! HTTP status codes are logged.
+//! password, the tokens and the MFA session are never logged or put in an error message. A
+//! refused call is logged with the server's reason, but only after the submitted secrets are
+//! removed from it (see `clean`).
 
 // `login`, `verify_mfa`, `sign_out` and `LoginOutcome` are called by the sign-in commands of
 // the IPC layer, which is wired in a later step; until then only the tests call them.
@@ -34,6 +35,15 @@ const SESSION_EXPIRED: &str = "StreamBIM-sessionen har gått ut – logga in ige
 const CODE_EXPIRED: &str = "Koden har gått ut – logga in igen.";
 const REFRESH_RETRY: &str =
     "StreamBIM-sessionen kunde inte förnyas: inget giltigt svar. Försök igen.";
+const TOO_MANY_LOGINS: &str =
+    "StreamBIM: för många inloggningsförsök. Vänta en stund och försök igen.";
+/// The most bytes of an error reply that are read. The rest is not read.
+const ERROR_BODY_BYTES: usize = 8 * 1024;
+/// Caps for the cleaned texts of a refused call (characters).
+const REASON_CHARS: usize = 200;
+const TEXT_REASON_CHARS: usize = 120;
+const CODE_CHARS: usize = 100;
+const RESULT_CHARS: usize = 60;
 
 /// What a password login leads to.
 #[derive(Debug)]
@@ -110,8 +120,13 @@ struct AuthReply {
 /// What an auth endpoint answered.
 enum Answer {
     Reply(AuthReply),
-    /// A non-2xx status.
-    Status(u16),
+    /// A non-2xx status, with the server's code and reason. Both are cleaned of the secrets
+    /// sent in the request (see `clean`), so they may be shown and logged.
+    Status {
+        status: u16,
+        code: String,
+        reason: String,
+    },
     /// No answer, or an answer that is not JSON.
     Failed,
 }
@@ -192,7 +207,12 @@ impl StreamBimAuth {
         }
         let body = json!({ "username": username, "password": password });
         match self
-            .call("login", &format!("{base}/auth/v1/login"), &body)
+            .call(
+                "login",
+                &format!("{base}/auth/v1/login"),
+                &body,
+                &[username, password],
+            )
             .await
         {
             Answer::Reply(mut reply) => match std::mem::take(&mut reply.result).as_str() {
@@ -226,14 +246,14 @@ impl StreamBimAuth {
                     info!("StreamBIM: MFA-kod krävs (region {region})");
                     Ok(LoginOutcome::MfaRequired)
                 }
+                "NEW_PASSWORD_REQUIRED" => bail!(password_reset_text(region)),
                 _ => bail!("StreamBIM-inloggningen misslyckades: oväntat svar från servern."),
             },
-            Answer::Status(400 | 401 | 403) => {
-                bail!("Fel e-post eller lösenord för StreamBIM (region {region}).")
-            }
-            Answer::Status(status) => {
-                bail!("StreamBIM-inloggningen misslyckades: HTTP {status}")
-            }
+            Answer::Status {
+                status,
+                code,
+                reason,
+            } => bail!(login_refusal(region, status, &code, &reason)),
             Answer::Failed => {
                 bail!("StreamBIM-inloggningen misslyckades: inget giltigt svar från servern.")
             }
@@ -258,7 +278,12 @@ impl StreamBimAuth {
             "code": code,
         });
         let url = format!("{}/auth/v1/mfa/verify", challenge.base);
-        match self.call("mfa/verify", &url, &body).await {
+        let secrets = [
+            challenge.username.as_str(),
+            challenge.session.as_str(),
+            code,
+        ];
+        match self.call("mfa/verify", &url, &body, &secrets).await {
             Answer::Reply(reply) if reply.result == "SUCCESS" => {
                 let tokens = tokens_from(reply, None, now_secs()).ok_or_else(|| {
                     anyhow!("StreamBIM-verifieringen misslyckades: svaret saknar token.")
@@ -275,11 +300,22 @@ impl StreamBimAuth {
                 info!("StreamBIM: MFA godkänd (region {})", challenge.region);
                 Ok(profile_user(&profile))
             }
-            Answer::Reply(_) => bail!("Fel kod för StreamBIM – logga in igen."),
-            Answer::Status(400 | 401 | 403) => bail!("Fel kod för StreamBIM – logga in igen."),
-            Answer::Status(status) => {
-                self.st().pending = Some(challenge);
-                bail!("StreamBIM-verifieringen misslyckades: HTTP {status}")
+            // Any other definitive answer ends the challenge, as a refusal does.
+            Answer::Reply(reply) => {
+                let result = clean(&reply.result, &secret_forms(&secrets), RESULT_CHARS);
+                bail!(mfa_refusal(200, "", &result))
+            }
+            Answer::Status {
+                status,
+                code: error_code,
+                reason,
+            } => {
+                let message = mfa_refusal(status, &error_code, &reason);
+                // A transient failure keeps the challenge for another try.
+                if !matches!(status, 400 | 401 | 403) {
+                    self.st().pending = Some(challenge);
+                }
+                bail!(message)
             }
             Answer::Failed => {
                 self.st().pending = Some(challenge);
@@ -425,8 +461,14 @@ impl StreamBimAuth {
             bail!(SESSION_EXPIRED);
         };
         let body = json!({ "token": tokens.id_token, "refreshToken": refresh_token });
+        let secrets = [tokens.id_token.as_str(), refresh_token.as_str()];
         match self
-            .call("refresh", &format!("{base}/auth/v1/refresh"), &body)
+            .call(
+                "refresh",
+                &format!("{base}/auth/v1/refresh"),
+                &body,
+                &secrets,
+            )
             .await
         {
             Answer::Reply(reply) if reply.result == "SUCCESS" => {
@@ -449,15 +491,19 @@ impl StreamBimAuth {
                 self.clear_session();
                 bail!(SESSION_EXPIRED)
             }
-            // The server refuses the refresh material: the session is over.
-            Answer::Status(status @ (400 | 401 | 403)) => {
+            // The server refuses the refresh material: the session is over. The reason is in the
+            // WARN line that `call` logged.
+            Answer::Status {
+                status: status @ (400 | 401 | 403),
+                ..
+            } => {
                 warn!(status, "StreamBIM: sessionen avvisades");
                 self.clear_session();
                 bail!(SESSION_EXPIRED)
             }
             // Everything else is temporary (throttling, timeouts, server errors, no answer, an
             // unknown reply). The refresh material may still be good: keep it.
-            Answer::Status(status) => {
+            Answer::Status { status, .. } => {
                 warn!(status, "StreamBIM: sessionen kunde inte förnyas");
                 bail!("StreamBIM-sessionen kunde inte förnyas: HTTP {status}. Försök igen.")
             }
@@ -492,12 +538,15 @@ impl StreamBimAuth {
         write_atomic(&self.token_path(), &dpapi_protect(&plain)?)
     }
 
-    /// POST a JSON body. Any 2xx with a JSON body is a `Reply`; other statuses are returned as
-    /// they are. The body is never logged, only the endpoint and the status.
-    async fn call(&self, endpoint: &str, url: &str, body: &Value) -> Answer {
+    /// POST a JSON body. A 2xx with a JSON body is a `Reply`. Any other status is a `Status`
+    /// with the server's code and reason. `secrets` are the values sent in this request; they are
+    /// removed from everything that is kept or logged. Each failed call is logged at WARN with
+    /// the endpoint, the status, the code and the reason.
+    async fn call(&self, endpoint: &str, url: &str, body: &Value, secrets: &[&str]) -> Answer {
         let Ok(bytes) = serde_json::to_vec(body) else {
             return Answer::Failed;
         };
+        let forms = secret_forms(secrets);
         let sent = self
             .http
             .post(url)
@@ -509,18 +558,33 @@ impl StreamBimAuth {
         let resp = match sent {
             Ok(resp) => resp,
             Err(e) => {
-                debug!(endpoint, error = %e.without_url(), "StreamBIM: anropet misslyckades");
+                warn!(endpoint, error = %e.without_url(), "StreamBIM: anropet misslyckades");
                 return Answer::Failed;
             }
         };
-        let status = resp.status();
-        debug!(endpoint, status = status.as_u16(), "StreamBIM: auth");
-        if !status.is_success() {
-            return Answer::Status(status.as_u16());
+        let status = resp.status().as_u16();
+        debug!(endpoint, status, "StreamBIM: auth");
+        if !(200..300).contains(&status) {
+            let (code, reason) = refusal_details(&read_error_body(resp).await, &forms);
+            warn!(endpoint, status, code = %code, reason = %reason, "StreamBIM: anropet avvisades");
+            return Answer::Status {
+                status,
+                code,
+                reason,
+            };
         }
         match resp.json::<AuthReply>().await {
-            Ok(reply) => Answer::Reply(reply),
-            Err(_) => Answer::Failed,
+            Ok(reply) => {
+                if !matches!(reply.result.as_str(), "SUCCESS" | "CHALLENGE_REQUESTED") {
+                    let result = clean(&reply.result, &forms, RESULT_CHARS);
+                    warn!(endpoint, status, result = %result, "StreamBIM: oväntat resultat i svaret");
+                }
+                Answer::Reply(reply)
+            }
+            Err(_) => {
+                warn!(endpoint, status, "StreamBIM: svaret kunde inte läsas");
+                Answer::Failed
+            }
         }
     }
 
@@ -608,6 +672,233 @@ fn tokens_from(reply: AuthReply, previous_refresh: Option<String>, now: i64) -> 
     })
 }
 
+/// The start of an error reply, at most `ERROR_BODY_BYTES`. Reading stops there.
+async fn read_error_body(mut resp: reqwest::Response) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        let room = ERROR_BODY_BYTES - bytes.len();
+        if chunk.len() >= room {
+            bytes.extend_from_slice(&chunk[..room]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    bytes
+}
+
+/// The code and the reason of a refused call, both cleaned with `forms`. A JSON reply gives them
+/// from the fields that StreamBIM and its AWS-style backends use. Other text gives its first
+/// characters, and HTML is only named.
+fn refusal_details(body: &[u8], forms: &[String]) -> (String, String) {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        let text = String::from_utf8_lossy(body);
+        if text.contains('<') {
+            return (String::new(), "(HTML)".to_string());
+        }
+        return (String::new(), clean(&text, forms, TEXT_REASON_CHARS));
+    };
+    let text = |key: &str| value.get(key).and_then(Value::as_str);
+    let first = value.get("errors").and_then(|errors| errors.get(0));
+    let nested = |key: &str| first.and_then(|e| e.get(key)).and_then(Value::as_str);
+    let reason = first_clean(
+        [
+            text("message"),
+            text("errorMessage"),
+            text("error_description"),
+            text("error"),
+            text("detail"),
+            nested("detail"),
+            nested("title"),
+            text("__type"),
+            text("code"),
+            text("errorCode"),
+            text("type"),
+        ],
+        forms,
+        REASON_CHARS,
+    );
+    let code = first_clean(
+        [
+            text("code"),
+            text("errorCode"),
+            text("__type"),
+            text("error"),
+            nested("code"),
+        ],
+        forms,
+        CODE_CHARS,
+    );
+    (code, reason)
+}
+
+/// The first candidate that is not empty once cleaned.
+fn first_clean<'a>(
+    candidates: impl IntoIterator<Item = Option<&'a str>>,
+    forms: &[String],
+    cap: usize,
+) -> String {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|raw| clean(raw, forms, cap))
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
+}
+
+/// Each secret as it can appear in a reply: as typed, and as JSON text (quotes and backslashes
+/// escaped), since a server may repeat the request body. Empty secrets are skipped. Longest first,
+/// so that a secret which contains another one is removed whole.
+fn secret_forms(secrets: &[&str]) -> Vec<String> {
+    let mut forms: Vec<String> = Vec::new();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        forms.push(secret.to_string());
+        let json = serde_json::to_string(secret).unwrap_or_default();
+        if let Some(escaped) = json.get(1..json.len().saturating_sub(1)) {
+            if escaped != *secret {
+                forms.push(escaped.to_string());
+            }
+        }
+    }
+    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    forms
+}
+
+/// `text` with every occurrence of each form replaced by "***". ASCII letters match in any case.
+fn redact(text: &str, forms: &[String]) -> String {
+    forms
+        .iter()
+        .fold(text.to_string(), |out, form| replace_secret(&out, form))
+}
+
+fn replace_secret(text: &str, secret: &str) -> String {
+    // ASCII lowercasing keeps every byte offset, so a match in `lower` is a match in `text`.
+    let lower = text.to_ascii_lowercase();
+    let secret = secret.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (start, found) in lower.match_indices(secret.as_str()) {
+        out.push_str(&text[last..start]);
+        out.push_str("***");
+        last = start + found.len();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// A reply's text made safe to keep or log: the secrets become "***" (before anything is cut, so
+/// a cut never leaves part of one), control characters are dropped, whitespace is collapsed, and
+/// the result is at most `cap` characters.
+fn clean(text: &str, forms: &[String], cap: usize) -> String {
+    let plain: String = redact(text, forms)
+        .chars()
+        .filter_map(|c| {
+            if c.is_whitespace() {
+                Some(' ')
+            } else if c.is_control() {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect();
+    let collapsed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .chars()
+        .take(cap)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// Letters and digits only, lowercase. Matching on this makes "Password reset required" match
+/// "passwordresetrequired" and "NEW_PASSWORD_REQUIRED" match "new_password_required".
+fn squash(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// True when the code or the reason contains one of the needles (case and punctuation aside).
+fn mentions(code: &str, reason: &str, needles: &[&str]) -> bool {
+    let hay = squash(&format!("{code} {reason}"));
+    needles.iter().any(|needle| hay.contains(&squash(needle)))
+}
+
+/// The Swedish text for a refused password step.
+fn login_refusal(region: &str, status: u16, code: &str, reason: &str) -> String {
+    if mentions(
+        code,
+        reason,
+        &["usernotfound", "user does not exist", "not found"],
+    ) {
+        return format!(
+            "Det finns inget StreamBIM-konto med den e-postadressen i regionen {region}. \
+             Välj en annan region (de flesta svenska konton finns i Europe eller Sweden)."
+        );
+    }
+    if mentions(
+        code,
+        reason,
+        &[
+            "passwordresetrequired",
+            "new_password_required",
+            "force_change_password",
+        ],
+    ) {
+        return password_reset_text(region);
+    }
+    if mentions(code, reason, &["usernotconfirmed"]) {
+        return "StreamBIM-kontot är inte bekräftat ännu. Bekräfta det via e-posten från StreamBIM."
+            .to_string();
+    }
+    if mentions(
+        code,
+        reason,
+        &["federat", "sso", "external", "identity provider"],
+    ) {
+        return "Kontot loggar in via SSO (t.ex. Microsoft). Synka kan bara logga in StreamBIM-konton med lösenord ännu."
+            .to_string();
+    }
+    if status == 401 || mentions(code, reason, &["notauthorized", "incorrect"]) {
+        return format!(
+            "Fel e-post eller lösenord för StreamBIM (region {region}). \
+             Kontrollera också att kontot finns i den regionen."
+        );
+    }
+    if status == 429 {
+        return TOO_MANY_LOGINS.to_string();
+    }
+    refused_text(status, reason)
+}
+
+/// The Swedish text for a login that needs a password change in the web app.
+fn password_reset_text(region: &str) -> String {
+    format!(
+        "StreamBIM kräver att du byter lösenord. Logga in på {region}.streambim.com i webbläsaren först."
+    )
+}
+
+/// The Swedish text for a refused verify_mfa call.
+fn mfa_refusal(status: u16, code: &str, reason: &str) -> String {
+    if mentions(code, reason, &["codemismatch", "invalid code", "incorrect"]) {
+        return "Fel kod. Logga in igen och ange en ny kod.".to_string();
+    }
+    if status == 429 {
+        return TOO_MANY_LOGINS.to_string();
+    }
+    refused_text(status, reason)
+}
+
+/// The generic text: the status, and the reason when there is one.
+fn refused_text(status: u16, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("StreamBIM avvisade inloggningen (HTTP {status})")
+    } else {
+        format!("StreamBIM avvisade inloggningen (HTTP {status}): {reason}")
+    }
+}
+
 /// True for a StreamBIM region subdomain (`^[a-z0-9-]{1,32}$`).
 pub fn valid_region(region: &str) -> bool {
     (1..=32).contains(&region.len())
@@ -674,6 +965,7 @@ mod tests {
     use super::*;
     use crate::test_support::{Fault, Request, Server};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     /// A state directory that is removed when dropped.
     struct TestDir(PathBuf);
@@ -840,14 +1132,14 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "Fel e-post eller lösenord för StreamBIM (region sweden)."
+            "Fel e-post eller lösenord för StreamBIM (region sweden). Kontrollera också att kontot finns i den regionen."
         );
         assert!(!err.contains("hunter2"));
         assert!(!auth.is_signed_in());
     }
 
     #[tokio::test]
-    async fn other_login_failures_report_the_status_only() {
+    async fn other_login_failures_report_the_status_and_the_reason() {
         let server = Server::new(|_, _| reply_json(500, json!({"detail": "boom"}))).await;
         let dir = TestDir::new("status");
         let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
@@ -856,7 +1148,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "StreamBIM-inloggningen misslyckades: HTTP 500");
+        assert_eq!(err, "StreamBIM avvisade inloggningen (HTTP 500): boom");
     }
 
     #[tokio::test]
@@ -906,7 +1198,10 @@ mod tests {
                 200,
                 json!({"result": "CHALLENGE_REQUESTED", "session": "sess-1"}),
             ),
-            "/auth/v1/mfa/verify" => reply_json(401, json!({"error": "code"})),
+            "/auth/v1/mfa/verify" => reply_json(
+                401,
+                json!({"__type": "CodeMismatchException", "message": "Invalid code received for user."}),
+            ),
             _ => Fault::reply(404, "unexpected"),
         })
         .await;
@@ -938,7 +1233,7 @@ mod tests {
         // A wrong code ends the challenge: the next try needs a new password step.
         auth.login("app", "ada@example.com", "pw").await.unwrap();
         let err = auth.verify_mfa("000000").await.unwrap_err().to_string();
-        assert_eq!(err, "Fel kod för StreamBIM – logga in igen.");
+        assert_eq!(err, "Fel kod. Logga in igen och ange en ny kod.");
         assert_eq!(server.count(), 3);
         let err = auth.verify_mfa("000000").await.unwrap_err().to_string();
         assert_eq!(err, CODE_EXPIRED);
@@ -1257,5 +1552,481 @@ mod tests {
         );
         assert_eq!(name_from_profile(&json!({"data": []})), None);
         assert_eq!(name_from_profile(&json!({"errors": []})), None);
+    }
+
+    /// Collects what the tracing subscriber writes while `install` is in force (this thread).
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let sink = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || sink.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The error text of a login that the server answers with `fault`. The password and the
+    /// e-mail are asserted to be absent from it.
+    async fn login_error_with(fault: Fault) -> String {
+        let server = Server::new(move |_, _| fault.clone()).await;
+        let dir = TestDir::new("loginerr");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let err = auth
+            .login("sweden", "ada@example.com", "pw-secret")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("pw-secret") && !err.contains("ada@example.com"),
+            "{err}"
+        );
+        err
+    }
+
+    /// The error text of a verify_mfa call that follows a password step asking for MFA, when the
+    /// server answers the verify step with `verify`.
+    async fn mfa_error_with(verify: Fault) -> String {
+        let server = Server::new(move |req, _| match req.target.as_str() {
+            "/auth/v1/login" => reply_json(
+                200,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-1"}),
+            ),
+            "/auth/v1/mfa/verify" => verify.clone(),
+            _ => Fault::reply(404, "unexpected"),
+        })
+        .await;
+        let dir = TestDir::new("mfaerr");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        let err = auth.verify_mfa("123456").await.unwrap_err().to_string();
+        assert!(
+            !err.contains("sess-1") && !err.contains("123456") && !err.contains("ada@example.com"),
+            "{err}"
+        );
+        err
+    }
+
+    #[tokio::test]
+    async fn an_unknown_account_names_the_region() {
+        let err = login_error_with(reply_json(
+            400,
+            json!({"__type": "UserNotFoundException", "message": "User does not exist."}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "Det finns inget StreamBIM-konto med den e-postadressen i regionen sweden. Välj en annan region (de flesta svenska konton finns i Europe eller Sweden)."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cognito_wrong_password_is_a_password_error() {
+        let err = login_error_with(reply_json(
+            400,
+            json!({"__type": "NotAuthorizedException", "message": "Incorrect username or password."}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "Fel e-post eller lösenord för StreamBIM (region sweden). Kontrollera också att kontot finns i den regionen."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_reset_is_sent_to_the_web_app() {
+        let text = "StreamBIM kräver att du byter lösenord. Logga in på sweden.streambim.com i webbläsaren först.";
+        let err = login_error_with(reply_json(
+            400,
+            json!({"message": "Password reset required for the user"}),
+        ))
+        .await;
+        assert_eq!(err, text);
+        // Cognito's own result, in a 200 reply.
+        let err =
+            login_error_with(reply_json(200, json!({"result": "NEW_PASSWORD_REQUIRED"}))).await;
+        assert_eq!(err, text);
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_account_is_named() {
+        let err = login_error_with(reply_json(
+            400,
+            json!({"__type": "UserNotConfirmedException", "message": "User is not confirmed."}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "StreamBIM-kontot är inte bekräftat ännu. Bekräfta det via e-posten från StreamBIM."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_federated_account_is_told_to_use_sso() {
+        let err = login_error_with(reply_json(
+            400,
+            json!({"message": "Users from a federated identity provider must sign in with it."}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "Kontot loggar in via SSO (t.ex. Microsoft). Synka kan bara logga in StreamBIM-konton med lösenord ännu."
+        );
+    }
+
+    #[tokio::test]
+    async fn throttling_is_named() {
+        let err = login_error_with(Fault::reply(429, "")).await;
+        assert_eq!(
+            err,
+            "StreamBIM: för många inloggningsförsök. Vänta en stund och försök igen."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_refusal_is_named_and_not_shown() {
+        let html = Fault::reply(403, "<html><body><h1>Forbidden</h1></body></html>")
+            .header("Content-Type", "text/html");
+        assert_eq!(
+            login_error_with(html).await,
+            "StreamBIM avvisade inloggningen (HTTP 403): (HTML)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_api_error_gives_its_detail() {
+        let err = login_error_with(reply_json(
+            400,
+            json!({"errors": [{"status": "400", "code": "badRequest", "detail": "The request body is malformed."}]}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "StreamBIM avvisade inloggningen (HTTP 400): The request body is malformed."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_without_a_reason_has_the_status_only() {
+        assert_eq!(
+            login_error_with(Fault::reply(404, "")).await,
+            "StreamBIM avvisade inloggningen (HTTP 404)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_reply_is_read_up_to_8_kib_only() {
+        // The '<' comes after the first 8 KiB, so it is never read and HTML is not named.
+        let mut body = "a".repeat(ERROR_BODY_BYTES + 100);
+        body.push('<');
+        let err = login_error_with(Fault::reply(400, body)).await;
+        assert_eq!(
+            err,
+            format!(
+                "StreamBIM avvisade inloggningen (HTTP 400): {}",
+                "a".repeat(TEXT_REASON_CHARS)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_echoed_login_keeps_the_password_and_the_e_mail_out() {
+        // The server repeats the request body in its error. The password has a quote and a
+        // backslash, so its JSON-escaped form is echoed too.
+        let server = Server::new(|req, _| {
+            let echoed = String::from_utf8_lossy(&req.body).into_owned();
+            reply_json(400, json!({"message": format!("Rejected: {echoed}")}))
+        })
+        .await;
+        let dir = TestDir::new("echo");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        let err = auth
+            .login("app", "ada@example.com", "hunter\"2\\secret")
+            .await
+            .unwrap_err()
+            .to_string();
+        let log = logs.text();
+        assert_eq!(
+            err,
+            r#"StreamBIM avvisade inloggningen (HTTP 400): Rejected: {"password":"***","username":"***"}"#
+        );
+        assert!(log.contains("StreamBIM: anropet avvisades"), "{log}");
+        for secret in ["hunter", "secret", "ada@example.com"] {
+            assert!(
+                !err.contains(secret) && !log.contains(secret),
+                "{secret}: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_echoed_mfa_step_keeps_the_session_and_the_code_out() {
+        let server = Server::new(|req, _| match req.target.as_str() {
+            "/auth/v1/login" => reply_json(
+                200,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-secret-9"}),
+            ),
+            "/auth/v1/mfa/verify" => {
+                let echoed = String::from_utf8_lossy(&req.body).into_owned();
+                reply_json(400, json!({"message": format!("Rejected: {echoed}")}))
+            }
+            _ => Fault::reply(404, "unexpected"),
+        })
+        .await;
+        let dir = TestDir::new("mfaecho");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+
+        let err = auth.verify_mfa("482915").await.unwrap_err().to_string();
+        let log = logs.text();
+        assert_eq!(
+            err,
+            r#"StreamBIM avvisade inloggningen (HTTP 400): Rejected: {"code":"***","session":"***","username":"***"}"#
+        );
+        for secret in ["sess-secret-9", "482915", "ada@example.com"] {
+            assert!(
+                !err.contains(secret) && !log.contains(secret),
+                "{secret}: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_echoed_refresh_keeps_the_tokens_out_of_the_log() {
+        let server = Server::new(|req, _| match req.target.as_str() {
+            "/auth/v1/login" => reply_json(
+                200,
+                json!({"result": "SUCCESS", "idToken": "id-secret-token", "refreshToken": "rt-secret-token", "expiresIn": 3600}),
+            ),
+            "/auth/v1/refresh" => {
+                let echoed = String::from_utf8_lossy(&req.body).into_owned();
+                reply_json(400, json!({"message": format!("Expired: {echoed}")}))
+            }
+            t if t.starts_with("/mgw/api/v2/user-profiles") => profile_reply(),
+            _ => Fault::reply(404, "unexpected"),
+        })
+        .await;
+        let dir = TestDir::new("refreshecho");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.invalidate().await;
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        assert_eq!(
+            auth.access_token().await.unwrap_err().to_string(),
+            SESSION_EXPIRED
+        );
+        let log = logs.text();
+        assert!(log.contains("Expired: "), "{log}");
+        assert!(log.contains("***"), "{log}");
+        for secret in ["id-secret-token", "rt-secret-token"] {
+            assert!(!log.contains(secret), "{log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_is_logged_at_warn_with_the_reason() {
+        let server = Server::new(|_, _| {
+            reply_json(
+                400,
+                json!({"__type": "UserNotFoundException", "message": "User does not exist."}),
+            )
+        })
+        .await;
+        let dir = TestDir::new("warnlog");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        auth.login("sweden", "ada@example.com", "pw")
+            .await
+            .unwrap_err();
+        let log = logs.text();
+        let line = log
+            .lines()
+            .find(|line| line.contains("anropet avvisades"))
+            .unwrap_or_default();
+        for part in [
+            "WARN",
+            "login",
+            "400",
+            "UserNotFoundException",
+            "User does not exist.",
+        ] {
+            assert!(line.contains(part), "{part}: {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_result_is_logged_at_warn() {
+        let server =
+            Server::new(|_, _| reply_json(200, json!({"result": "NEW_PASSWORD_REQUIRED"}))).await;
+        let dir = TestDir::new("resultlog");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        auth.login("app", "ada@example.com", "pw")
+            .await
+            .unwrap_err();
+        let log = logs.text();
+        assert!(
+            log.lines()
+                .any(|line| line.contains("WARN") && line.contains("NEW_PASSWORD_REQUIRED")),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_mfa_code_is_named_and_other_refusals_give_their_reason() {
+        assert_eq!(
+            mfa_error_with(reply_json(
+                400,
+                json!({"__type": "CodeMismatchException", "message": "Invalid code received for user."}),
+            ))
+            .await,
+            "Fel kod. Logga in igen och ange en ny kod."
+        );
+        assert_eq!(
+            mfa_error_with(reply_json(200, json!({"result": "CODE_MISMATCH"}),)).await,
+            "Fel kod. Logga in igen och ange en ny kod."
+        );
+        assert_eq!(
+            mfa_error_with(reply_json(
+                400,
+                json!({"__type": "ExpiredCodeException", "message": "Code has expired."}),
+            ))
+            .await,
+            "StreamBIM avvisade inloggningen (HTTP 400): Code has expired."
+        );
+        assert_eq!(
+            mfa_error_with(Fault::reply(429, "")).await,
+            "StreamBIM: för många inloggningsförsök. Vänta en stund och försök igen."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_mfa_failure_keeps_the_challenge() {
+        let server = Server::scripted(vec![
+            reply_json(
+                200,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-1"}),
+            ),
+            Fault::reply(503, "busy"),
+            reply_json(
+                200,
+                json!({"result": "SUCCESS", "idToken": "id-2", "expiresIn": 3600}),
+            ),
+            profile_reply(),
+        ])
+        .await;
+        let dir = TestDir::new("transient");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+
+        let err = auth.verify_mfa("123456").await.unwrap_err().to_string();
+        assert_eq!(err, "StreamBIM avvisade inloggningen (HTTP 503): busy");
+        // The same challenge is still there for the next code.
+        assert!(auth.verify_mfa("123456").await.is_ok());
+        assert!(auth.is_signed_in());
+    }
+
+    #[test]
+    fn refusal_details_read_the_known_fields() {
+        let details = |body: &[u8]| refusal_details(body, &[]);
+        assert_eq!(
+            details(br#"{"__type":"UserNotFoundException","message":"User does not exist."}"#),
+            (
+                "UserNotFoundException".to_string(),
+                "User does not exist.".to_string()
+            )
+        );
+        assert_eq!(
+            details(br#"{"detail":"d","message":"m"}"#),
+            (String::new(), "m".to_string())
+        );
+        assert_eq!(
+            details(br#"{"error":{"x":1},"detail":"d"}"#),
+            (String::new(), "d".to_string())
+        );
+        assert_eq!(
+            details(br#"{"errors":[{"detail":"D","title":"T","code":"c"}]}"#),
+            ("c".to_string(), "D".to_string())
+        );
+        assert_eq!(
+            details(br#"{"errors":[{"title":"T"}]}"#),
+            (String::new(), "T".to_string())
+        );
+        assert_eq!(
+            details(br#"{"error":"invalid_grant"}"#),
+            ("invalid_grant".to_string(), "invalid_grant".to_string())
+        );
+        assert_eq!(details(b""), (String::new(), String::new()));
+        assert_eq!(details(b"<html>"), (String::new(), "(HTML)".to_string()));
+        assert_eq!(
+            details(b"Bad gateway"),
+            (String::new(), "Bad gateway".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_removes_secrets_controls_and_extra_space() {
+        let forms = secret_forms(&["ada@example.com", "hunter2"]);
+        // Case does not matter for the secrets.
+        assert_eq!(
+            clean("Hej ADA@example.com, hunter2!", &forms, 200),
+            "Hej ***, ***!"
+        );
+        assert_eq!(clean("a\u{0}b\tc\n\n d\u{7f}e", &[], 200), "ab c de");
+        assert_eq!(clean(" \n ", &[], 200), "");
+        // The cap counts characters. A secret is removed before the cut, so none of it survives.
+        assert_eq!(clean(&"å".repeat(300), &[], 200).chars().count(), 200);
+        assert_eq!(clean("pw=hunter2", &forms, 5), "pw=**");
+        assert_eq!(clean("abc def", &[], 4), "abc");
+    }
+
+    #[test]
+    fn secrets_are_removed_in_json_form_longest_first_and_never_empty() {
+        let forms = secret_forms(&["hunter\"2\\secret"]);
+        assert_eq!(
+            clean(r#"x "hunter\"2\\secret" y"#, &forms, 200),
+            r#"x "***" y"#
+        );
+        assert_eq!(
+            clean(
+                "ada@example.com",
+                &secret_forms(&["ada", "ada@example.com"]),
+                200
+            ),
+            "***"
+        );
+        assert_eq!(
+            clean("banana", &secret_forms(&["", "n"]), 200),
+            "ba***a***a"
+        );
     }
 }
