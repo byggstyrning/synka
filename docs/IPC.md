@@ -97,7 +97,18 @@ See `docs/PROVIDERS.md`. Clarifications:
   `http://localhost:47864/`); it must match the URI registered with Interaxo exactly. The
   secret is optional, stored DPAPI-protected and reported only as `interaxo_client_secret_set`.
 - **`projects`.** `hubs[].provider` is `acc`, `streambim` or `interaxo`. Hub ids and project ids
-  are unique across providers (`docs/PROVIDERS.md`).
+  are unique across providers (`docs/PROVIDERS.md`). A signed-out provider's subscribed projects
+  stay listed (from the store, with `subscribed` true) so they can be unsubscribed; subscribing
+  to them is refused with a warning `notify`.
+- **Signed-out providers.** Their projects are not polled and their outbox jobs wait without
+  spending an attempt. A file of such a project that Explorer asks for fails with a
+  `notify` "Logga in på … för att hämta filen.".
+- **`sign_in_progress` for StreamBIM.** Nothing is sent when the login starts; the next event is
+  `mfa_required`, `signed_in` or `failed`. ACC and Interaxo send `browser` at once.
+- **Folders and renames a provider cannot do** (Interaxo has no folder creation, rename or move).
+  A folder made on this PC stays local with its contents, with one notice. A rename or move is
+  refused by the provider once: the local name and place stay, and a poll that still reports
+  the old remote name does not change them.
 
 ## Language
 

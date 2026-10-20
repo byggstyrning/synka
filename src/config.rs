@@ -153,8 +153,16 @@ impl Default for Config {
     }
 }
 
+/// The trimmed text of a setting value, or None when it is blank.
+fn text_or_none(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 /// Protect a client secret for settings.json: DPAPI (current Windows user), then base64.
-#[allow(dead_code)] // the settings step stores secrets with it; tests use it now
 pub fn protect_secret(secret: &str) -> anyhow::Result<String> {
     let blob = dpapi_protect(secret.as_bytes())?;
     Ok(base64::engine::general_purpose::STANDARD.encode(blob))
@@ -246,6 +254,21 @@ impl Config {
                 if let Some(s) = value.as_str() {
                     self.log_level = s.to_string();
                 }
+            }
+            "interaxo_client_id" => {
+                self.interaxo_client_id = text_or_none(value);
+            }
+            "interaxo_redirect_uri" => {
+                self.interaxo_redirect_uri = text_or_none(value);
+            }
+            "interaxo_client_secret" => {
+                self.interaxo_client_secret_protected = match text_or_none(value) {
+                    Some(secret) => Some(
+                        protect_secret(&secret)
+                            .map_err(|e| format!("kunde inte skydda klienthemligheten: {e}"))?,
+                    ),
+                    None => None,
+                };
             }
             _ => {}
         }
@@ -536,6 +559,46 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn interaxo_settings_apply_trimmed_values_and_blank_clears_them() {
+        let mut config = Config::default();
+        config
+            .apply_setting("interaxo_client_id", &json!("  ix-client  "))
+            .unwrap();
+        assert_eq!(config.interaxo_client_id.as_deref(), Some("ix-client"));
+        config
+            .apply_setting("interaxo_redirect_uri", &json!(" http://127.0.0.1:5000/x "))
+            .unwrap();
+        assert_eq!(
+            config.interaxo_redirect_uri.as_deref(),
+            Some("http://127.0.0.1:5000/x")
+        );
+        config
+            .apply_setting("interaxo_redirect_uri", &json!("  "))
+            .unwrap();
+        assert_eq!(config.interaxo_redirect_uri, None, "blank = default");
+        config
+            .apply_setting("interaxo_client_secret", &json!("sekret-value"))
+            .unwrap();
+        let blob = config.interaxo_client_secret_protected.clone().unwrap();
+        assert!(
+            !blob.contains("sekret-value"),
+            "stored protected, never in clear"
+        );
+        assert_eq!(
+            config.interaxo_client().client_secret.as_deref(),
+            Some("sekret-value")
+        );
+        config
+            .apply_setting("interaxo_client_secret", &json!(""))
+            .unwrap();
+        assert_eq!(config.interaxo_client_secret_protected, None);
+        config
+            .apply_setting("interaxo_client_id", &json!(""))
+            .unwrap();
+        assert_eq!(config.interaxo_client_id, None);
     }
 
     #[test]

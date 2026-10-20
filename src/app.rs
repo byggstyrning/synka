@@ -1,5 +1,6 @@
 //! Shared application context and the engine <-> UI messages.
 
+use crate::api::streambim::Region;
 use crate::auth::{Auth, UserInfo};
 use crate::config::Config;
 use crate::http::Api;
@@ -8,7 +9,7 @@ use crate::model::{now_ms, HubInfo, ProjectInfo, Provider};
 use crate::paths::Paths;
 use crate::store::Store;
 use crate::streambim_auth::StreamBimAuth;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -41,7 +42,6 @@ impl Ctx {
     }
 
     /// The API client of one provider's account.
-    #[allow(dead_code)]
     pub fn api_for(&self, p: Provider) -> &Api {
         match p {
             Provider::Acc => &self.api,
@@ -51,7 +51,6 @@ impl Ctx {
     }
 
     /// True when that provider's account has a usable session.
-    #[allow(dead_code)]
     pub fn signed_in(&self, p: Provider) -> bool {
         match p {
             Provider::Acc => self.auth.is_signed_in(),
@@ -61,13 +60,11 @@ impl Ctx {
     }
 
     /// True when at least one provider is signed in.
-    #[allow(dead_code)]
     pub fn any_signed_in(&self) -> bool {
         Provider::ALL.into_iter().any(|p| self.signed_in(p))
     }
 
     /// The signed-in user of one provider, if any.
-    #[allow(dead_code)]
     pub fn user_for(&self, p: Provider) -> Option<UserInfo> {
         match p {
             Provider::Acc => self.auth.user(),
@@ -96,6 +93,76 @@ pub struct Status {
     /// File data on disk across projects (populated folders only). None until first counted.
     pub local_bytes: Option<u64>,
     pub engine_version: String,
+    /// One entry per provider, in the order acc, streambim, interaxo.
+    pub accounts: Vec<AccountStatus>,
+}
+
+/// One provider's account as shown in `status.accounts`.
+#[derive(Debug, Clone)]
+pub struct AccountStatus {
+    pub provider: Provider,
+    pub label: &'static str,
+    /// The provider can sign in (ACC has a client id, Interaxo has `interaxo_client_id`).
+    pub configured: bool,
+    pub signed_in: bool,
+    pub signing_in: bool,
+    pub user: Option<UserInfo>,
+    /// StreamBIM: the region host once signed in.
+    pub host: Option<String>,
+}
+
+impl AccountStatus {
+    /// The entry for a provider that is not signed in (used before the first status).
+    pub fn signed_out(provider: Provider) -> AccountStatus {
+        AccountStatus {
+            provider,
+            label: provider.label(),
+            configured: false,
+            signed_in: false,
+            signing_in: false,
+            user: None,
+            host: None,
+        }
+    }
+}
+
+/// A secret text (StreamBIM password, MFA code). Debug never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    /// Only text is accepted, and the error never repeats the input (serde would echo it).
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Secret, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => Ok(Secret(s)),
+            _ => Err(serde::de::Error::custom("lösenord och kod måste vara text")),
+        }
+    }
+}
+
+/// StreamBIM password sign-in input. The password is used once and never stored.
+#[derive(Clone)]
+pub struct StreamBimLogin {
+    pub region: String,
+    pub username: String,
+    pub password: Secret,
+}
+
+impl std::fmt::Debug for StreamBimLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamBimLogin")
+            .field("region", &self.region)
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .finish()
+    }
 }
 
 /// Deletes held for confirmation in one project; `count` weighs a folder by its contents.
@@ -150,6 +217,15 @@ pub struct SettingsView {
     pub aps_client_id: Option<String>,
     pub aps_client_id_override_supported: bool,
     pub aps_client_id_validation_supported: bool,
+    /// Every provider the engine knows, in account order.
+    pub providers: Vec<&'static str>,
+    /// Saved Interaxo client id (trimmed), or None.
+    pub interaxo_client_id: Option<String>,
+    /// The redirect URI in use (saved, or the default).
+    pub interaxo_redirect_uri: String,
+    pub interaxo_redirect_uri_default: &'static str,
+    /// Whether a client secret is saved. The secret itself is never sent.
+    pub interaxo_client_secret_set: bool,
 }
 
 /// One entry of the activity feed. `kind` is one of the IPC.md kinds.
@@ -188,6 +264,14 @@ pub enum UiMsg {
     },
     Settings(SettingsView),
     Activity(ActivityItem),
+    /// Sign-in progress of one provider: browser | mfa_required | signed_in | failed | cancelled.
+    SignInProgress {
+        provider: Provider,
+        state: &'static str,
+        error: Option<String>,
+    },
+    /// The StreamBIM regions (live list or the built-in fallback).
+    StreamBimRegions(Vec<Region>),
     /// Correlated outcome of a staged public-client PKCE test. No credentials are sent.
     ApsClientIdValidation {
         request_id: String,
@@ -209,8 +293,26 @@ impl UiMsg {
 /// Commands from the tray and the IPC server to the engine.
 #[derive(Debug, Clone)]
 pub enum TrayCmd {
-    SignIn,
-    SignOut,
+    /// Sign in to one provider. ACC and Interaxo open the browser; StreamBIM needs `streambim`.
+    SignIn {
+        provider: Provider,
+        streambim: Option<StreamBimLogin>,
+    },
+    /// The MFA code for a pending StreamBIM sign-in.
+    SignInMfa {
+        provider: Provider,
+        code: Secret,
+    },
+    /// Cancel a pending sign-in (browser or MFA wait) of one provider.
+    CancelSignIn {
+        provider: Provider,
+    },
+    /// Sign out of one provider, or of every provider (`None`).
+    SignOut {
+        provider: Option<Provider>,
+    },
+    /// Load the StreamBIM region list and publish it as `streambim_regions`.
+    StreamBimRegions,
     TestApsClientId {
         client_id: String,
         request_id: String,

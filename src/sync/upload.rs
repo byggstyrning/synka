@@ -185,7 +185,12 @@ enum Step {
 
 /// Run all due jobs (respecting concurrency). Returns the number processed.
 pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
-    let jobs = ctx.store.due_jobs(now_ms(), BATCH)?;
+    let jobs: Vec<OutboxJob> = ctx
+        .store
+        .due_jobs(now_ms(), BATCH)?
+        .into_iter()
+        .filter(|job| !waits_for_sign_in(ctx, job))
+        .collect();
     if jobs.is_empty() {
         return Ok(0);
     }
@@ -211,6 +216,26 @@ pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
         }
     }
     Ok(processed)
+}
+
+/// A job of a signed-out provider waits like offline work: it is postponed without a request and
+/// without spending an attempt. True when it waits.
+fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
+    let provider = ctx
+        .store
+        .project(job.pid)
+        .ok()
+        .flatten()
+        .map(|p| p.provider)
+        .unwrap_or_default();
+    if ctx.signed_in(provider) {
+        return false;
+    }
+    let waiting = format!("Logga in på {} för att synka.", provider.label());
+    let _ = ctx
+        .store
+        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
+    true
 }
 
 /// Returns true when the job reached a final state (done or failed), false when it was
@@ -362,7 +387,7 @@ fn rejected_mime_type(err: &anyhow::Error) -> bool {
     })
 }
 
-fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error) {
+pub(crate) fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error) {
     let msg = format!("{err:#}");
     if is_offline(err) {
         // A pause, not a failure: offline for hours must not use up the job's attempts.

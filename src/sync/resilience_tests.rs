@@ -1,7 +1,7 @@
 //! Repeatable fault and event-storm tests against disposable folders and real SQLite.
 //! `SYNKA_TEST_SEED` and `SYNKA_STRESS_OPS` reproduce a run without touching a live sync root.
 
-use super::tests::{fixture, row, Fixture};
+use super::tests::{client_override_signed_in, fixture, row, Fixture};
 use super::*;
 use crate::store::OutboxJob;
 use std::collections::BTreeMap;
@@ -327,7 +327,9 @@ fn resilience_repeated_safe_saves_coalesce_without_losing_latest_bytes() {
 async fn resilience_saves_during_finalization_reuse_the_committed_job() {
     use std::os::windows::fs::MetadataExt;
 
-    let f = fixture("resilience-finalize-save");
+    let mut f = fixture("resilience-finalize-save");
+    // The outbox only runs for signed-in projects: this is an ACC job.
+    client_override_signed_in(&mut f);
     let path = f.dir.join("committed.bin");
     std::fs::write(&path, b"first committed bytes").unwrap();
     let before = std::fs::metadata(&path).unwrap();
