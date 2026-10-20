@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
@@ -223,6 +224,40 @@ where
     ))
 }
 
+/// Read timeout of one metadata call: the same as `http::REQUEST_TIMEOUT` (private there).
+const METADATA_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// `list_all` through `get_no_reauth`, for the hub probe.
+async fn probe_all<T: Listed + DeserializeOwned>(api: &Api, url: &str) -> Result<Vec<T>, ApiError> {
+    list_pages(url, move |page_url: String| async move {
+        get_no_reauth::<Vec<T>>(api, &page_url).await
+    })
+    .await
+}
+
+/// One GET with the current bearer token, and no sign-in refresh on 401. The hub probe uses it:
+/// a host that does not know the user answers 401, and a refresh would not change that answer.
+async fn get_no_reauth<T: DeserializeOwned>(api: &Api, url: &str) -> Result<T, ApiError> {
+    let token = api.bearer().await?;
+    let resp = api
+        .client()
+        .get(url)
+        .bearer_auth(&token)
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .await
+        .map_err(transport)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(ApiError::Status {
+            status: status.as_u16(),
+            body: crate::http::error_body(resp).await,
+        });
+    }
+    let bytes = resp.bytes().await.map_err(transport)?;
+    serde_json::from_slice(&bytes).map_err(|e| ApiError::Decode(e.to_string()))
+}
+
 /// Drops the URL from a reqwest error. Request URLs are the place a token could end up, so
 /// nothing that reaches an error text or a log keeps one.
 fn transport(e: reqwest::Error) -> ApiError {
@@ -252,21 +287,23 @@ async fn room_root(
 // ---- hubs and projects ------------------------------------------------------------------------
 
 /// The user's communities on both hosts. A community is listed under the host it lives on.
-/// A 401, 403 or 404 from a host means that host does not know the community, not that the
-/// sign-in failed.
+/// A 403 or 404 from a host means that host does not know the community. A 401 means the host
+/// refused the sign-in; when both hosts do, the sign-in has expired and the error says so.
 pub async fn list_hubs(api: &Api) -> Result<Vec<HubInfo>, ApiError> {
     list_hubs_on(api, &HOSTS).await
 }
 
 /// `list_hubs` over the given API bases, in order: a community on two hosts is kept once,
-/// under the first host.
+/// under the first host. A host that answers 401 is not asked again with a refreshed token. When
+/// every host answers 401, the sign-in has expired and that is the error.
 async fn list_hubs_on(api: &Api, bases: &[&str]) -> Result<Vec<HubInfo>, ApiError> {
     let mut hubs = Vec::new();
     let mut seen = HashSet::new();
     let mut answered = false;
+    let mut refused = 0usize;
     let mut failure = None;
     for base in bases {
-        match list_all::<Community>(api, &format!("{base}/communities")).await {
+        match probe_all::<Community>(api, &format!("{base}/communities")).await {
             Ok(communities) => {
                 answered = true;
                 for community in communities {
@@ -288,9 +325,12 @@ async fn list_hubs_on(api: &Api, bases: &[&str]) -> Result<Vec<HubInfo>, ApiErro
                     });
                 }
             }
+            Err(ApiError::Status { status: 401, .. }) => {
+                refused += 1;
+                debug!(host = %base, "inloggningen godtas inte på den här värden");
+            }
             Err(ApiError::Status {
-                status: 401 | 403 | 404,
-                ..
+                status: 403 | 404, ..
             }) => debug!(host = %base, "inga gemenskaper på den här värden"),
             Err(e) => {
                 warn!(host = %base, status = ?e.status(), "kunde inte lista gemenskaper");
@@ -300,6 +340,9 @@ async fn list_hubs_on(api: &Api, bases: &[&str]) -> Result<Vec<HubInfo>, ApiErro
     }
     match failure {
         Some(e) if !answered => Err(e),
+        _ if !answered && refused > 0 && refused == bases.len() => Err(ApiError::Auth(
+            anyhow::anyhow!("Interaxo-inloggningen har gått ut – logga in igen. (Session expired)"),
+        )),
         _ => Ok(hubs),
     }
 }
@@ -881,7 +924,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::Duration;
 
     /// The bearer the loopback tests receive (see `Auth::for_test`).
     const TOKEN: &str = "Bearer synka-loopback-test-token";
@@ -1025,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_hubs_skips_a_host_that_does_not_know_the_community() {
-        let com = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
+        let com = Server::scripted(vec![Fault::reply(401, "")]).await;
         let se = Server::scripted(vec![
             json_reply(json!([
                 {"id": "example-corp", "name": "Example Corp"},
@@ -1048,8 +1090,8 @@ mod tests {
         assert_eq!(hubs[0].region.as_deref(), Some(se_base.as_str()));
         assert_eq!(hubs[0].provider, Provider::Interaxo);
         assert_eq!(hubs[1].id, "interaxo:other");
-        // The 401 is retried once with a fresh token, then counts as "not on this host".
-        assert_eq!(com.requests().len(), 2);
+        // A 401 is not retried with a refreshed token: it counts as "not on this host".
+        assert_eq!(com.requests().len(), 1);
         let se_requests = se.requests();
         assert_eq!(se_requests.len(), 2);
         assert_eq!(
@@ -1086,7 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn list_hubs_is_empty_when_no_host_knows_the_user_but_reports_a_real_failure() {
         let api = api_for("http://127.0.0.1:9");
-        let a = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
+        let a = Server::scripted(vec![Fault::reply(401, "")]).await;
         let b = Server::scripted(vec![Fault::reply(404, "")]).await;
         let (a_base, b_base) = (format!("{}/v1", a.origin), format!("{}/v1", b.origin));
         let hubs = list_hubs_on(&api, &[a_base.as_str(), b_base.as_str()])
@@ -1095,12 +1137,27 @@ mod tests {
         assert!(hubs.is_empty());
 
         let c = Server::scripted(vec![Fault::reply(400, "{\"code\":\"validation_error\"}")]).await;
-        let d = Server::scripted(vec![Fault::reply(401, ""), Fault::reply(401, "")]).await;
+        let d = Server::scripted(vec![Fault::reply(401, "")]).await;
         let (c_base, d_base) = (format!("{}/v1", c.origin), format!("{}/v1", d.origin));
         let err = list_hubs_on(&api, &[c_base.as_str(), d_base.as_str()])
             .await
             .unwrap_err();
         assert_eq!(err.status(), Some(400));
+    }
+
+    #[tokio::test]
+    async fn list_hubs_asks_the_user_to_sign_in_again_when_every_host_refuses_the_token() {
+        let api = api_for("http://127.0.0.1:9");
+        let a = Server::scripted(vec![Fault::reply(401, "")]).await;
+        let b = Server::scripted(vec![Fault::reply(401, "")]).await;
+        let (a_base, b_base) = (format!("{}/v1", a.origin), format!("{}/v1", b.origin));
+        let err = list_hubs_on(&api, &[a_base.as_str(), b_base.as_str()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Auth(_)), "{err:?}");
+        // One request per host: no refresh and no second attempt.
+        assert_eq!(a.count(), 1);
+        assert_eq!(b.count(), 1);
     }
 
     #[tokio::test]
