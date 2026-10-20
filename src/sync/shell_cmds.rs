@@ -41,7 +41,8 @@ impl Engine {
             self.shell_pin(paths, verb == ShellVerb::Pin).await;
             return;
         }
-        if !self.ctx.auth.is_signed_in() {
+        // Global gate: the verbs act per project, and each one refuses a signed-out provider.
+        if !self.ctx.any_signed_in() {
             self.shell_warn("Logga in först".into());
             return;
         }

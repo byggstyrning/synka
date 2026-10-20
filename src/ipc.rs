@@ -6,9 +6,12 @@
 //! last status, settings and projects and keeps the last 200 activity items, so `hello` can be
 //! answered without asking the engine.
 
-use crate::app::{ActivityItem, HubList, SettingsView, Status, TrayCmd, UiMsg};
+use crate::app::{
+    AccountStatus, ActivityItem, HubList, Secret, SettingsView, Status, StreamBimLogin, TrayCmd,
+    UiMsg,
+};
 use crate::config;
-use crate::model::{HubInfo, ProjectInfo};
+use crate::model::{HubInfo, ProjectInfo, Provider};
 use crate::sync::sanitize_name;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,8 +45,30 @@ pub enum Command {
         #[serde(default)]
         version: Option<String>,
     },
-    SignIn,
-    SignOut,
+    /// ACC/Interaxo need no fields. StreamBIM needs `region`, `username` and `password`.
+    SignIn {
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        region: Option<String>,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<Secret>,
+    },
+    SignInMfa {
+        provider: String,
+        code: Secret,
+    },
+    CancelSignIn {
+        provider: String,
+    },
+    SignOut {
+        #[serde(default)]
+        provider: Option<String>,
+    },
+    #[serde(rename = "streambim_regions")]
+    StreamBimRegions,
     TestApsClientId {
         client_id: String,
         request_id: String,
@@ -175,6 +200,24 @@ impl IpcHub {
                 self.cache().settings = Some(v.clone());
                 self.emit(&v);
             }
+            UiMsg::SignInProgress {
+                provider,
+                state,
+                error,
+            } => {
+                self.emit(&json!({
+                    "type": "sign_in_progress",
+                    "provider": provider.as_str(),
+                    "state": state,
+                    "error": error,
+                }));
+            }
+            UiMsg::StreamBimRegions(regions) => {
+                self.emit(&json!({
+                    "type": "streambim_regions",
+                    "regions": regions,
+                }));
+            }
             UiMsg::ApsClientIdValidation {
                 request_id,
                 state,
@@ -253,6 +296,7 @@ impl IpcHub {
                 state: "signed_out",
                 sync_root: self.sync_root.display().to_string(),
                 engine_version: env!("CARGO_PKG_VERSION").into(),
+                accounts: Provider::ALL.map(AccountStatus::signed_out).into(),
                 ..Default::default()
             })
         });
@@ -280,7 +324,7 @@ impl IpcHub {
 fn status_json(s: &Status) -> Value {
     json!({
         "type": "status",
-        "signed_in": s.user.is_some(),
+        "signed_in": s.accounts.iter().any(|a| a.signed_in),
         "user": s.user.as_ref().map(|u| json!({ "name": u.name, "email": u.email })),
         "state": s.state,
         "text": s.text,
@@ -292,6 +336,20 @@ fn status_json(s: &Status) -> Value {
         "held_deletes": s.held_deletes,
         "local_bytes": s.local_bytes,
         "engine_version": s.engine_version,
+        "accounts": s.accounts.iter().map(account_json).collect::<Vec<Value>>(),
+    })
+}
+
+/// One `status.accounts` entry. The user is name and e-mail only, never the user id.
+fn account_json(a: &AccountStatus) -> Value {
+    json!({
+        "provider": a.provider.as_str(),
+        "label": a.label,
+        "configured": a.configured,
+        "signed_in": a.signed_in,
+        "signing_in": a.signing_in,
+        "user": a.user.as_ref().map(|u| json!({ "name": u.name, "email": u.email })),
+        "host": a.host,
     })
 }
 
@@ -326,7 +384,7 @@ fn projects_json(hubs: &HubList, loading: bool, root: &Path) -> Value {
                     })
                 })
                 .collect();
-            json!({ "id": h.id, "name": h.name, "projects": projects })
+            json!({ "id": h.id, "name": h.name, "provider": h.provider.as_str(), "projects": projects })
         })
         .collect();
     json!({ "type": "projects", "loading": loading, "hubs": hubs_json })
@@ -568,6 +626,40 @@ fn ack(id: Option<i64>, res: Result<(), String>) -> Option<String> {
     Some(s)
 }
 
+/// The provider named in a command. Unknown names are refused with a fixed text.
+fn parse_provider(name: &str) -> Result<Provider, String> {
+    Provider::parse(name)
+        .ok_or_else(|| "Okänd leverantör. Använd acc, streambim eller interaxo.".to_string())
+}
+
+/// The StreamBIM sign-in fields, all required. The region is a subdomain such as "app".
+fn streambim_login(
+    region: Option<String>,
+    username: Option<String>,
+    password: Option<Secret>,
+) -> Result<StreamBimLogin, String> {
+    let region = region.unwrap_or_default();
+    let region_ok = (1..=32).contains(&region.len())
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !region_ok {
+        return Err("Ange en giltig StreamBIM-region.".into());
+    }
+    let username = username.unwrap_or_default().trim().to_string();
+    if username.is_empty() {
+        return Err("Ange e-postadress för StreamBIM.".into());
+    }
+    match password {
+        Some(password) if !password.0.is_empty() => Ok(StreamBimLogin {
+            region,
+            username,
+            password,
+        }),
+        _ => Err("Ange lösenordet för StreamBIM.".into()),
+    }
+}
+
 /// Correlation IDs are public UUIDs generated by the UI, never arbitrary log/error text.
 fn check_validation_request_id(id: &str) -> Result<(), String> {
     if id.len() == 36
@@ -598,8 +690,42 @@ fn dispatch(
                 .map_err(|_| "motorn kör inte".to_string())?;
             return Ok(hub.snapshot());
         }
-        Command::SignIn => TrayCmd::SignIn,
-        Command::SignOut => TrayCmd::SignOut,
+        Command::SignIn {
+            provider,
+            region,
+            username,
+            password,
+        } => {
+            let provider = parse_provider(provider.as_deref().unwrap_or("acc"))?;
+            let streambim = match provider {
+                Provider::StreamBim => Some(streambim_login(region, username, password)?),
+                _ => None,
+            };
+            TrayCmd::SignIn {
+                provider,
+                streambim,
+            }
+        }
+        Command::SignInMfa { provider, code } => {
+            let provider = parse_provider(&provider)?;
+            if provider != Provider::StreamBim {
+                return Err("Engångskod används bara för StreamBIM.".into());
+            }
+            if code.0.len() != 6 || !code.0.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("Koden ska vara 6 siffror.".into());
+            }
+            TrayCmd::SignInMfa { provider, code }
+        }
+        Command::CancelSignIn { provider } => TrayCmd::CancelSignIn {
+            provider: parse_provider(&provider)?,
+        },
+        Command::SignOut { provider: None } => TrayCmd::SignOut { provider: None },
+        Command::SignOut {
+            provider: Some(provider),
+        } => TrayCmd::SignOut {
+            provider: Some(parse_provider(&provider)?),
+        },
+        Command::StreamBimRegions => TrayCmd::StreamBimRegions,
         Command::TestApsClientId {
             client_id,
             request_id,
@@ -708,8 +834,19 @@ mod tests {
                 version: Some("0.2.0".into())
             }
         );
-        assert_eq!(parse(r#"{"cmd":"sign_in"}"#), Command::SignIn);
-        assert_eq!(parse(r#"{"cmd":"sign_out","id":2}"#), Command::SignOut);
+        assert_eq!(
+            parse(r#"{"cmd":"sign_in"}"#),
+            Command::SignIn {
+                provider: None,
+                region: None,
+                username: None,
+                password: None,
+            }
+        );
+        assert_eq!(
+            parse(r#"{"cmd":"sign_out","id":2}"#),
+            Command::SignOut { provider: None }
+        );
         assert_eq!(parse(r#"{"cmd":"sync_now"}"#), Command::SyncNow);
         assert_eq!(
             parse(r#"{"cmd":"open_folder"}"#),
@@ -1111,10 +1248,29 @@ mod tests {
             held_deletes: vec![],
             local_bytes: None,
             engine_version: "0.1.0".into(),
+            accounts: vec![AccountStatus {
+                provider: Provider::Acc,
+                label: "ACC",
+                configured: true,
+                signed_in: true,
+                signing_in: false,
+                user: Some(crate::auth::UserInfo {
+                    user_id: "u".into(),
+                    name: "Anna".into(),
+                    email: "a@x.se".into(),
+                }),
+                host: None,
+            }],
         };
         let v = status_json(&s);
         assert_eq!(v["type"], "status");
         assert_eq!(v["signed_in"], true);
+        assert_eq!(v["accounts"][0]["provider"], "acc");
+        assert_eq!(v["accounts"][0]["signed_in"], true);
+        assert!(
+            !v.to_string().contains("\"u\""),
+            "user ids never reach the UI"
+        );
         assert_eq!(v["user"], json!({"name":"Anna","email":"a@x.se"}));
         assert_eq!(v["state"], "syncing");
         assert!(v["error"].is_null());
@@ -1210,6 +1366,11 @@ mod tests {
             aps_client_id: None,
             aps_client_id_override_supported: true,
             aps_client_id_validation_supported: true,
+            providers: vec!["acc", "streambim", "interaxo"],
+            interaxo_client_id: None,
+            interaxo_redirect_uri: "http://localhost:47864/".into(),
+            interaxo_redirect_uri_default: "http://localhost:47864/",
+            interaxo_client_secret_set: false,
         }));
         let v: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(v["type"], "settings");
@@ -1260,6 +1421,11 @@ mod tests {
                 aps_client_id: config.explicit_client_id_override().map(str::to_string),
                 aps_client_id_override_supported: true,
                 aps_client_id_validation_supported: true,
+                providers: vec!["acc", "streambim", "interaxo"],
+                interaxo_client_id: None,
+                interaxo_redirect_uri: "http://localhost:47864/".into(),
+                interaxo_redirect_uri_default: "http://localhost:47864/",
+                interaxo_client_secret_set: false,
             }));
             let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
             assert_eq!(event["aps_client_id_override_supported"], true);
@@ -1277,6 +1443,270 @@ mod tests {
                 .unwrap();
             assert_eq!(cached, event);
         }
+    }
+
+    #[test]
+    fn sign_in_commands_parse_with_defaults_and_validate_each_field() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+
+        // ACC needs no fields.
+        let r = handle_line(br#"{"cmd":"sign_in","id":1}"#, &hub, &tx);
+        assert_eq!(
+            serde_json::from_str::<Value>(&r[0]).unwrap(),
+            json!({"type":"ack","ok":true,"id":1})
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TrayCmd::SignIn {
+                provider: Provider::Acc,
+                streambim: None
+            })
+        ));
+
+        // StreamBIM with everything it needs; the username is trimmed.
+        let r = handle_line(
+            br#"{"cmd":"sign_in","id":2,"provider":"streambim","region":"app","username":" anna@example.se ","password":"pw-one"}"#,
+            &hub,
+            &tx,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&r[0]).unwrap()["ok"],
+            json!(true)
+        );
+        match rx.try_recv() {
+            Ok(TrayCmd::SignIn {
+                provider: Provider::StreamBim,
+                streambim: Some(login),
+            }) => {
+                assert_eq!(login.region, "app");
+                assert_eq!(login.username, "anna@example.se");
+                assert_eq!(login.password.0, "pw-one");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Each missing or invalid StreamBIM field, and an unknown provider, is refused in the ack.
+        for line in [
+            r#"{"cmd":"sign_in","id":3,"provider":"streambim","username":"a@x.se","password":"p"}"#,
+            r#"{"cmd":"sign_in","id":4,"provider":"streambim","region":"App","username":"a@x.se","password":"p"}"#,
+            r#"{"cmd":"sign_in","id":5,"provider":"streambim","region":"app.se","username":"a@x.se","password":"p"}"#,
+            r#"{"cmd":"sign_in","id":6,"provider":"streambim","region":"app","username":"  ","password":"p"}"#,
+            r#"{"cmd":"sign_in","id":7,"provider":"streambim","region":"app","username":"a@x.se"}"#,
+            r#"{"cmd":"sign_in","id":8,"provider":"streambim","region":"app","username":"a@x.se","password":""}"#,
+            r#"{"cmd":"sign_in","id":9,"provider":"nope","region":"app"}"#,
+        ] {
+            let r = handle_line(line.as_bytes(), &hub, &tx);
+            let v: Value = serde_json::from_str(&r[0]).unwrap();
+            assert_eq!(v["ok"], false, "{line}: {v}");
+            assert_eq!(v["type"], "ack");
+            assert!(
+                rx.try_recv().is_err(),
+                "refused line reached the engine: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mfa_cancel_sign_out_and_regions_commands_validate_their_fields() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+
+        let r = handle_line(
+            br#"{"cmd":"sign_in_mfa","id":1,"provider":"streambim","code":"123456"}"#,
+            &hub,
+            &tx,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&r[0]).unwrap()["ok"],
+            json!(true)
+        );
+        match rx.try_recv() {
+            Ok(TrayCmd::SignInMfa {
+                provider: Provider::StreamBim,
+                code,
+            }) => assert_eq!(code.0, "123456"),
+            other => panic!("{other:?}"),
+        }
+        for line in [
+            r#"{"cmd":"sign_in_mfa","id":2,"provider":"streambim","code":"12345"}"#,
+            r#"{"cmd":"sign_in_mfa","id":3,"provider":"streambim","code":"1234567"}"#,
+            r#"{"cmd":"sign_in_mfa","id":4,"provider":"streambim","code":"12a456"}"#,
+            r#"{"cmd":"sign_in_mfa","id":5,"provider":"acc","code":"123456"}"#,
+            r#"{"cmd":"sign_in_mfa","id":6,"provider":"streambim","code":123456}"#,
+            r#"{"cmd":"sign_in_mfa","id":7,"provider":"nope","code":"123456"}"#,
+        ] {
+            let r = handle_line(line.as_bytes(), &hub, &tx);
+            let v: Value = serde_json::from_str(&r[0]).unwrap();
+            assert_eq!(v["ok"], false, "{line}: {v}");
+            assert!(
+                rx.try_recv().is_err(),
+                "refused line reached the engine: {line}"
+            );
+        }
+
+        // Cancel is valid for every provider.
+        handle_line(
+            br#"{"cmd":"cancel_sign_in","provider":"interaxo"}"#,
+            &hub,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TrayCmd::CancelSignIn {
+                provider: Provider::Interaxo
+            })
+        ));
+        let r = handle_line(
+            br#"{"cmd":"cancel_sign_in","id":8,"provider":"x"}"#,
+            &hub,
+            &tx,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&r[0]).unwrap()["ok"],
+            json!(false)
+        );
+
+        // Sign-out with and without a provider.
+        handle_line(br#"{"cmd":"sign_out"}"#, &hub, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TrayCmd::SignOut { provider: None })
+        ));
+        handle_line(br#"{"cmd":"sign_out","provider":"streambim"}"#, &hub, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TrayCmd::SignOut {
+                provider: Some(Provider::StreamBim)
+            })
+        ));
+        let r = handle_line(br#"{"cmd":"sign_out","id":9,"provider":"x"}"#, &hub, &tx);
+        assert_eq!(
+            serde_json::from_str::<Value>(&r[0]).unwrap()["ok"],
+            json!(false)
+        );
+        assert!(rx.try_recv().is_err());
+
+        handle_line(br#"{"cmd":"streambim_regions"}"#, &hub, &tx);
+        assert!(matches!(rx.try_recv(), Ok(TrayCmd::StreamBimRegions)));
+    }
+
+    #[test]
+    fn passwords_and_codes_never_reach_an_ack_or_a_debug_string() {
+        const PASSWORD: &str = "Hemligt-Lösen-7731";
+        const CODE: &str = "548213";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let lines = [
+            // accepted: the password reaches the engine, but never a text
+            format!(r#"{{"cmd":"sign_in","id":1,"provider":"streambim","region":"app","username":"a@x.se","password":"{pw}"}}"#, pw = PASSWORD),
+            // a password that is not text: serde would echo the value, the reader must not
+            r#"{"cmd":"sign_in","id":2,"provider":"streambim","region":"app","username":"a@x.se","password":4711123}"#.to_string(),
+            // a code that is not text
+            format!(r#"{{"cmd":"sign_in_mfa","id":3,"provider":"streambim","code":{code}}}"#, code = CODE),
+            // a code for another provider
+            format!(r#"{{"cmd":"sign_in_mfa","id":4,"provider":"acc","code":"{code}"}}"#, code = CODE),
+            // broken JSON that still contains the password
+            format!(r#"{{"cmd":"sign_in","id":5,"provider":"streambim","password":"{pw}","extra":[}}"#, pw = PASSWORD),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for line in &lines {
+            for reply in handle_line(line.as_bytes(), &hub, &tx) {
+                seen.push(reply);
+            }
+        }
+        while let Ok(cmd) = rx.try_recv() {
+            seen.push(format!("{cmd:?}"));
+        }
+        assert!(seen.len() >= 4, "{seen:?}");
+        for text in &seen {
+            assert!(!text.contains(PASSWORD), "password leaked: {text}");
+            assert!(!text.contains(CODE), "code leaked: {text}");
+            assert!(!text.contains("4711123"), "password value leaked: {text}");
+        }
+        // The parsed command, too: its Debug output is what a log line would show.
+        let parsed: Command = serde_json::from_str(&lines[0]).unwrap();
+        assert!(!format!("{parsed:?}").contains(PASSWORD));
+    }
+
+    #[test]
+    fn projects_event_names_the_provider_of_each_hub() {
+        let hubs: HubList = vec![(
+            HubInfo {
+                id: "interaxo:c1".into(),
+                name: "Interaxo – Byggstyrning".into(),
+                region: Some("https://api.interaxo.se/v1".into()),
+                provider: Provider::Interaxo,
+            },
+            Vec::new(),
+        )];
+        let v = projects_json(&hubs, false, Path::new(r"C:\Synka"));
+        assert_eq!(v["hubs"][0]["provider"], "interaxo");
+    }
+
+    #[test]
+    fn status_lists_every_account_in_order_without_user_ids() {
+        let accounts = vec![
+            AccountStatus {
+                provider: Provider::Acc,
+                label: "ACC",
+                configured: true,
+                signed_in: false,
+                signing_in: false,
+                user: None,
+                host: None,
+            },
+            AccountStatus {
+                provider: Provider::StreamBim,
+                label: "StreamBIM",
+                configured: true,
+                signed_in: true,
+                signing_in: false,
+                user: Some(crate::auth::UserInfo {
+                    user_id: "sb-secret-id".into(),
+                    name: "Sven".into(),
+                    email: "s@x.se".into(),
+                }),
+                host: Some("app.streambim.com".into()),
+            },
+            AccountStatus {
+                provider: Provider::Interaxo,
+                label: "Interaxo",
+                configured: false,
+                signed_in: false,
+                signing_in: true,
+                user: None,
+                host: None,
+            },
+        ];
+        let s = Status {
+            accounts,
+            text: "Synkad".into(),
+            state: "synced",
+            sync_root: r"C:\Synka".into(),
+            engine_version: "x".into(),
+            ..Default::default()
+        };
+        let v = status_json(&s);
+        assert_eq!(v["signed_in"], true);
+        let providers: Vec<&str> = v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(providers, ["acc", "streambim", "interaxo"]);
+        assert_eq!(
+            v["accounts"][1]["user"],
+            json!({"name":"Sven","email":"s@x.se"})
+        );
+        assert_eq!(v["accounts"][1]["host"], "app.streambim.com");
+        assert_eq!(v["accounts"][2]["signing_in"], true);
+        assert!(v["accounts"][0]["user"].is_null());
+        assert!(
+            !v.to_string().contains("sb-secret-id"),
+            "user ids never reach the UI"
+        );
     }
 
     #[test]

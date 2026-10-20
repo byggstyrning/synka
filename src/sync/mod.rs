@@ -63,6 +63,8 @@ mod change_source_tests;
 #[cfg(test)]
 mod local_inspection_tests;
 #[cfg(test)]
+mod provider_tests;
+#[cfg(test)]
 mod resilience_tests;
 
 pub use naming::sanitize_name;
@@ -72,9 +74,10 @@ pub(crate) use reset::project_resetting;
 use crate::api::syncfeed;
 use crate::api::syncfeed::FeedError;
 use crate::app::{
-    Ctx, CtxRef, HeldDeletes, HubList, SettingsView, Severity, Status, Transfer, TrayCmd, UiMsg,
+    AccountStatus, Ctx, CtxRef, HeldDeletes, HubList, SettingsView, Severity, Status,
+    StreamBimLogin, Transfer, TrayCmd, UiMsg,
 };
-use crate::auth::UserInfo;
+use crate::auth::{UserInfo, INTERAXO_DEFAULT_REDIRECT};
 use crate::cf::callbacks as cb;
 use crate::cf::placeholder::{self as ph, PinState, PlaceholderInfo, PlaceholderSpec};
 use crate::cf::{
@@ -86,6 +89,7 @@ use crate::http::ApiError;
 use crate::model::*;
 use crate::remote::{self, DownloadUrl};
 use crate::store::Store;
+use crate::streambim_auth::LoginOutcome;
 use crate::sync::watcher::{LocalChange, WatchHandle};
 use crate::update::{self, UpdateInfo};
 use anyhow::{anyhow, Result};
@@ -110,6 +114,10 @@ const IDLE_MS: u64 = 30 * 60 * 1000;
 const STATUS_GAP: Duration = Duration::from_millis(500);
 /// Collapse a double-click without blocking a deliberate retry of a failed browser tab.
 const SIGN_IN_BURST: Duration = Duration::from_secs(1);
+/// How long a StreamBIM sign-in waits for its MFA code.
+const MFA_WAIT: Duration = Duration::from_secs(5 * 60);
+/// Stored in kv: the id the sync root is registered under (see `root_uid`).
+const SYNC_ROOT_UID_KEY: &str = "sync_root_uid";
 const PROGRESS_GAP: Duration = Duration::from_millis(250);
 /// Shortest pause between two outbox passes (jobs enqueued during a pass run in the next one).
 const OUTBOX_MIN_GAP: Duration = Duration::from_millis(500);
@@ -232,7 +240,8 @@ struct St {
     /// Install the pending update automatically once the engine is quiet.
     auto_install_at: Option<Instant>,
     installing: bool,
-    signing_in: bool,
+    /// Providers with a sign-in attempt in progress (browser, login or MFA wait).
+    signing_in: HashSet<Provider>,
     last_status: Option<Instant>,
     flush_scheduled: bool,
     provider: Option<u8>,
@@ -272,10 +281,14 @@ pub(crate) struct Work {
 }
 
 enum Internal {
+    /// A sign-in task of one provider finished (a StreamBIM login may answer "MFA required").
     SignedIn {
+        provider: Provider,
         generation: u64,
-        result: Result<UserInfo>,
+        result: Result<LoginOutcome>,
     },
+    /// The five minutes for a StreamBIM MFA code are over.
+    SignInExpired { provider: Provider, generation: u64 },
     ClientIdValidated {
         generation: u64,
         request_id: String,
@@ -293,16 +306,28 @@ struct ClientIdValidation {
     original_effective_id: String,
 }
 
+/// One pending sign-in of one provider. Owned by the command loop, so a retry or a sign-out can
+/// wait for the cancellation.
+struct SignInAttempt {
+    /// The sign-in itself; for a StreamBIM MFA wait, the timer that ends the wait.
+    task: tokio::task::JoinHandle<()>,
+    /// Identifies this attempt: a completion for another generation is ignored.
+    generation: u64,
+    started_at: Instant,
+    /// StreamBIM: the login asked for an MFA code and `task` is the wait's timer.
+    mfa_pending: bool,
+}
+
 /// Connection-scoped handles, owned by the run loop.
 struct Live {
     conn: Option<cf::Connection>,
     watch: Option<WatchHandle>,
     cf_tx: UnboundedSender<CfEvent>,
     w_tx: UnboundedSender<Vec<LocalChange>>,
-    /// Owned by the command loop so retry/logout can wait for cancellation.
-    sign_in_task: Option<tokio::task::JoinHandle<()>>,
+    /// Pending sign-in attempts, one per provider.
+    sign_ins: HashMap<Provider, SignInAttempt>,
+    /// Last generation handed out (monotonic over all providers).
     sign_in_generation: u64,
-    sign_in_started_at: Option<Instant>,
     client_validation: Option<ClientIdValidation>,
     /// A saved APS identity change must stop before another command or timer runs.
     restart_pending: bool,
@@ -356,9 +381,8 @@ impl Engine {
             watch: None,
             cf_tx,
             w_tx,
-            sign_in_task: None,
+            sign_ins: HashMap::new(),
             sign_in_generation: 0,
-            sign_in_started_at: None,
             client_validation: None,
             restart_pending: false,
         };
@@ -366,7 +390,7 @@ impl Engine {
         if !self.ctx.cfg.update_channel.trim().is_empty() {
             self.st().update_due = Some(Instant::now() + Duration::from_secs(60));
         }
-        if self.ctx.auth.is_signed_in() && self.ctx.auth.user().is_some() {
+        if self.ctx.any_signed_in() {
             if let Err(e) = self.go_online(&mut live).await {
                 error!("kunde inte starta synk: {e:#}");
                 self.set_error(format!("{e:#}"));
@@ -376,10 +400,9 @@ impl Engine {
         }
         self.publish();
         self.publish_settings();
-        if self.ctx.auth.is_signed_in() && self.ctx.auth.user().is_some() {
-            let me = self.clone();
-            self.spawn_maintenance(async move { me.refresh_projects().await });
-        }
+        // Lists the hubs of every signed-in provider, and the subscriptions of the others.
+        let me = self.clone();
+        self.spawn_maintenance(async move { me.refresh_projects().await });
 
         loop {
             let wake_at = self.next_wake();
@@ -399,8 +422,11 @@ impl Engine {
                     }
                 }
                 msg = irx.recv() => match msg {
-                    Some(Internal::SignedIn { generation, result }) => {
-                        self.on_signed_in(generation, result, &mut live).await;
+                    Some(Internal::SignedIn { provider, generation, result }) => {
+                        self.on_signed_in(provider, generation, result, &mut live, &itx).await;
+                    }
+                    Some(Internal::SignInExpired { provider, generation }) => {
+                        self.on_sign_in_expired(provider, generation, &mut live);
                     }
                     Some(Internal::ClientIdValidated { generation, request_id, result }) => {
                         self.on_client_id_validated(generation, &request_id, result, &mut live).await;
@@ -421,7 +447,7 @@ impl Engine {
         }
 
         info!("avslutar synkmotorn");
-        self.cancel_sign_in(&mut live).await;
+        self.cancel_all_sign_ins(&mut live).await;
         self.abort_downloads();
         live.watch.take();
         live.conn.take();
@@ -452,7 +478,7 @@ impl Engine {
     /// mutation span blocks a client change; retry markers remain for next login.
     fn active_session_work(self: &Arc<Self>) -> Option<MaintenanceGuard> {
         let mut st = self.st();
-        if !self.ctx.auth.is_signed_in() || st.recovering || st.moving {
+        if !self.ctx.any_signed_in() || st.recovering || st.moving {
             return None;
         }
         st.maintenance_running += 1;
@@ -461,18 +487,53 @@ impl Engine {
 
     // ------------------------------------------------------------------ session
 
+    /// True when the project's provider is signed in (false when the project is unknown).
+    fn project_signed_in(&self, pid: Pid) -> bool {
+        self.ctx
+            .store
+            .project(pid)
+            .ok()
+            .flatten()
+            .is_some_and(|p| self.ctx.signed_in(p.provider))
+    }
+
+    /// The user of a provider whose account is signed in.
+    fn signed_user(&self, p: Provider) -> Option<UserInfo> {
+        if self.ctx.signed_in(p) {
+            self.ctx.user_for(p)
+        } else {
+            None
+        }
+    }
+
+    /// The id the sync root is registered under. Stored once (kv `sync_root_uid`), so it
+    /// stays the same while the root is registered whichever account signs in later.
+    fn sync_root_uid(&self) -> Result<String> {
+        let acc = self.signed_user(Provider::Acc);
+        let first_other = Provider::ALL
+            .into_iter()
+            .filter(|p| *p != Provider::Acc)
+            .find_map(|p| self.signed_user(p).map(|u| (p, u)));
+        let stored = self.ctx.store.kv_get(SYNC_ROOT_UID_KEY)?;
+        let uid = root_uid(
+            stored.clone(),
+            acc.as_ref(),
+            first_other.as_ref().map(|(p, u)| (*p, u)),
+        )
+        .ok_or_else(|| anyhow!("ingen användarinformation"))?;
+        if stored.as_deref() != Some(uid.as_str()) {
+            self.ctx.store.kv_set(SYNC_ROOT_UID_KEY, Some(&uid))?;
+        }
+        Ok(uid)
+    }
+
     async fn go_online(self: &Arc<Self>, live: &mut Live) -> Result<()> {
         if live.conn.is_some() {
             return Ok(());
         }
-        let user = self
-            .ctx
-            .auth
-            .user()
-            .ok_or_else(|| anyhow!("ingen användarinformation"))?;
+        let uid = self.sync_root_uid()?;
         let root = self.ctx.paths.sync_root.clone();
         let tx = live.cf_tx.clone();
-        let uid = user.user_id.clone();
         let root2 = root.clone();
         let conn = tokio::task::spawn_blocking(move || -> Result<cf::Connection> {
             cf::register(&root2, &uid, APP_NAME, env!("CARGO_PKG_VERSION"))?;
@@ -552,56 +613,310 @@ impl Engine {
         Ok(())
     }
 
-    /// Invalidate even an already queued completion before dropping the old listener.
-    /// Awaiting the aborted task also prevents a late token commit after logout.
-    async fn cancel_sign_in(self: &Arc<Self>, live: &mut Live) {
-        live.sign_in_generation = live.sign_in_generation.wrapping_add(1);
-        live.sign_in_started_at = None;
-        if let Some(task) = live.sign_in_task.take() {
-            task.abort();
-            if let Err(error) = task.await {
+    /// Stops one provider's pending sign-in and waits until its task is gone. Aborting first
+    /// releases a browser callback socket before a replacement tries the same port, and awaiting
+    /// the aborted task prevents a late token commit after logout. A completion that is already
+    /// queued is dropped: its attempt is no longer in `sign_ins`.
+    async fn cancel_sign_in(self: &Arc<Self>, live: &mut Live, provider: Provider) {
+        if let Some(attempt) = live.sign_ins.remove(&provider) {
+            attempt.task.abort();
+            if let Err(error) = attempt.task.await {
                 if !error.is_cancelled() {
                     warn!("inloggningstask avbröts: {error}");
                 }
             }
         }
-        self.st().signing_in = false;
-        if let Some(pending) = live.client_validation.take() {
-            self.client_validation_event(&pending.request_id, "cancelled", None);
+        self.st().signing_in.remove(&provider);
+        if provider == Provider::Acc {
+            if let Some(pending) = live.client_validation.take() {
+                self.client_validation_event(&pending.request_id, "cancelled", None);
+            }
         }
     }
 
-    async fn on_signed_in(self: &Arc<Self>, generation: u64, r: Result<UserInfo>, live: &mut Live) {
-        if live.restart_pending || generation != live.sign_in_generation {
+    async fn cancel_all_sign_ins(self: &Arc<Self>, live: &mut Live) {
+        for provider in Provider::ALL {
+            self.cancel_sign_in(live, provider).await;
+        }
+    }
+
+    /// `sign_in` for one provider. A repeat within SIGN_IN_BURST shares the pending attempt, so an
+    /// accidental double click cannot open two browser tabs; a later one replaces it.
+    async fn sign_in(
+        self: &Arc<Self>,
+        provider: Provider,
+        login: Option<StreamBimLogin>,
+        live: &mut Live,
+        itx: &UnboundedSender<Internal>,
+    ) {
+        let shared = live.sign_ins.get(&provider).is_some_and(|attempt| {
+            attempt.started_at.elapsed() < SIGN_IN_BURST
+                && !attempt.task.is_finished()
+                && !attempt.mfa_pending
+        }) && !(provider == Provider::Acc && live.client_validation.is_some());
+        if shared {
+            self.publish();
+            return;
+        }
+        // One more explicit click retries a closed browser tab or starts a new password login.
+        self.cancel_sign_in(live, provider).await;
+        if self.ctx.signed_in(provider) {
+            if let Err(e) = self.go_online(live).await {
+                self.set_error(format!("{e:#}"));
+            }
+            self.publish();
+            return;
+        }
+        let generation = next_sign_in_generation(live);
+        let me = self.clone();
+        let tx = itx.clone();
+        let task = match provider {
+            Provider::Acc => tokio::spawn(async move {
+                let result = me.ctx.auth.sign_in().await.map(LoginOutcome::SignedIn);
+                let _ = tx.send(Internal::SignedIn {
+                    provider,
+                    generation,
+                    result,
+                });
+                me.wake.notify_one();
+            }),
+            Provider::Interaxo => tokio::spawn(async move {
+                let result = me.ctx.interaxo.sign_in().await.map(LoginOutcome::SignedIn);
+                let _ = tx.send(Internal::SignedIn {
+                    provider,
+                    generation,
+                    result,
+                });
+                me.wake.notify_one();
+            }),
+            Provider::StreamBim => {
+                let Some(login) = login else {
+                    self.ctx.ui.send(UiMsg::notify(
+                        Severity::Warning,
+                        "Ange region, e-postadress och lösenord för StreamBIM.",
+                    ));
+                    self.publish();
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result = me
+                        .ctx
+                        .streambim
+                        .login(&login.region, &login.username, &login.password.0)
+                        .await;
+                    drop(login);
+                    let _ = tx.send(Internal::SignedIn {
+                        provider,
+                        generation,
+                        result,
+                    });
+                    me.wake.notify_one();
+                })
+            }
+        };
+        live.sign_ins.insert(
+            provider,
+            SignInAttempt {
+                task,
+                generation,
+                started_at: Instant::now(),
+                mfa_pending: false,
+            },
+        );
+        {
+            let mut st = self.st();
+            st.signing_in.insert(provider);
+            if provider == Provider::Acc {
+                st.last_error = None;
+            }
+        }
+        if provider != Provider::StreamBim {
+            self.ctx.ui.send(UiMsg::SignInProgress {
+                provider,
+                state: "browser",
+                error: None,
+            });
+        }
+        self.publish();
+    }
+
+    /// The result of a sign-in task. A result of an attempt that was replaced or cancelled is
+    /// dropped. A StreamBIM login that needs an MFA code keeps its attempt for `MFA_WAIT`.
+    async fn on_signed_in(
+        self: &Arc<Self>,
+        provider: Provider,
+        generation: u64,
+        r: Result<LoginOutcome>,
+        live: &mut Live,
+        itx: &UnboundedSender<Internal>,
+    ) {
+        let current = live
+            .sign_ins
+            .get(&provider)
+            .is_some_and(|attempt| attempt.generation == generation);
+        if live.restart_pending || !current {
             debug!("ignorerar svar från en ersatt inloggning");
             return;
         }
-        live.sign_in_task.take();
-        live.sign_in_started_at = None;
-        self.st().signing_in = false;
         match r {
-            Ok(_) => {
-                info!("inloggad");
-                if let Err(e) = self.go_online(live).await {
+            Ok(LoginOutcome::MfaRequired) => {
+                // The login task is finished; the attempt now waits for the code.
+                let timer = mfa_timer(provider, generation, itx);
+                if let Some(attempt) = live.sign_ins.get_mut(&provider) {
+                    attempt.task = timer;
+                    attempt.mfa_pending = true;
+                    attempt.started_at = Instant::now();
+                }
+                self.ctx.ui.send(UiMsg::SignInProgress {
+                    provider,
+                    state: "mfa_required",
+                    error: None,
+                });
+            }
+            Ok(LoginOutcome::SignedIn(_)) => {
+                live.sign_ins.remove(&provider);
+                self.st().signing_in.remove(&provider);
+                info!("inloggad i {}", provider.label());
+                self.ctx.ui.send(UiMsg::SignInProgress {
+                    provider,
+                    state: "signed_in",
+                    error: None,
+                });
+                if live.conn.is_some() {
+                    self.provider_connected(provider).await;
+                } else if let Err(e) = self.go_online(live).await {
                     error!("kunde inte starta synk: {e:#}");
                     self.set_error(format!("{e:#}"));
                 }
+                let me = self.clone();
+                self.spawn_maintenance(async move { me.refresh_projects().await });
             }
             Err(e) => {
-                warn!("inloggning misslyckades: {e:#}");
-                self.set_error(format!("{e:#}"));
-                self.ctx.ui.send(UiMsg::notify(
-                    Severity::Error,
-                    format!("Inloggningen misslyckades: {e:#}"),
-                ));
+                live.sign_ins.remove(&provider);
+                self.st().signing_in.remove(&provider);
+                warn!("inloggning misslyckades ({}): {e:#}", provider.label());
+                let text = format!("{e:#}");
+                if provider == Provider::Acc {
+                    self.set_error(text.clone());
+                    self.ctx.ui.send(UiMsg::notify(
+                        Severity::Error,
+                        format!("Inloggningen misslyckades: {text}"),
+                    ));
+                }
+                self.ctx.ui.send(UiMsg::SignInProgress {
+                    provider,
+                    state: "failed",
+                    error: Some(text),
+                });
             }
         }
         self.publish();
     }
 
-    async fn sign_out(self: &Arc<Self>, live: &mut Live) {
-        self.cancel_sign_in(live).await;
-        let uid = self.ctx.auth.user().map(|u| u.user_id);
+    /// The MFA wait ran out: the attempt ends, the user starts over.
+    fn on_sign_in_expired(self: &Arc<Self>, provider: Provider, generation: u64, live: &mut Live) {
+        let waiting = live
+            .sign_ins
+            .get(&provider)
+            .is_some_and(|attempt| attempt.mfa_pending && attempt.generation == generation);
+        if !waiting {
+            return;
+        }
+        live.sign_ins.remove(&provider);
+        self.st().signing_in.remove(&provider);
+        self.ctx.ui.send(UiMsg::SignInProgress {
+            provider,
+            state: "cancelled",
+            error: Some("Tiden för koden gick ut – logga in igen.".into()),
+        });
+        self.publish();
+    }
+
+    /// A provider signed in while the sync root is already registered: its projects get their
+    /// folders and an immediate poll, and the outbox runs (its jobs waited for the sign-in).
+    async fn provider_connected(self: &Arc<Self>, provider: Provider) {
+        let ctx = self.ctx.clone();
+        let pids =
+            match tokio::task::spawn_blocking(move || ensure_provider_dirs(&ctx, provider)).await {
+                Ok(Ok(pids)) => pids,
+                Ok(Err(e)) => {
+                    warn!("kunde inte skapa mappar för {}: {e:#}", provider.label());
+                    Vec::new()
+                }
+                Err(e) => {
+                    warn!("uppgift avbröts: {e}");
+                    Vec::new()
+                }
+            };
+        let now = Instant::now();
+        let mut st = self.st();
+        for pid in pids {
+            st.next_due.insert(pid, now);
+        }
+        st.outbox_next = Some(now);
+    }
+
+    /// `sign_out` with `Some(provider)` or `None` (every provider). While another provider stays
+    /// signed in, the sync root stays registered and only this provider's projects pause.
+    async fn sign_out(self: &Arc<Self>, provider: Option<Provider>, live: &mut Live) {
+        match provider {
+            Some(p) => {
+                self.cancel_sign_in(live, p).await;
+                let others = Provider::ALL
+                    .into_iter()
+                    .any(|q| q != p && self.ctx.signed_in(q));
+                if others {
+                    self.sign_out_account(p).await;
+                    let paused: Vec<Pid> = self
+                        .ctx
+                        .store
+                        .projects()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|q| q.provider == p)
+                        .map(|q| q.pid)
+                        .collect();
+                    {
+                        let mut st = self.st();
+                        for pid in paused {
+                            st.next_due.remove(&pid);
+                            st.fails.remove(&pid);
+                            st.activity.remove(&pid);
+                        }
+                    }
+                    info!("utloggad från {}; övriga konton synkar vidare", p.label());
+                    self.publish();
+                    return;
+                }
+            }
+            None => self.cancel_all_sign_ins(live).await,
+        }
+        self.sign_out_everything(live).await;
+    }
+
+    async fn sign_out_account(&self, provider: Provider) {
+        let result = match provider {
+            Provider::Acc => self.ctx.auth.sign_out().await,
+            Provider::StreamBim => self.ctx.streambim.sign_out().await,
+            Provider::Interaxo => self.ctx.interaxo.sign_out().await,
+        };
+        if let Err(e) = result {
+            warn!("utloggning ({}): {e:#}", provider.label());
+        }
+    }
+
+    /// The full sign-out: unregister the sync root, sign out of every account, forget the root
+    /// id and clear the engine state.
+    async fn sign_out_everything(self: &Arc<Self>, live: &mut Live) {
+        let stored = self.ctx.store.kv_get(SYNC_ROOT_UID_KEY).ok().flatten();
+        let uid = stored
+            .or_else(|| self.ctx.auth.user().map(|u| u.user_id))
+            .or_else(|| {
+                Provider::ALL
+                    .into_iter()
+                    .find_map(|p| self.ctx.user_for(p))
+                    .map(|u| u.user_id)
+            });
         live.watch.take();
         live.conn.take();
         self.abort_downloads();
@@ -612,8 +927,11 @@ impl Engine {
                 Ok(Ok(())) => {}
             }
         }
-        if let Err(e) = self.ctx.auth.sign_out().await {
-            warn!("utloggning: {e:#}");
+        for provider in Provider::ALL {
+            self.sign_out_account(provider).await;
+        }
+        if let Err(e) = self.ctx.store.kv_set(SYNC_ROOT_UID_KEY, None) {
+            warn!("kunde inte glömma synkrotens id: {e:#}");
         }
         {
             let mut st = self.st();
@@ -715,9 +1033,23 @@ impl Engine {
                 .collect()
         };
         for pid in due {
-            self.spawn_poll(pid);
+            // A project of a signed-out provider does not poll. It leaves the schedule and comes
+            // back when that provider signs in (provider_connected).
+            let provider = self
+                .ctx
+                .store
+                .project(pid)
+                .ok()
+                .flatten()
+                .map(|p| p.provider);
+            match provider {
+                Some(provider) if !self.ctx.signed_in(provider) => {
+                    self.st().next_due.remove(&pid);
+                }
+                _ => self.spawn_poll(pid),
+            }
         }
-        let signed_in = self.ctx.auth.is_signed_in();
+        let signed_in = self.ctx.any_signed_in();
         let run_outbox = {
             let mut st = self.st();
             match st.outbox_next {
@@ -784,7 +1116,7 @@ impl Engine {
             let fresh = st
                 .local_bytes_at
                 .is_some_and(|t| t.elapsed() < LOCAL_BYTES_EVERY);
-            if st.counting_bytes || (fresh && !force) || !self.ctx.auth.is_signed_in() {
+            if st.counting_bytes || (fresh && !force) || !self.ctx.any_signed_in() {
                 return;
             }
             st.counting_bytes = true;
@@ -1417,6 +1749,25 @@ impl Engine {
             .await;
             return;
         };
+        let provider = db(&self.ctx, move |s| s.project(pid))
+            .await
+            .ok()
+            .flatten()
+            .map_or(Provider::Acc, |p| p.provider);
+        if !self.ctx.signed_in(provider) {
+            self.ctx.ui.send(UiMsg::notify(
+                Severity::Warning,
+                format!("Logga in på {} för att hämta filen.", provider.label()),
+            ));
+            fail_data(
+                req.keys,
+                req.required_offset,
+                req.required_length,
+                STATUS_CLOUD_FILE_UNSUCCESSFUL,
+            )
+            .await;
+            return;
+        }
         let permit = match self.down_sem.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => return,
@@ -1733,7 +2084,7 @@ impl Engine {
             loop {
                 tokio::time::sleep(REFRESH_RETRY).await;
                 let Some(_work) = me.active_session_work() else {
-                    if me.ctx.auth.is_signed_in() {
+                    if me.project_signed_in(pid) {
                         continue; // Recovery pauses persisted remote work; it does not cancel it.
                     }
                     break;
@@ -1785,7 +2136,7 @@ impl Engine {
             loop {
                 tokio::time::sleep(wait).await;
                 let Some(_work) = me.active_session_work() else {
-                    if me.ctx.auth.is_signed_in() {
+                    if me.project_signed_in(pid) {
                         continue;
                     }
                     break;
@@ -1883,48 +2234,76 @@ impl Engine {
             return;
         };
         match cmd {
-            TrayCmd::SignIn => {
-                if live.client_validation.is_none()
-                    && live
-                        .sign_in_started_at
-                        .is_some_and(|started| started.elapsed() < SIGN_IN_BURST)
-                    && live
-                        .sign_in_task
-                        .as_ref()
-                        .is_some_and(|task| !task.is_finished())
-                {
-                    // An accidental burst must not open several browser tabs or keep
-                    // replacing the callback that the first tab is about to complete.
-                    self.publish();
+            TrayCmd::SignIn {
+                provider,
+                streambim,
+            } => {
+                self.sign_in(provider, streambim, live, itx).await;
+            }
+            TrayCmd::SignInMfa { provider, code } => {
+                let generation = live
+                    .sign_ins
+                    .get(&provider)
+                    .filter(|attempt| attempt.mfa_pending)
+                    .map(|attempt| attempt.generation);
+                let Some(generation) = generation else {
+                    self.ctx.ui.send(UiMsg::notify(
+                        Severity::Warning,
+                        "Ingen kod väntas. Logga in igen.",
+                    ));
                     return;
+                };
+                // The MFA wait's timer gives way to the verification of the code.
+                if let Some(wait) = live.sign_ins.remove(&provider) {
+                    wait.task.abort();
+                    let _ = wait.task.await;
                 }
-                // One more explicit click retries a closed/error browser tab. Release
-                // the old callback socket before a replacement tries the same port.
-                self.cancel_sign_in(live).await;
-                if self.ctx.auth.is_signed_in() && self.ctx.auth.user().is_some() {
-                    if let Err(e) = self.go_online(live).await {
-                        self.set_error(format!("{e:#}"));
-                    }
-                    self.publish();
-                    return;
-                }
-                let generation = live.sign_in_generation;
-                live.sign_in_started_at = Some(Instant::now());
-                {
-                    let mut st = self.st();
-                    st.signing_in = true;
-                    st.last_error = None;
-                }
-                self.publish();
                 let me = self.clone();
                 let tx = itx.clone();
-                live.sign_in_task = Some(tokio::spawn(async move {
-                    let result = me.ctx.auth.sign_in().await;
-                    let _ = tx.send(Internal::SignedIn { generation, result });
+                let task = tokio::spawn(async move {
+                    let result = me
+                        .ctx
+                        .streambim
+                        .verify_mfa(&code.0)
+                        .await
+                        .map(LoginOutcome::SignedIn);
+                    drop(code);
+                    let _ = tx.send(Internal::SignedIn {
+                        provider,
+                        generation,
+                        result,
+                    });
                     me.wake.notify_one();
-                }));
+                });
+                live.sign_ins.insert(
+                    provider,
+                    SignInAttempt {
+                        task,
+                        generation,
+                        started_at: Instant::now(),
+                        mfa_pending: false,
+                    },
+                );
+                self.publish();
             }
-            TrayCmd::SignOut => self.sign_out(live).await,
+            TrayCmd::CancelSignIn { provider } => {
+                self.cancel_sign_in(live, provider).await;
+                self.ctx.ui.send(UiMsg::SignInProgress {
+                    provider,
+                    state: "cancelled",
+                    error: None,
+                });
+                self.publish();
+            }
+            TrayCmd::SignOut { provider } => self.sign_out(provider, live).await,
+            TrayCmd::StreamBimRegions => {
+                let client = self.ctx.api.client().clone();
+                let ui = self.ctx.ui.clone();
+                tokio::spawn(async move {
+                    let regions = crate::api::streambim::regions(&client).await;
+                    ui.send(UiMsg::StreamBimRegions(regions));
+                });
+            }
             TrayCmd::TestApsClientId {
                 client_id,
                 request_id,
@@ -1937,7 +2316,7 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|pending| pending.request_id == request_id)
                 {
-                    self.cancel_sign_in(live).await;
+                    self.cancel_sign_in(live, Provider::Acc).await;
                     self.publish();
                 } else if !self.ctx.ui.hub.replay_client_validation_result(&request_id) {
                     // A new engine has no live request after a crash/restart. Let the UI
@@ -1984,6 +2363,13 @@ impl Engine {
                         })
                 };
                 match found {
+                    // Unsubscribing needs no API, so a signed-out provider's project can be let go.
+                    Some((hub, _)) if subscribe && !self.ctx.signed_in(hub.provider) => {
+                        self.ctx.ui.send(UiMsg::notify(
+                            Severity::Warning,
+                            format!("Logga in på {} först.", hub.provider.label()),
+                        ));
+                    }
                     Some((hub, project)) => {
                         let me = self.clone();
                         self.spawn_maintenance(async move {
@@ -2006,7 +2392,7 @@ impl Engine {
                     return;
                 }
                 if live.client_validation.is_some() {
-                    self.cancel_sign_in(live).await;
+                    self.cancel_sign_in(live, Provider::Acc).await;
                 }
                 if self.set_client_id(&value, live).await {
                     crate::app::request_restart();
@@ -2096,9 +2482,6 @@ impl Engine {
     /// Hubs and projects of every signed-in provider. A provider whose hubs cannot be listed
     /// keeps the hubs it had before (one notice); the other providers are listed as usual.
     async fn refresh_projects(self: &Arc<Self>) {
-        if !self.ctx.any_signed_in() {
-            return; // nothing to list before sign-in
-        }
         let previous = self
             .projects
             .lock()
@@ -2108,14 +2491,12 @@ impl Engine {
             hubs: previous.clone(),
             loading: true,
         });
-        let subscribed: HashSet<String> = match db(&self.ctx, |s| s.projects()).await {
-            Ok(ps) => ps
-                .into_iter()
-                .filter(|p| p.enabled)
-                .map(|p| p.project_id)
-                .collect(),
-            Err(_) => HashSet::new(),
-        };
+        let stored = db(&self.ctx, |s| s.projects()).await.unwrap_or_default();
+        let subscribed: HashSet<String> = stored
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.project_id.clone())
+            .collect();
         let lists = futures_util::future::join_all(
             Provider::ALL
                 .into_iter()
@@ -2145,6 +2526,13 @@ impl Engine {
                             .cloned(),
                     );
                 }
+            }
+        }
+        // A signed-out provider cannot be listed. Its subscribed projects still show, so they
+        // can be unsubscribed.
+        for provider in Provider::ALL {
+            if !self.ctx.signed_in(provider) {
+                out.extend(offline_hubs(provider, &previous, &stored, &subscribed));
             }
         }
         *self.projects.lock().unwrap_or_else(|e| e.into_inner()) = out.clone();
@@ -2344,7 +2732,7 @@ impl Engine {
             ));
             return;
         };
-        if !self.ctx.auth.is_signed_in() || self.st().offline {
+        if !self.ctx.signed_in(p.provider) || self.st().offline {
             self.ctx.ui.send(UiMsg::notify(
                 Severity::Warning,
                 "Återställning kräver att du är inloggad och online",
@@ -2363,7 +2751,7 @@ impl Engine {
             self.ctx.ui.send(UiMsg::notify(Severity::Warning, "Kunde inte återställa: synkarbetet blev inte klart i tid. Lokala filer är kvar. Försök igen när överföringarna är klara."));
             return;
         }
-        if !self.ctx.auth.is_signed_in() || self.st().offline {
+        if !self.ctx.signed_in(p.provider) || self.st().offline {
             self.ctx.ui.send(UiMsg::notify(Severity::Warning, "Återställningen avbröts eftersom anslutningen eller inloggningen ändrades. Dina lokala filer finns kvar."));
             return;
         }
@@ -2843,12 +3231,9 @@ impl Engine {
                 })
             })
             .collect();
-        let user = self
-            .ctx
-            .auth
-            .user()
-            .filter(|_| self.ctx.auth.is_signed_in());
-        let signed_in = user.is_some();
+        let accounts = self.account_statuses();
+        let user = status_user(&accounts);
+        let signed_in = accounts.iter().any(|a| a.signed_in);
         let last_synced = if signed_in {
             self.last_synced_ms()
         } else {
@@ -2873,10 +3258,10 @@ impl Engine {
                     "Starta om Synka för att slutföra återställningen.".to_string(),
                 )
             } else if !signed_in {
-                let text = if st.signing_in {
-                    "Väntar på inloggning i webbläsaren…"
-                } else {
+                let text = if st.signing_in.is_empty() {
                     "Logga in"
+                } else {
+                    "Väntar på inloggning i webbläsaren…"
                 };
                 ("signed_out", text.to_string())
             } else if let Some(e) = &st.last_error {
@@ -2931,7 +3316,39 @@ impl Engine {
             held_deletes,
             local_bytes: self.st().local_bytes,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            accounts,
         }));
+    }
+
+    /// One entry per provider, in account order (see IPC.md `status.accounts`).
+    fn account_statuses(&self) -> Vec<AccountStatus> {
+        let signing: HashSet<Provider> = self.st().signing_in.clone();
+        Provider::ALL
+            .into_iter()
+            .map(|provider| {
+                let signed_in = self.ctx.signed_in(provider);
+                AccountStatus {
+                    provider,
+                    label: provider.label(),
+                    configured: match provider {
+                        Provider::Acc => self.ctx.auth.is_configured(),
+                        Provider::StreamBim => true,
+                        Provider::Interaxo => self.ctx.interaxo.is_configured(),
+                    },
+                    signed_in,
+                    signing_in: signing.contains(&provider),
+                    user: if signed_in {
+                        self.ctx.user_for(provider)
+                    } else {
+                        None
+                    },
+                    host: match provider {
+                        Provider::StreamBim => self.ctx.streambim.host(),
+                        _ => None,
+                    },
+                }
+            })
+            .collect()
     }
 
     /// Latest successful poll: this process, or the newest `last_sync_ms` stored for an enabled
@@ -2964,6 +3381,20 @@ impl Engine {
             aps_client_id_override_supported: true,
             aps_client_id_validation_supported: true,
             update_channel_configured: !s.update_channel.trim().is_empty(),
+            providers: Provider::ALL.into_iter().map(Provider::as_str).collect(),
+            interaxo_client_id: s
+                .interaxo_client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            interaxo_redirect_uri: s.interaxo_client().redirect_uri,
+            interaxo_redirect_uri_default: INTERAXO_DEFAULT_REDIRECT,
+            interaxo_client_secret_set: s
+                .interaxo_client_secret_protected
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|blob| !blob.is_empty()),
         };
         self.ctx.ui.send(UiMsg::Settings(view));
     }
@@ -3025,7 +3456,7 @@ impl Engine {
                     // A reconnect may retry a request whose acknowledgement was lost.
                     self.client_validation_event(&request_id, "testing", None);
                 } else {
-                    self.cancel_sign_in(live).await;
+                    self.cancel_sign_in(live, Provider::Acc).await;
                     self.client_validation_event(
                         &request_id,
                         "failed",
@@ -3039,14 +3470,9 @@ impl Engine {
                 return;
             }
         }
-        if live
-            .sign_in_started_at
-            .is_some_and(|started| started.elapsed() < SIGN_IN_BURST)
-            && live
-                .sign_in_task
-                .as_ref()
-                .is_some_and(|task| !task.is_finished())
-        {
+        if live.sign_ins.get(&Provider::Acc).is_some_and(|attempt| {
+            attempt.started_at.elapsed() < SIGN_IN_BURST && !attempt.task.is_finished()
+        }) {
             self.client_validation_event(&request_id, "failed", Some(
                 "En inloggning eller ett APS-test startades just. Vänta ett ögonblick eller avbryt först.".into()));
             return;
@@ -3064,7 +3490,7 @@ impl Engine {
             return;
         }
         // Retrying must release the previous callback listener before the next flow binds.
-        self.cancel_sign_in(live).await;
+        self.cancel_sign_in(live, Provider::Acc).await;
         if let Err(error) = self.client_validation_guard(live) {
             self.client_validation_event(&request_id, "failed", Some(error));
             self.publish();
@@ -3077,21 +3503,29 @@ impl Engine {
             original_override: original.explicit_client_id_override().map(str::to_string),
             original_effective_id: original.client_id(),
         });
-        let generation = live.sign_in_generation;
-        live.sign_in_started_at = Some(Instant::now());
-        self.st().signing_in = true;
+        let generation = next_sign_in_generation(live);
+        self.st().signing_in.insert(Provider::Acc);
         self.client_validation_event(&request_id, "testing", None);
         self.publish();
         let http = self.ctx.api.client().clone();
         let tx = itx.clone();
-        live.sign_in_task = Some(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = crate::auth::Auth::validate_client_id(client_id, http).await;
             let _ = tx.send(Internal::ClientIdValidated {
                 generation,
                 request_id,
                 result,
             });
-        }));
+        });
+        live.sign_ins.insert(
+            Provider::Acc,
+            SignInAttempt {
+                task,
+                generation,
+                started_at: Instant::now(),
+                mfa_pending: false,
+            },
+        );
     }
 
     async fn on_client_id_validated(
@@ -3102,7 +3536,10 @@ impl Engine {
         live: &mut Live,
     ) {
         if live.restart_pending
-            || generation != live.sign_in_generation
+            || live
+                .sign_ins
+                .get(&Provider::Acc)
+                .is_none_or(|attempt| attempt.generation != generation)
             || live
                 .client_validation
                 .as_ref()
@@ -3114,9 +3551,8 @@ impl Engine {
             .client_validation
             .take()
             .expect("matched pending validation");
-        live.sign_in_task.take();
-        live.sign_in_started_at = None;
-        self.st().signing_in = false;
+        live.sign_ins.remove(&Provider::Acc);
+        self.st().signing_in.remove(&Provider::Acc);
         let result = match result {
             Ok(()) => self.client_validation_guard(live),
             Err(error) => Err(format!("APS-testet misslyckades: {error:#}")),
@@ -3191,7 +3627,7 @@ impl Engine {
                 );
             }
 
-            self.cancel_sign_in(live).await;
+            self.cancel_sign_in(live, Provider::Acc).await;
             self.publish();
             // The previous worker may have finished committing a complete session
             // just before cancellation. It still requires an explicit sign-out.
@@ -3254,6 +3690,13 @@ impl Engine {
     /// Applies a validated `set_setting`, saves settings.json and republishes `settings`.
     /// max_downloads, max_uploads and log_level take effect after the next engine start.
     async fn set_setting(self: &Arc<Self>, key: &str, value: &Value) {
+        if matches!(
+            key,
+            "interaxo_client_id" | "interaxo_redirect_uri" | "interaxo_client_secret"
+        ) {
+            self.set_interaxo_setting(key, value);
+            return;
+        }
         if key == "start_at_login" {
             let on = value.as_bool().unwrap_or(false);
             let packaged = self.ctx.paths.packaged;
@@ -3291,6 +3734,44 @@ impl Engine {
             }
         }
         self.publish_settings();
+    }
+
+    /// The Interaxo client (id, redirect URI, secret) is saved only while Interaxo is signed out:
+    /// the account keeps tokens for the client it was signed in with.
+    fn set_interaxo_setting(self: &Arc<Self>, key: &str, value: &Value) {
+        let busy = self.ctx.signed_in(Provider::Interaxo)
+            || self.st().signing_in.contains(&Provider::Interaxo);
+        if busy {
+            self.ctx.ui.send(UiMsg::notify(
+                Severity::Warning,
+                "Logga ut från Interaxo innan du ändrar klientinställningarna.",
+            ));
+            self.publish_settings();
+            return;
+        }
+        let saved = {
+            let mut s = self.ctx.settings.write().unwrap_or_else(|e| e.into_inner());
+            match s.apply_setting(key, value) {
+                Ok(()) => Ok(s.clone()),
+                Err(e) => Err(e),
+            }
+        };
+        match saved {
+            Ok(cfg) => {
+                if let Err(e) = cfg.save(&self.ctx.paths.state_dir.join("settings.json")) {
+                    warn!("kunde inte spara inställningar: {e:#}");
+                    self.ctx.ui.send(UiMsg::notify(
+                        Severity::Error,
+                        "Kunde inte spara Interaxo-inställningen. Försök igen.",
+                    ));
+                }
+                self.ctx.interaxo.set_interaxo_client(cfg.interaxo_client());
+                info!("inställning {key} ändrad");
+            }
+            Err(e) => warn!("inställning {key}: {e}"),
+        }
+        self.publish_settings();
+        self.publish();
     }
 
     /// Frees clean local copies and clears offline pinning in the selected scope.
@@ -4201,6 +4682,120 @@ fn ensure_project_dirs(ctx: &Ctx, p: &Project) -> Result<()> {
     Ok(())
 }
 
+/// The user `status.user` shows: the first signed-in account in account order.
+pub(crate) fn status_user(accounts: &[AccountStatus]) -> Option<UserInfo> {
+    accounts
+        .iter()
+        .find(|a| a.signed_in)
+        .and_then(|a| a.user.clone())
+}
+
+/// The id the sync root is registered under: the stored one, else the ACC user id (an existing
+/// ACC install keeps its registration), else `<provider>:<user id>` of the first other provider.
+pub(crate) fn root_uid(
+    stored: Option<String>,
+    acc_user: Option<&UserInfo>,
+    first_other: Option<(Provider, &UserInfo)>,
+) -> Option<String> {
+    if let Some(uid) = stored.filter(|uid| !uid.trim().is_empty()) {
+        return Some(uid);
+    }
+    if let Some(user) = acc_user {
+        return Some(user.user_id.clone());
+    }
+    first_other.map(|(provider, user)| format!("{}:{}", provider.as_str(), user.user_id))
+}
+
+/// The hubs of a provider that is signed out: the hubs listed before, with their current
+/// subscription flags, plus every subscribed project of that provider missing from them.
+fn offline_hubs(
+    provider: Provider,
+    previous: &HubList,
+    stored: &[Project],
+    subscribed: &HashSet<String>,
+) -> HubList {
+    let mut hubs: HubList = previous
+        .iter()
+        .filter(|(hub, _)| hub.provider == provider)
+        .map(|(hub, projects)| {
+            let projects = projects
+                .iter()
+                .map(|(p, _)| (p.clone(), subscribed.contains(&p.id)))
+                .collect();
+            (hub.clone(), projects)
+        })
+        .collect();
+    for project in stored
+        .iter()
+        .filter(|p| p.enabled && p.provider == provider)
+    {
+        let listed = hubs
+            .iter()
+            .any(|(_, ps)| ps.iter().any(|(p, _)| p.id == project.project_id));
+        if listed {
+            continue;
+        }
+        let info = ProjectInfo {
+            id: project.project_id.clone(),
+            hub_id: project.hub_id.clone(),
+            name: project.name.clone(),
+            root_folder_urn: None,
+            scopes: Vec::new(),
+            provider,
+            meta: project.meta.clone(),
+        };
+        match hubs.iter_mut().find(|(hub, _)| hub.id == project.hub_id) {
+            Some((_, ps)) => ps.push((info, true)),
+            None => hubs.push((
+                HubInfo {
+                    id: project.hub_id.clone(),
+                    name: project.hub_name.clone(),
+                    region: None,
+                    provider,
+                },
+                vec![(info, true)],
+            )),
+        }
+    }
+    hubs
+}
+
+/// A new attempt generation (never reused, so a stale completion cannot match a newer attempt).
+fn next_sign_in_generation(live: &mut Live) -> u64 {
+    live.sign_in_generation = live.sign_in_generation.wrapping_add(1);
+    live.sign_in_generation
+}
+
+/// Ends a StreamBIM MFA wait after MFA_WAIT.
+fn mfa_timer(
+    provider: Provider,
+    generation: u64,
+    itx: &UnboundedSender<Internal>,
+) -> tokio::task::JoinHandle<()> {
+    let tx = itx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(MFA_WAIT).await;
+        let _ = tx.send(Internal::SignInExpired {
+            provider,
+            generation,
+        });
+    })
+}
+
+/// Hub and project dirs of one provider's enabled projects (those with a current layout).
+fn ensure_provider_dirs(ctx: &Ctx, provider: Provider) -> Result<Vec<Pid>> {
+    let mut pids = Vec::new();
+    for p in ctx.store.projects()? {
+        if p.enabled && p.provider == provider && !ctx.store.old_layout(p.pid)? {
+            if let Err(e) = ensure_project_dirs(ctx, &p) {
+                warn!("kunde inte skapa mappar för {}: {e:#}", p.name);
+            }
+            pids.push(p.pid);
+        }
+    }
+    Ok(pids)
+}
+
 /// Hub and project dirs for every enabled project. Returns the projects to poll, and the
 /// project ids whose rows predate top folders (rebuilt by the caller, not polled before).
 fn ensure_all_dirs(ctx: &Ctx) -> Result<(Vec<Pid>, Vec<String>)> {
@@ -4550,7 +5145,10 @@ fn keep_pending_local(store: &Store, pid: Pid, delta: &mut Delta) -> Result<()> 
     if delta.upserts.is_empty() {
         return Ok(());
     }
-    let pending = store.pending_items(pid, &["rename", "move", "delete"])?;
+    // A rename or move the provider refused (its job is parked) keeps the local name too: a
+    // poll that still reports the old remote name must not move the file back.
+    let mut pending = store.pending_items(pid, &["rename", "move", "delete"])?;
+    pending.extend(store.refused_renames(pid)?);
     if pending.is_empty() {
         return Ok(());
     }
@@ -5814,6 +6412,9 @@ pub(crate) fn register_local(
             path.display()
         ));
     }
+    if is_dir && !creates_folders(ctx, pid) {
+        return Err(anyhow!("mappen finns bara lokalt: {}", path.display()));
+    }
     let id = local_id();
     let now = now_ms();
     let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
@@ -5927,6 +6528,10 @@ fn adopt(ctx: &Ctx, p: &Project, path: &Path, w: &mut Work) {
                 not_synced_here(ctx, p, &cur);
                 return;
             }
+            None if !creates_folders(ctx, p.pid) && (!last || cur.is_dir()) => {
+                not_created_here(ctx, p, &cur);
+                return;
+            }
             None => match register_local(ctx, p.pid, &parent, c, !last || cur.is_dir(), &cur) {
                 Ok(id) => {
                     w.enqueued = true;
@@ -6038,6 +6643,10 @@ fn process_local_with_info(
         }
         if md.is_dir() {
             match &existing {
+                // Stays local with its contents: no folder job the provider would refuse forever.
+                None if info.is_none() && !creates_folders(ctx, p.pid) => {
+                    not_created_here(ctx, p, &path)
+                }
                 None if info.is_none() => {
                     match register_local(ctx, p.pid, &parent, &leaf, true, &path) {
                         Ok(_) => {
@@ -6147,6 +6756,36 @@ fn process_local_with_info(
         }
     }
     w
+}
+
+/// Folders can be created in the project's provider (`remote::caps`). Unknown projects can.
+fn creates_folders(ctx: &Ctx, pid: Pid) -> bool {
+    ctx.store
+        .project(pid)
+        .ok()
+        .flatten()
+        .is_none_or(|p| remote::caps(p.provider).mkdir)
+}
+
+/// Tell the user once per path that a folder made here stays on this PC: the provider's API has
+/// no folder creation, so the folder and what is inside it are not synced.
+fn not_created_here(ctx: &Ctx, p: &Project, path: &Path) {
+    static TOLD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if told.iter().any(|t| naming::same_path(t, path)) {
+        return;
+    }
+    told.push(path.to_path_buf());
+    drop(told);
+    info!("skapas inte i {}: {}", p.provider.label(), path.display());
+    ctx.ui.send(UiMsg::notify(
+        Severity::Warning,
+        format!(
+            "{} API:t kan inte skapa mappar. {} finns bara på den här datorn.",
+            p.provider.label(),
+            file_name_of(path)
+        ),
+    ));
 }
 
 /// Tell the user once per path that something directly in a project directory stays local.
@@ -6774,6 +7413,31 @@ fn reconcile(ctx: &Ctx) -> Work {
 pub(crate) mod tests {
     use super::*;
 
+    /// Test shim: the Acc attempt with the current generation and "now" as its start.
+    fn set_test_attempt(live: &mut Live, task: tokio::task::JoinHandle<()>) {
+        let generation = live.sign_in_generation;
+        live.sign_ins.insert(
+            Provider::Acc,
+            SignInAttempt {
+                task,
+                generation,
+                started_at: Instant::now(),
+                mfa_pending: false,
+            },
+        );
+    }
+
+    /// Test shim: moves the start of the Acc attempt (if one is pending).
+    fn set_test_started(live: &mut Live, started: Instant) {
+        if let Some(attempt) = live.sign_ins.get_mut(&Provider::Acc) {
+            attempt.started_at = started;
+        }
+    }
+
+    fn test_started(live: &Live) -> Option<Instant> {
+        live.sign_ins.get(&Provider::Acc).map(|a| a.started_at)
+    }
+
     fn login_test_live() -> Live {
         let (cf_tx, _) = unbounded_channel();
         let (w_tx, _) = unbounded_channel();
@@ -6782,9 +7446,8 @@ pub(crate) mod tests {
             watch: None,
             cf_tx,
             w_tx,
-            sign_in_task: None,
+            sign_ins: HashMap::new(),
             sign_in_generation: 0,
-            sign_in_started_at: None,
             client_validation: None,
             restart_pending: false,
         }
@@ -6795,6 +7458,17 @@ pub(crate) mod tests {
     fn stage_client_validation(f: &Fixture, live: &mut Live, client_id: &str) {
         let original = f.ctx.cfg_now();
         live.sign_in_generation = 19;
+        // The validation runs as the Acc sign-in attempt (generation 19), started long enough ago
+        // that a new click is not a burst.
+        live.sign_ins.insert(
+            Provider::Acc,
+            SignInAttempt {
+                task: tokio::spawn(std::future::pending::<()>()),
+                generation: 19,
+                started_at: Instant::now() - SIGN_IN_BURST - Duration::from_millis(1),
+                mfa_pending: false,
+            },
+        );
         live.client_validation = Some(ClientIdValidation {
             request_id: VALIDATION_REQUEST.into(),
             client_id: client_id.into(),
@@ -6832,10 +7506,7 @@ pub(crate) mod tests {
                     &tx,
                 )
                 .await;
-            assert!(
-                live.sign_in_task.is_none(),
-                "started auth during {scenario}"
-            );
+            assert!(live.sign_ins.is_empty(), "started auth during {scenario}");
             assert!(live.client_validation.is_none());
             assert!(!live.restart_pending);
             assert!(rx.try_recv().is_err());
@@ -6927,10 +7598,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        live.sign_in_task = Some(tokio::spawn(async move {
-            let _listener = listener;
-            std::future::pending::<()>().await;
-        }));
+        set_test_attempt(
+            &mut live,
+            tokio::spawn(async move {
+                let _listener = listener;
+                std::future::pending::<()>().await;
+            }),
+        );
         let (tx, _) = unbounded_channel();
         engine
             .on_cmd(
@@ -7076,8 +7750,8 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         stage_client_validation(&f, &mut live, "new-test-client");
-        live.sign_in_started_at = Some(Instant::now());
-        live.sign_in_task = Some(tokio::spawn(std::future::pending::<()>()));
+        set_test_attempt(&mut live, tokio::spawn(std::future::pending::<()>()));
+        set_test_started(&mut live, Instant::now());
         let (tx, mut rx) = unbounded_channel();
         for operation in 0..50 {
             engine
@@ -7096,7 +7770,7 @@ pub(crate) mod tests {
             live.client_validation.as_ref().unwrap().request_id,
             VALIDATION_REQUEST
         );
-        assert!(!live.sign_in_task.as_ref().unwrap().is_finished());
+        assert!(!live.sign_ins[&Provider::Acc].task.is_finished());
         assert!(rx.try_recv().is_err());
         assert_eq!(
             f._rx
@@ -7111,7 +7785,7 @@ pub(crate) mod tests {
                 .count(),
             50
         );
-        engine.cancel_sign_in(&mut live).await;
+        engine.cancel_all_sign_ins(&mut live).await;
     }
 
     #[tokio::test]
@@ -7134,7 +7808,7 @@ pub(crate) mod tests {
             UiMsg::ApsClientIdValidation { request_id, state: "cancelled", error: None }
             if request_id == VALIDATION_REQUEST)));
         stage_client_validation(&f, &mut live, "new-test-client");
-        live.sign_in_task = Some(tokio::spawn(std::future::pending::<()>()));
+        set_test_attempt(&mut live, tokio::spawn(std::future::pending::<()>()));
         engine
             .on_cmd(
                 TrayCmd::CancelApsClientIdTest {
@@ -7149,12 +7823,12 @@ pub(crate) mod tests {
             live.client_validation.as_ref().unwrap().request_id,
             VALIDATION_REQUEST
         );
-        assert!(!live.sign_in_task.as_ref().unwrap().is_finished());
+        assert!(!live.sign_ins[&Provider::Acc].task.is_finished());
         assert_eq!(
             std::fs::read(f.ctx.paths.state_dir.join("settings.json")).unwrap(),
             settings
         );
-        engine.cancel_sign_in(&mut live).await;
+        engine.cancel_all_sign_ins(&mut live).await;
     }
 
     #[tokio::test]
@@ -7405,17 +8079,20 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 20;
-        engine.st().signing_in = true;
+        engine.st().signing_in.insert(Provider::Acc);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        live.sign_in_task = Some(tokio::spawn(async move {
-            let _listener = listener;
-            let _ = ready_tx.send(());
-            std::future::pending::<()>().await;
-        }));
+        set_test_attempt(
+            &mut live,
+            tokio::spawn(async move {
+                let _listener = listener;
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        );
         tokio::time::timeout(Duration::from_secs(5), ready_rx)
             .await
             .unwrap()
@@ -7427,23 +8104,39 @@ pub(crate) mod tests {
                 .await
         );
         assert!(live.restart_pending);
-        assert!(live.sign_in_task.is_none());
-        assert!(!engine.st().signing_in);
-        assert_eq!(live.sign_in_generation, 21);
+        assert!(live.sign_ins.is_empty());
+        assert!(engine.st().signing_in.is_empty());
+        // Cancelling removes the attempt; the counter only moves when a new attempt starts.
+        assert_eq!(live.sign_in_generation, 20);
         let _rebound = tokio::net::TcpListener::bind(address)
             .await
             .expect("APS change left the old callback bound");
         assert!(!f.ctx.paths.state_dir.join("token.bin").exists());
         assert!(!f.ctx.paths.state_dir.join("user.json").exists());
         engine
-            .on_signed_in(20, Err(anyhow!("stale old-client completion")), &mut live)
+            .on_signed_in(
+                Provider::Acc,
+                20,
+                Err(anyhow!("stale old-client completion")),
+                &mut live,
+                &unbounded_channel().0,
+            )
             .await;
         assert!(engine.st().last_error.is_none());
         let (tx, mut rx) = unbounded_channel();
-        engine.on_cmd(TrayCmd::SignIn, &mut live, &tx).await;
+        engine
+            .on_cmd(
+                TrayCmd::SignIn {
+                    provider: Provider::Acc,
+                    streambim: None,
+                },
+                &mut live,
+                &tx,
+            )
+            .await;
         engine.on_cmd(TrayCmd::InstallUpdate, &mut live, &tx).await;
         assert!(
-            live.sign_in_task.is_none(),
+            live.sign_ins.is_empty(),
             "restart accepted an old-client sign-in"
         );
         assert_eq!(
@@ -7529,7 +8222,7 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 8;
-        live.sign_in_task = Some(tokio::spawn(std::future::pending()));
+        set_test_attempt(&mut live, tokio::spawn(std::future::pending()));
         engine.st().outbox_running = true;
         assert!(
             !engine
@@ -7538,7 +8231,7 @@ pub(crate) mod tests {
         );
         assert!(!live.restart_pending);
         assert_eq!(live.sign_in_generation, 8);
-        assert!(live.sign_in_task.is_some());
+        assert!(!live.sign_ins.is_empty());
         assert!(f.ctx.auth.is_signed_in());
         assert_eq!(
             std::fs::read(f.ctx.paths.state_dir.join("token.bin")).unwrap(),
@@ -7546,7 +8239,7 @@ pub(crate) mod tests {
         );
         let saved = crate::config::Config::load(&f.ctx.paths.state_dir.join("settings.json"));
         assert_eq!(saved.aps_client_id.as_deref(), Some("old-test-client"));
-        engine.cancel_sign_in(&mut live).await;
+        engine.cancel_all_sign_ins(&mut live).await;
     }
 
     #[tokio::test]
@@ -7612,30 +8305,42 @@ pub(crate) mod tests {
         let mut live = login_test_live();
         live.sign_in_generation = 5;
         let started = Instant::now();
-        live.sign_in_started_at = Some(started);
-        engine.st().signing_in = true;
+        engine.st().signing_in.insert(Provider::Acc);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        live.sign_in_task = Some(tokio::spawn(async move {
-            let _listener = listener;
-            let _ = ready_tx.send(());
-            std::future::pending::<()>().await;
-        }));
+        set_test_attempt(
+            &mut live,
+            tokio::spawn(async move {
+                let _listener = listener;
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        );
         ready_rx.await.unwrap();
+        set_test_started(&mut live, started);
         let (tx, mut rx) = unbounded_channel();
 
         for _ in 0..20 {
-            engine.on_cmd(TrayCmd::SignIn, &mut live, &tx).await;
+            engine
+                .on_cmd(
+                    TrayCmd::SignIn {
+                        provider: Provider::Acc,
+                        streambim: None,
+                    },
+                    &mut live,
+                    &tx,
+                )
+                .await;
         }
         assert_eq!(
             live.sign_in_generation, 5,
             "a click burst replaced the attempt"
         );
-        assert_eq!(live.sign_in_started_at, Some(started));
-        assert!(!live.sign_in_task.as_ref().unwrap().is_finished());
+        assert_eq!(test_started(&live), Some(started));
+        assert!(!live.sign_ins[&Provider::Acc].task.is_finished());
         assert!(
             tokio::net::TcpListener::bind(address).await.is_err(),
             "the first browser's callback listener was dropped during the burst"
@@ -7646,8 +8351,20 @@ pub(crate) mod tests {
         );
 
         // Model a deliberate click after the debounce interval without a wall-clock sleep.
-        live.sign_in_started_at = Some(Instant::now() - SIGN_IN_BURST - Duration::from_millis(1));
-        engine.on_cmd(TrayCmd::SignIn, &mut live, &tx).await;
+        set_test_started(
+            &mut live,
+            Instant::now() - SIGN_IN_BURST - Duration::from_millis(1),
+        );
+        engine
+            .on_cmd(
+                TrayCmd::SignIn {
+                    provider: Provider::Acc,
+                    streambim: None,
+                },
+                &mut live,
+                &tx,
+            )
+            .await;
         assert_eq!(live.sign_in_generation, 6);
         let _rebound = tokio::net::TcpListener::bind(address)
             .await
@@ -7657,14 +8374,27 @@ pub(crate) mod tests {
             .expect("the deliberate retry was ignored")
             .unwrap()
         {
-            Internal::SignedIn { generation, result } => {
+            Internal::SignedIn {
+                provider,
+                generation,
+                result,
+            } => {
                 assert_eq!(generation, 6);
                 assert!(result.is_err(), "the empty client ID must fail locally");
-                engine.on_signed_in(generation, result, &mut live).await;
-                assert!(live.sign_in_started_at.is_none());
-                assert!(live.sign_in_task.is_none());
+                engine
+                    .on_signed_in(
+                        provider,
+                        generation,
+                        result,
+                        &mut live,
+                        &unbounded_channel().0,
+                    )
+                    .await;
+                assert!(test_started(&live).is_none());
+                assert!(live.sign_ins.is_empty());
             }
             Internal::ClientIdValidated { .. } => panic!("unexpected APS validation completion"),
+            Internal::SignInExpired { .. } => panic!("no MFA wait in this test"),
             Internal::Quit => panic!("a retry unexpectedly stopped the engine"),
         }
     }
@@ -7688,22 +8418,39 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 7;
-        engine.st().signing_in = true;
+        engine.st().signing_in.insert(Provider::Acc);
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        live.sign_in_task = Some(tokio::spawn(async move {
-            let _listener = listener;
-            let _ = ready_tx.send(());
-            std::future::pending::<()>().await;
-        }));
+        set_test_attempt(
+            &mut live,
+            tokio::spawn(async move {
+                let _listener = listener;
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        );
         ready_rx.await.unwrap();
+        // The pending attempt started before the burst window: this click replaces it.
+        set_test_started(
+            &mut live,
+            Instant::now() - SIGN_IN_BURST - Duration::from_millis(1),
+        );
 
         let (tx, mut rx) = unbounded_channel();
-        engine.on_cmd(TrayCmd::SignIn, &mut live, &tx).await;
+        engine
+            .on_cmd(
+                TrayCmd::SignIn {
+                    provider: Provider::Acc,
+                    streambim: None,
+                },
+                &mut live,
+                &tx,
+            )
+            .await;
         let _rebound = tokio::net::TcpListener::bind(address)
             .await
             .expect("retry left the old OAuth callback listener bound");
@@ -7712,15 +8459,28 @@ pub(crate) mod tests {
             .expect("retry silently ignored the new click")
             .expect("login completion channel closed");
         match message {
-            Internal::SignedIn { generation, result } => {
+            Internal::SignedIn {
+                provider,
+                generation,
+                result,
+            } => {
                 assert_eq!(generation, 8);
                 assert!(result.is_err(), "the empty client ID must fail locally");
-                assert!(engine.st().signing_in);
-                engine.on_signed_in(generation, result, &mut live).await;
-                assert!(!engine.st().signing_in);
-                assert!(live.sign_in_task.is_none());
+                assert!(!engine.st().signing_in.is_empty());
+                engine
+                    .on_signed_in(
+                        provider,
+                        generation,
+                        result,
+                        &mut live,
+                        &unbounded_channel().0,
+                    )
+                    .await;
+                assert!(engine.st().signing_in.is_empty());
+                assert!(live.sign_ins.is_empty());
             }
             Internal::ClientIdValidated { .. } => panic!("unexpected APS validation completion"),
+            Internal::SignInExpired { .. } => panic!("no MFA wait in this test"),
             Internal::Quit => panic!("retry unexpectedly stopped the engine"),
         }
     }
@@ -7731,8 +8491,7 @@ pub(crate) mod tests {
         let engine = Engine::new(f.ctx.clone());
         let mut live = login_test_live();
         live.sign_in_generation = 3;
-        live.sign_in_started_at = Some(Instant::now());
-        engine.st().signing_in = true;
+        engine.st().signing_in.insert(Provider::Acc);
         let token = f.ctx.paths.state_dir.join("token.bin");
         std::fs::write(&token, b"private existing test token").unwrap();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -7742,16 +8501,21 @@ pub(crate) mod tests {
         let (release, wait) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let late_token = token.clone();
-        live.sign_in_task = Some(tokio::spawn(async move {
-            let _listener = listener;
-            let _ = ready_tx.send(());
-            let _ = wait.await;
-            std::fs::write(late_token, b"late credentials must never be committed").unwrap();
-        }));
+        set_test_attempt(
+            &mut live,
+            tokio::spawn(async move {
+                let _listener = listener;
+                let _ = ready_tx.send(());
+                let _ = wait.await;
+                std::fs::write(late_token, b"late credentials must never be committed").unwrap();
+            }),
+        );
         ready_rx.await.unwrap();
 
         let (tx, _) = unbounded_channel();
-        engine.on_cmd(TrayCmd::SignOut, &mut live, &tx).await;
+        engine
+            .on_cmd(TrayCmd::SignOut { provider: None }, &mut live, &tx)
+            .await;
         assert!(
             release.send(()).is_err(),
             "logout left the sign-in worker alive"
@@ -7761,10 +8525,10 @@ pub(crate) mod tests {
             "a late sign-in restored credentials after logout"
         );
         assert!(!f.ctx.auth.is_signed_in());
-        assert!(!engine.st().signing_in);
-        assert_eq!(live.sign_in_generation, 4);
-        assert!(live.sign_in_task.is_none());
-        assert!(live.sign_in_started_at.is_none());
+        assert!(engine.st().signing_in.is_empty());
+        assert_eq!(live.sign_in_generation, 3);
+        assert!(live.sign_ins.is_empty());
+        assert!(test_started(&live).is_none());
         let _rebound = tokio::net::TcpListener::bind(address)
             .await
             .expect("logout did not release the pending callback listener");
@@ -7777,19 +8541,21 @@ pub(crate) mod tests {
         let mut live = login_test_live();
         live.sign_in_generation = 9;
         let started = Instant::now();
-        live.sign_in_started_at = Some(started);
-        live.sign_in_task = Some(tokio::spawn(std::future::pending()));
-        engine.st().signing_in = true;
+        set_test_attempt(&mut live, tokio::spawn(std::future::pending()));
+        set_test_started(&mut live, started);
+        engine.st().signing_in.insert(Provider::Acc);
 
         engine
             .on_signed_in(
+                Provider::Acc,
                 8,
                 Err(anyhow!("error from the cancelled attempt")),
                 &mut live,
+                &unbounded_channel().0,
             )
             .await;
         assert!(
-            engine.st().signing_in,
+            !engine.st().signing_in.is_empty(),
             "old completion cleared the new attempt"
         );
         assert!(
@@ -7797,22 +8563,22 @@ pub(crate) mod tests {
             "old failure replaced the current status"
         );
         assert!(
-            live.sign_in_task.is_some(),
+            !live.sign_ins.is_empty(),
             "old completion detached the active worker"
         );
-        assert_eq!(live.sign_in_started_at, Some(started));
+        assert_eq!(test_started(&live), Some(started));
         assert!(
             f._rx.try_recv().is_err(),
             "old failure was published to the UI"
         );
-        engine.cancel_sign_in(&mut live).await;
+        engine.cancel_all_sign_ins(&mut live).await;
     }
 
     #[test]
     fn resilience_login_pending_status_is_visible_without_a_new_protocol_state() {
         let f = fixture("login-status");
         let engine = Engine::new(f.ctx.clone());
-        engine.st().signing_in = true;
+        engine.st().signing_in.insert(Provider::Acc);
         engine.publish_now();
         match f._rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             UiMsg::Status(status) => {

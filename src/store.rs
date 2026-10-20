@@ -1111,6 +1111,22 @@ impl Store {
         Ok(removed)
     }
 
+    /// Items whose rename or move the provider refused (`dead = 3`, see `job_unsupported`). Their
+    /// local name and place stay until the user changes them again.
+    pub fn refused_renames(&self, pid: Pid) -> Result<HashSet<String>> {
+        let c = self.conn()?;
+        let mut st = c.prepare_cached(
+            "SELECT item FROM outbox WHERE pid = ?1 AND dead = 3 AND item IS NOT NULL \
+             AND kind IN ('rename', 'move')",
+        )?;
+        let rows = st.query_map(params![pid], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     /// Items with a live job of one of `kinds` (their local state wins over the next poll).
     pub fn pending_items(&self, pid: Pid, kinds: &[&str]) -> Result<HashSet<String>> {
         let c = self.conn()?;

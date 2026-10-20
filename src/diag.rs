@@ -81,7 +81,12 @@ fn summary(ctx: &Ctx) -> serde_json::Value {
         "engine_version": env!("CARGO_PKG_VERSION"),
         "packaged": ctx.paths.packaged,
         "os": os_version(),
-        "signed_in": ctx.auth.is_signed_in(),
+        // Per provider, booleans only: no names, e-mail addresses or ids.
+        "signed_in": {
+            "acc": ctx.signed_in(crate::model::Provider::Acc),
+            "streambim": ctx.signed_in(crate::model::Provider::StreamBim),
+            "interaxo": ctx.signed_in(crate::model::Provider::Interaxo),
+        },
         "settings": settings_summary(&s),
         "projects": projects,
         "jobs": jobs,
