@@ -4669,11 +4669,6 @@ pub(crate) fn rel_components(root: &Path, path: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Display name of the signed-in ACC user, to tell "locked by me" from "locked by someone else".
-pub(crate) fn me(ctx: &Ctx) -> Option<String> {
-    me_for(ctx, Provider::Acc)
-}
-
 /// Display name of the signed-in user of `provider`: the holder a lock of that provider names is
 /// compared with this (a project's own provider, see `me_for_project`).
 pub(crate) fn me_for(ctx: &Ctx, provider: Provider) -> Option<String> {
