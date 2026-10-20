@@ -63,7 +63,7 @@ impl Provider {
 | Provider | `meta` |
 |---|---|
 | ACC | `null` |
-| StreamBIM | `{"region":"app","base":"https://app.streambim.com","project":"1552"}` |
+| StreamBIM | `{"region":"app","base":"https://app.streambim.com","project":"1552"}`; projects made by this version also carry `"account"` (the same key as `region`) |
 | Interaxo | `{"base":"https://api.interaxo.se/v1","community":"example-corp","room":"my-room","root":"<uuid>"}` |
 
 `base` is the API origin every request of that project goes to (tests point it at a loopback
@@ -91,7 +91,8 @@ provider module. The ACC arm calls the existing `dm`/`oss` function with **ident
 so ACC behaviour does not change.
 
 Every function mirrors the `dm`/`oss` function it replaces, with `ctx: &Ctx` in place of
-`api: &Api` (the dispatcher picks `ctx.api_for(provider)`):
+`api: &Api` (each arm passes its own client: `ctx.api`, `ctx.interaxo_api`, or the API of the
+StreamBIM account of the project or hub):
 
 ```rust
 pub struct Caps { pub mkdir: bool, pub rename: bool, pub move_items: bool, pub delete: bool,
@@ -178,8 +179,10 @@ pub api: Api,                        // ACC
 pub streambim: Arc<StreamBimAccounts>,   // one StreamBimAuth + Api per StreamBIM server
 pub interaxo: Arc<Auth>,             pub interaxo_api: Api,   // Auth with the Interaxo OIDC spec
 impl Ctx {
-    pub fn api_for(&self, p: Provider) -> &Api;      // ACC and Interaxo; StreamBIM goes per account
-    pub fn signed_in(&self, p: Provider) -> bool;
+    // No `api_for`: ACC and Interaxo use `api` / `interaxo_api`; a StreamBIM call uses the API of
+    // the account of its project or hub (`streambim.for_project(p)` / `for_hub(hub)`), never another.
+    pub fn signed_in(&self, p: Provider) -> bool;     // StreamBIM: any account
+    pub fn project_connected(&self, p: &Project) -> bool;   // StreamBIM: the project's own account
     pub fn any_signed_in(&self) -> bool;
     pub fn user_for(&self, p: Provider) -> Option<UserInfo>;
 }

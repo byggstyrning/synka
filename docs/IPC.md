@@ -211,3 +211,10 @@ These pin down details the table above left open. The engine implements them as 
   10 s plus one summary.
 - **`notify`.** `title` is always `"Synka"`.
 - **Shell open.** The tray's left click opens the window. It is not a `TrayCmd` in the protocol.
+- **Accounts in commands.** `account` is a StreamBIM account key (see "Accounts"). `sign_in_mfa`
+  needs it, or the command is refused. `cancel_sign_in` and `sign_out` accept it only with
+  `provider: "streambim"`; with ACC, Interaxo, or with no provider, a non-null `account` is refused
+  in the ack (`null` counts as absent). `sign_out` with `provider: "streambim"` and no `account`
+  signs out every StreamBIM account. `region` and `url` are read only for `streambim`.
+- **Default status.** Before the first `status` event, `hello` replies with `accounts` for acc and
+  interaxo only; StreamBIM entries appear once an account is signed in or signing in.
