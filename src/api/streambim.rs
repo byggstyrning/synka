@@ -9,13 +9,14 @@
 
 use crate::api::dm::{self, UploadInfo};
 use crate::http::{error_body, Api, ApiError, Body};
-use crate::model::{HubInfo, Item, Kind, LocalState, Pid, Project, ProjectInfo, Provider};
+use crate::model::{now_ms, HubInfo, Item, Kind, LocalState, Pid, Project, ProjectInfo, Provider};
 use crate::remote::{DownloadUrl, ProjectSetup};
 use crate::streambim_auth::{region_base, valid_region, StreamBimAuth};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, RANGE};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,8 +27,10 @@ use tracing::{info, warn};
 const REGIONS_URL: &str = "https://global.streambim.com/regions.json";
 const REGIONS_TIMEOUT: Duration = Duration::from_secs(10);
 const JSON_API: &str = "application/vnd.api+json";
-/// `page[limit]` of the document listing. Paging ends at `meta.total`.
+/// `page[limit]` of the document listing. Paging ends at `meta.total`, or at an empty page.
 const PAGE_LIMIT: usize = 500;
+/// The most pages one folder listing reads. A listing that does not end before this is refused.
+const MAX_DOC_PAGES: usize = 1000;
 /// The largest file one presigned PUT takes here. The multipart signer is undocumented.
 const MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -36,6 +39,9 @@ const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const ROOT_ID: &str = "0";
 const TOP_NAME: &str = "Dokument";
+/// Engine ids of documents start with this letter: folders and documents have separate id
+/// sequences on the server, so a bare number could name both (see `doc_item_id`).
+const DOC_PREFIX: char = 'd';
 /// The storage marker of a new file: its bytes go up inside `create_item`/`create_version`.
 const PENDING_STORAGE: &str = "streambim:pending";
 /// Document attributes a PATCH echoes back (see `full_object`).
@@ -49,6 +55,9 @@ const DOC_KEYS: &[&str] = &[
 const FOLDER_KEYS: &[&str] = &["name", "description", "external-id", "is-deleted"];
 const META_MISSING: &str = "StreamBIM-projektet saknar anslutningsuppgifter.";
 const META_BAD: &str = "StreamBIM-projektets anslutningsuppgifter är ogiltiga.";
+/// Returned when a document was created but the reply has no usable id and the listing does not
+/// show it. Not retryable: the file is picked up by the next sync.
+const NOT_LISTED: &str = "StreamBIM tog emot filen men svarade utan id; den visas vid nästa synk.";
 
 /// A StreamBIM region: the host is `https://<subdomain>.streambim.com`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -98,11 +107,16 @@ async fn regions_from(client: &reqwest::Client, url: &str) -> Vec<Region> {
 }
 
 async fn fetch_regions(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<Region>> {
-    let resp = client.get(url).timeout(REGIONS_TIMEOUT).send().await?;
+    let resp = client
+        .get(url)
+        .timeout(REGIONS_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {}", resp.status().as_u16());
     }
-    let doc: Value = resp.json().await?;
+    let doc: Value = resp.json().await.map_err(|e| e.without_url())?;
     let rows = doc
         .get("regions")
         .and_then(Value::as_array)
@@ -259,8 +273,11 @@ pub async fn folder_contents(
         out.extend(folder_item(p.pid, row, folder_id, None));
     }
 
+    // Pages run to `meta.total` when the reply has it, else to the first empty page. A row that
+    // comes again on a later page is read once.
+    let mut seen = HashSet::new();
     let mut skip = 0usize;
-    loop {
+    for _ in 0..MAX_DOC_PAGES {
         let url = format!(
             "{root}/documents?filter%5BfolderId%5D={fid}&filter%5BisDeleted%5D=false\
              &page%5Bskip%5D={skip}&page%5Blimit%5D={PAGE_LIMIT}"
@@ -268,6 +285,9 @@ pub async fn folder_contents(
         let doc = get_json(api, &url).await?;
         let rows = resource_list(&doc)?;
         for row in rows {
+            if res_id(row).is_some_and(|id| !seen.insert(id)) {
+                continue;
+            }
             if attr_flag(row, "is-deleted") || moved_away(row, folder_id) {
                 continue;
             }
@@ -279,14 +299,16 @@ pub async fn folder_contents(
         }
         skip += rows.len();
         let more = match doc.pointer("/meta/total").and_then(Value::as_u64) {
-            Some(total) => (skip as u64) < total,
-            None => rows.len() == PAGE_LIMIT,
+            Some(total) => !rows.is_empty() && (skip as u64) < total,
+            None => !rows.is_empty(),
         };
-        if rows.is_empty() || !more {
-            break;
+        if !more {
+            return Ok(out);
         }
     }
-    Ok(out)
+    Err(user_error(
+        "StreamBIM-mappen har fler dokument än synken läser; listningen avbröts.",
+    ))
 }
 
 /// A download link for the current revision. The link is relative to the project's v1 root,
@@ -296,18 +318,31 @@ pub async fn download_url(
     api: &Api,
     p: &Project,
     item_id: &str,
-    _storage_urn: &str,
+    storage_urn: &str,
 ) -> Result<DownloadUrl, ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
+    let doc = server_doc_id(item_id)?;
     let root = api_v1_root(&meta);
-    let url = format!("{root}/documents/{}/downloadlink", dm::pct(item_id));
+    let url = format!("{root}/documents/{}/downloadlink", dm::pct(doc));
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     let resp = api
         .request_with_headers(Method::GET, &url, None, headers)
         .await?;
-    let link = parse_download_link(&resp.bytes().await?)?;
+    let link = parse_download_link(&read_body(resp).await?)?;
     let full = join_download_link(&root, &link);
+    // The engine asked for the revision in `storage_urn`. A link to another revision would stream
+    // other bytes than the ones the engine is about to store, so the engine asks again instead.
+    if let (Some(linked), Some(wanted)) =
+        (revision_in_link(&full, doc)?, handle_revision(storage_urn))
+    {
+        if linked != wanted {
+            return Err(ApiError::Status {
+                status: 409,
+                body: "revision changed".into(),
+            });
+        }
+    }
     let bearer = if needs_bearer(&full, &meta.base)? {
         Some(api.bearer().await?)
     } else {
@@ -355,10 +390,13 @@ pub(crate) async fn get_item_upload_info(
     id: &str,
 ) -> Result<(Item, UploadInfo), ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
-    let doc = get_json(api, &object_url(&meta, "documents", id)).await?;
+    let doc = get_json(api, &object_url(&meta, "documents", server_doc_id(id)?)).await?;
     let row = doc
         .get("data")
         .ok_or_else(|| decode("dokumentet saknas i svaret"))?;
+    if attr_flag(row, "is-deleted") {
+        return Err(deleted_document());
+    }
     let item =
         file_item(p.pid, row, None).ok_or_else(|| decode("dokumentet saknar namn eller id"))?;
     Ok((item, UploadInfo::generic()))
@@ -411,34 +449,47 @@ pub async fn create_item(
             "upload-ticket": {"data": {"type": "upload-tickets", "id": ticket.id}},
         },
     }});
-    let doc = send_json(
-        api,
-        Method::POST,
-        &format!("{}/documents", jsonapi_root(&meta)),
-        body,
-    )
-    .await?;
-    if let Some(id) = doc.get("data").and_then(res_id) {
-        let usable = doc
-            .get("data")
-            .and_then(|row| file_item(p.pid, row, Some(parent_id)))
-            .filter(|item| item.remote_version.is_some());
-        if let Some(item) = usable {
-            return Ok(item);
-        }
-        // The reply lacks the attributes (the revision, the name): read the document back.
-        let fetched = get_json(api, &object_url(&meta, "documents", &id)).await?;
-        return fetched
-            .get("data")
-            .and_then(|row| file_item(p.pid, row, Some(parent_id)))
-            .ok_or_else(|| decode("dokumentet kunde inte läsas efter uppladdningen"));
+    // The POST answer is the commit: from here on the document exists, so no error below may be
+    // retryable, or the engine would upload the file again. An unreadable answer counts as no
+    // answer, and a failed read-back falls back to what the answer and the upload establish.
+    let resp = api
+        .request(
+            Method::POST,
+            &format!("{}/documents", jsonapi_root(&meta)),
+            Some(Body::JsonApi(body)),
+        )
+        .await?;
+    let reply = match read_body(resp).await {
+        Ok(bytes) => parse_body(&bytes).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    let Some(server_id) = reply.get("data").and_then(res_id).filter(|id| plain_id(id)) else {
+        // No usable id: the newest file of that name and size in the folder is the one just made.
+        return newest_file_named(api, p, parent_id, name, size)
+            .await
+            .ok_or_else(|| user_error(NOT_LISTED));
+    };
+    let usable = reply
+        .get("data")
+        .and_then(|row| file_item(p.pid, row, Some(parent_id)))
+        .filter(|item| item.remote_version.is_some());
+    if let Some(item) = usable {
+        return Ok(item);
     }
-    // No id in the reply: the newest file of that name in the folder is the one just made.
-    newest_file_named(api, p, parent_id, name).await
+    // The reply lacks the attributes (the revision, the name): read the document back.
+    let fetched = get_json(api, &object_url(&meta, "documents", &server_id))
+        .await
+        .ok()
+        .and_then(|doc| {
+            doc.get("data")
+                .and_then(|row| file_item(p.pid, row, Some(parent_id)))
+        });
+    Ok(fetched.unwrap_or_else(|| created_item(p.pid, &server_id, parent_id, name, size)))
 }
 
 /// Upload `path` as the next revision of document `id`. Returns (revision, storage handle).
 /// The revision keeps the document's file name. A 400 or 409 from the server is returned as is.
+/// A deleted document is refused with a 404 (the engine treats that as gone).
 pub async fn create_version(
     api: &Api,
     p: &Project,
@@ -449,10 +500,14 @@ pub async fn create_version(
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(i64, String), ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
-    let current = get_json(api, &object_url(&meta, "documents", id)).await?;
+    let doc = server_doc_id(id)?;
+    let current = get_json(api, &object_url(&meta, "documents", doc)).await?;
     let row = current
         .get("data")
         .ok_or_else(|| decode("dokumentet saknas i svaret"))?;
+    if attr_flag(row, "is-deleted") {
+        return Err(deleted_document());
+    }
     let revision = attr_int(row, "revision").ok_or_else(|| decode("dokumentet saknar revision"))?;
     let filename = attr_text(row, "filename").ok_or_else(|| decode("dokumentet saknar filnamn"))?;
     let size = file_size(path).await?;
@@ -461,7 +516,7 @@ pub async fn create_version(
     put_presigned(api, &ticket.url, path, size, progress).await?;
     let next = revision + 1;
     let body = json!({"data": {
-        "id": format!("{id}-{next}"),
+        "id": format!("{doc}-{next}"),
         "type": "document-revisions",
         "attributes": {"description": "", "filesize": size},
         "relationships": {
@@ -475,7 +530,7 @@ pub async fn create_version(
         body,
     )
     .await?;
-    Ok((next, storage_urn(id, next)))
+    Ok((next, storage_urn(doc, next)))
 }
 
 pub async fn create_folder(
@@ -517,6 +572,7 @@ pub async fn rename_file(
     new_name: &str,
 ) -> Result<(), ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
+    let id = server_doc_id(id)?;
     let res = current(api, &meta, "documents", id).await?;
     let body = full_object(
         "documents",
@@ -536,6 +592,7 @@ pub async fn move_file(
     new_parent_id: &str,
 ) -> Result<(), ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
+    let id = server_doc_id(id)?;
     let res = current(api, &meta, "documents", id).await?;
     let body = full_object(
         "documents",
@@ -579,6 +636,7 @@ pub async fn patch_folder(
 /// Soft delete: `is-deleted` true.
 pub async fn delete_file(api: &Api, p: &Project, id: &str) -> Result<(), ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
+    let id = server_doc_id(id)?;
     let res = current(api, &meta, "documents", id).await?;
     let body = full_object(
         "documents",
@@ -607,8 +665,11 @@ pub async fn delete_folder(api: &Api, p: &Project, folder_id: &str) -> Result<()
 }
 
 /// The project's page in the web app. StreamBIM has no documented link to one document or folder.
-pub async fn web_link(_api: &Api, p: &Project, _item: &Item) -> Result<String, ApiError> {
+pub async fn web_link(_api: &Api, p: &Project, item: &Item) -> Result<String, ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
+    if item.kind == Kind::File {
+        server_doc_id(&item.id)?;
+    }
     Ok(format!(
         "{}/webapp/default/#/?projectId={}",
         meta.base, meta.project
@@ -650,12 +711,8 @@ fn parse_meta(raw: Option<&str>) -> Result<Meta, ApiError> {
 /// The checks every meta goes through: a plain region, an http(s) base, a plain project id.
 fn meta_checked(region: &str, base: &str, project: &str) -> Result<Meta, ApiError> {
     let base = base.trim_end_matches('/');
-    let plain_id = !project.is_empty()
-        && project
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     let plain_base = base.starts_with("https://") || base.starts_with("http://");
-    if !valid_region(region) || !plain_base || !plain_id {
+    if !valid_region(region) || !plain_base || !plain_id(project) {
         return Err(user_error(META_BAD));
     }
     Ok(Meta {
@@ -674,6 +731,37 @@ fn hub_region(hub: &HubInfo) -> Result<String, ApiError> {
         .clone()
         .filter(|r| !r.is_empty())
         .ok_or_else(|| user_error("StreamBIM-hubben saknar region."))
+}
+
+/// A plain StreamBIM id: letters, digits, '-' and '_', nothing that changes a URL.
+fn plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The engine's id of a document: `d` + the server id ("1002" gives "d1002"). Folders keep the
+/// bare server id, so a folder "7" and a document "7" never share a key in the store.
+fn doc_item_id(server_id: &str) -> String {
+    format!("{DOC_PREFIX}{server_id}")
+}
+
+/// The server id of an engine document id: "d1002" gives "1002". An id without the prefix is not
+/// a document of this provider (a folder id is the bare server id), so it is refused.
+fn server_doc_id(item_id: &str) -> Result<&str, ApiError> {
+    item_id
+        .strip_prefix(DOC_PREFIX)
+        .filter(|id| plain_id(id))
+        .ok_or_else(|| user_error("Ogiltigt dokument-id för StreamBIM."))
+}
+
+/// The number of an engine document id ("d1002" gives 1002), 0 for anything else.
+fn doc_number(item_id: &str) -> i64 {
+    item_id
+        .strip_prefix(DOC_PREFIX)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 /// `{base}/project-{id}/api/v1/v2`: the JSON:API root of a project.
@@ -700,6 +788,15 @@ fn user_error(msg: impl Into<String>) -> ApiError {
     ApiError::Message(msg.into())
 }
 
+/// A document deleted in StreamBIM: uploads into it are refused, and the engine treats the 404
+/// as "gone".
+fn deleted_document() -> ApiError {
+    ApiError::Status {
+        status: 404,
+        body: "document is deleted".into(),
+    }
+}
+
 fn jsonapi_accept() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static(JSON_API));
@@ -713,17 +810,28 @@ fn parse_body(bytes: &[u8]) -> Result<Value, ApiError> {
     serde_json::from_slice(bytes).map_err(|e| decode(format!("svaret från StreamBIM: {e}")))
 }
 
+/// A reqwest error as `ApiError::Transport`, with its URL removed: a presigned or `?token=` link
+/// must not reach an error, a log or the user.
+fn transport(e: reqwest::Error) -> ApiError {
+    ApiError::Transport(e.without_url())
+}
+
+/// The whole body of a reply, read without the URL in any error.
+async fn read_body(resp: reqwest::Response) -> Result<bytes::Bytes, ApiError> {
+    resp.bytes().await.map_err(transport)
+}
+
 async fn get_json(api: &Api, url: &str) -> Result<Value, ApiError> {
     let resp = api
         .request_with_headers(Method::GET, url, None, jsonapi_accept())
         .await?;
-    parse_body(&resp.bytes().await?)
+    parse_body(&read_body(resp).await?)
 }
 
 /// POST, PATCH or DELETE a JSON:API body. The reply body, when there is one, is returned.
 async fn send_json(api: &Api, method: Method, url: &str, body: Value) -> Result<Value, ApiError> {
     let resp = api.request(method, url, Some(Body::JsonApi(body))).await?;
-    parse_body(&resp.bytes().await?)
+    parse_body(&read_body(resp).await?)
 }
 
 fn resource_list(doc: &Value) -> Result<&Vec<Value>, ApiError> {
@@ -745,7 +853,8 @@ async fn get_download(
     if let Some(range) = range {
         req = req.header(RANGE, range);
     }
-    let resp = req.send().await?;
+    // The link may carry a token or a signature: its URL never reaches the error.
+    let resp = req.send().await.map_err(transport)?;
     let status = resp.status();
     if !status.is_success() {
         return Err(ApiError::Status {
@@ -828,14 +937,15 @@ fn folder_item(pid: Pid, r: &Value, parent: &str, fallback_name: Option<&str>) -
     })
 }
 
-/// A document resource. The parent is the relationship, else `parent_fallback`.
+/// A document resource. The parent is the relationship, else `parent_fallback`. The item id is
+/// the prefixed engine id (`doc_item_id`); the storage handle keeps the server id.
 fn file_item(pid: Pid, r: &Value, parent_fallback: Option<&str>) -> Option<Item> {
-    let id = res_id(r)?;
+    let server_id = res_id(r)?;
     let name = attr_text(r, "filename")?;
     let revision = attr_int(r, "revision");
     Some(Item {
         pid,
-        id: id.clone(),
+        id: doc_item_id(&server_id),
         parent: rel_id(r, "parent").or_else(|| parent_fallback.map(str::to_string)),
         name,
         kind: Kind::File,
@@ -844,7 +954,7 @@ fn file_item(pid: Pid, r: &Value, parent_fallback: Option<&str>) -> Option<Item>
         size: attr_int(r, "filesize").unwrap_or(0),
         ctime_ms: dm::ms(attr(r, "uploaded-date").and_then(Value::as_str)),
         mtime_ms: dm::ms(attr(r, "last-modified").and_then(Value::as_str)),
-        storage_urn: revision.map(|rev| storage_urn(&id, rev)),
+        storage_urn: revision.map(|rev| storage_urn(&server_id, rev)),
         version_urn: None,
         modified_by: rel_id(r, "uploaded-by"),
         locked_by: None,
@@ -853,18 +963,45 @@ fn file_item(pid: Pid, r: &Value, parent_fallback: Option<&str>) -> Option<Item>
     })
 }
 
+/// The newest file called `name` and of `size` in the listing of `folder_id`. None when the
+/// listing fails or does not show it. A file of the same name but another size is an older one.
 async fn newest_file_named(
     api: &Api,
     p: &Project,
     folder_id: &str,
     name: &str,
-) -> Result<Item, ApiError> {
+    size: u64,
+) -> Option<Item> {
     folder_contents(api, p, folder_id)
-        .await?
+        .await
+        .ok()?
         .into_iter()
-        .filter(|item| item.kind == Kind::File && item.name == name)
-        .max_by_key(|item| item.id.parse::<i64>().unwrap_or(0))
-        .ok_or_else(|| decode("dokumentet hittades inte efter uppladdningen"))
+        .filter(|item| item.kind == Kind::File && item.name == name && item.size == size as i64)
+        .max_by_key(|item| doc_number(&item.id))
+}
+
+/// A document just created, as the upload knows it when the read-back failed. A new document is
+/// revision 1, and its times are now.
+fn created_item(pid: Pid, server_id: &str, parent: &str, name: &str, size: u64) -> Item {
+    let now = now_ms();
+    Item {
+        pid,
+        id: doc_item_id(server_id),
+        parent: Some(parent.to_string()),
+        name: name.to_string(),
+        kind: Kind::File,
+        remote_version: Some(1),
+        base_version: None,
+        size: size as i64,
+        ctime_ms: now,
+        mtime_ms: now,
+        storage_urn: Some(storage_urn(server_id, 1)),
+        version_urn: None,
+        modified_by: None,
+        locked_by: None,
+        local_state: LocalState::Clean,
+        populated: false,
+    }
 }
 
 // ---------- downloads ----------
@@ -897,6 +1034,30 @@ fn join_download_link(api_v1: &str, link: &str) -> String {
         api_v1.trim_end_matches('/'),
         link.trim_start_matches('/')
     )
+}
+
+/// The revision that a download link names, for `.../documents/{id}/{rev}/download...`. None for
+/// the other link forms (no revision in the path) and for a link to another document.
+fn revision_in_link(full: &str, doc: &str) -> Result<Option<i64>, ApiError> {
+    let link = url::Url::parse(full).map_err(|_| decode("downloadlink: ogiltig länk"))?;
+    let path: Vec<&str> = link.path().split('/').collect();
+    let Some(at) = path.iter().position(|segment| *segment == "documents") else {
+        return Ok(None);
+    };
+    if path.get(at + 1) != Some(&doc) {
+        return Ok(None);
+    }
+    let revision = path.get(at + 2).and_then(|rev| rev.parse::<i64>().ok());
+    let download = path
+        .get(at + 3)
+        .is_some_and(|seg| seg.starts_with("download"));
+    Ok(revision.filter(|_| download))
+}
+
+/// The revision of a content handle `streambim:{id}:{revision}`. None for any other handle.
+fn handle_revision(storage_urn: &str) -> Option<i64> {
+    let (_, revision) = storage_urn.strip_prefix("streambim:")?.rsplit_once(':')?;
+    revision.parse().ok()
 }
 
 /// False for another origin (a presigned S3 link) and for links with `token` or `microtoken`.
@@ -996,7 +1157,8 @@ async fn put_presigned(
     let mut tick = tokio::time::interval(PROGRESS_TICK);
     let resp = loop {
         tokio::select! {
-            reply = &mut request => break reply?,
+            // The presigned URL is signed: its error is returned without the URL.
+            reply = &mut request => break reply.map_err(transport)?,
             _ = tick.tick() => progress(sent.load(Ordering::Relaxed), size),
         }
     };
@@ -1361,7 +1523,7 @@ mod tests {
         assert_eq!(folder.modified_by.as_deref(), Some("ada@example.com"));
         assert!(folder.ctime_ms > 0 && folder.mtime_ms > folder.ctime_ms);
         let plan = &items[1];
-        assert_eq!(plan.id, "1002");
+        assert_eq!(plan.id, "d1002");
         assert_eq!(plan.parent.as_deref(), Some("7"));
         assert_eq!(plan.size, 406602);
         assert_eq!(plan.remote_version, Some(2));
@@ -1410,7 +1572,7 @@ mod tests {
         for (body, path, bearer) in cases {
             let server = Server::scripted(vec![Fault::reply(200, body)]).await;
             let p = project(&server.origin);
-            let d = download_url(&api_for(&server), &p, "1002", "streambim:1002:1")
+            let d = download_url(&api_for(&server), &p, "d1002", "streambim:1002:1")
                 .await
                 .unwrap();
             assert_eq!(
@@ -1434,7 +1596,7 @@ mod tests {
             r#"{"data": "https://bucket.example.invalid/x?X-Amz-Signature=1"}"#,
         )])
         .await;
-        let d = download_url(&api_for(&server), &project(&server.origin), "1002", "x")
+        let d = download_url(&api_for(&server), &project(&server.origin), "d1002", "x")
             .await
             .unwrap();
         assert_eq!(d.url, "https://bucket.example.invalid/x?X-Amz-Signature=1");
@@ -1525,7 +1687,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(item.id, "1002");
+        assert_eq!(item.id, "d1002");
         assert_eq!(item.name, "plan.pdf");
         assert_eq!(item.parent.as_deref(), Some("7"));
         assert_eq!(item.remote_version, Some(1));
@@ -1581,7 +1743,7 @@ mod tests {
         let (revision, storage) = create_version(
             &api_for(&server),
             &project(&server.origin),
-            "1002",
+            "d1002",
             "x",
             "y",
             &file.0,
@@ -1623,7 +1785,7 @@ mod tests {
         let err = create_version(
             &api_for(&server),
             &project(&server.origin),
-            "1002",
+            "d1002",
             "x",
             "y",
             &file.0,
@@ -1651,7 +1813,7 @@ mod tests {
         rename_file(
             &api_for(&server),
             &project(&server.origin),
-            "1002",
+            "d1002",
             None,
             "renamed.pdf",
         )
@@ -1707,8 +1869,8 @@ mod tests {
         .await;
         let api = api_for(&server);
         let p = project(&server.origin);
-        move_file(&api, &p, "1002", "9").await.unwrap();
-        delete_file(&api, &p, "1002").await.unwrap();
+        move_file(&api, &p, "d1002", "9").await.unwrap();
+        delete_file(&api, &p, "d1002").await.unwrap();
         delete_folder(&api, &p, "8").await.unwrap();
         patch_folder(&api, &p, "8", None, None).await.unwrap();
         let patches: Vec<Value> = server
@@ -1759,6 +1921,314 @@ mod tests {
         assert_eq!(body["data"]["relationships"]["parent"]["data"]["id"], "7");
     }
 
+    /// The document listing of `folder 7` with `docs` as its rows; no folders.
+    fn listing(req: &Request, docs: Value) -> Fault {
+        if req.target.contains("/folders?") {
+            reply(200, json!({"data": []}))
+        } else if req.target.contains("/documents?") {
+            // One page holding every row, with the total, so the listing ends after it.
+            let total = docs.as_array().map_or(0, Vec::len);
+            reply(200, json!({"data": docs, "meta": {"total": total}}))
+        } else {
+            Fault::reply(404, "unexpected")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_back_after_the_post_still_returns_the_document() {
+        let file = TestFile::new(&pattern(300_000));
+        let commit = reply(200, json!({"data": {"id": "1002", "type": "documents"}}));
+        // The read-back of the new document fails: the answer to the POST is all there is.
+        let server = Server::new(move |req, _| {
+            upload_fault(req, "/project-1552/api/v1/v2/documents", &commit)
+                .unwrap_or(Fault::Disconnect)
+        })
+        .await;
+        let progress = |_: u64, _: u64| {};
+        let item = create_item(
+            &api_for(&server),
+            &project(&server.origin),
+            "7",
+            "plan.pdf",
+            PENDING_STORAGE,
+            &file.0,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(item.id, "d1002");
+        assert_eq!(item.name, "plan.pdf");
+        assert_eq!(item.parent.as_deref(), Some("7"));
+        assert_eq!(item.size, 300_000);
+        assert_eq!(item.remote_version, Some(1));
+        assert_eq!(item.storage_urn.as_deref(), Some("streambim:1002:1"));
+        let commits = server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.target == "/project-1552/api/v1/v2/documents")
+            .count();
+        assert_eq!(commits, 1, "one commit, no second upload");
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_a_usable_id_is_read_from_the_listing_or_is_a_message() {
+        let file = TestFile::new(&pattern(300_000));
+        let older = json!({"id": "990", "type": "documents", "attributes": {"filename": "plan.pdf", "filesize": 5, "revision": 1, "is-deleted": false}, "relationships": {"parent": {"data": {"id": "7", "type": "folders"}}}});
+        let created = json!({"id": "1002", "type": "documents", "attributes": {"filename": "plan.pdf", "filesize": 300000, "revision": 1, "is-deleted": false}, "relationships": {"parent": {"data": {"id": "7", "type": "folders"}}}});
+        // Listed: the newest file of that name and size is the one just made.
+        for (commit, docs, expect) in [
+            (
+                reply(200, json!({})),
+                json!([older.clone(), created.clone()]),
+                Some("d1002"),
+            ),
+            (
+                Fault::reply(200, "not json"),
+                json!([created.clone()]),
+                Some("d1002"),
+            ),
+            // Not listed (the older file has another size): a message, never a retry.
+            (reply(200, json!({})), json!([older.clone()]), None),
+            (Fault::reply(200, "not json"), json!([]), None),
+        ] {
+            let server = Server::new(move |req, _| {
+                upload_fault(req, "/project-1552/api/v1/v2/documents", &commit)
+                    .unwrap_or_else(|| listing(req, docs.clone()))
+            })
+            .await;
+            let progress = |_: u64, _: u64| {};
+            let result = create_item(
+                &api_for(&server),
+                &project(&server.origin),
+                "7",
+                "plan.pdf",
+                PENDING_STORAGE,
+                &file.0,
+                &progress,
+            )
+            .await;
+            match expect {
+                Some(id) => assert_eq!(result.unwrap().id, id),
+                None => {
+                    let err = result.unwrap_err();
+                    assert!(
+                        matches!(&err, ApiError::Message(m) if m == NOT_LISTED),
+                        "{err:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_into_a_deleted_document_are_refused_with_a_404() {
+        let file = TestFile::new(&pattern(10));
+        let deleted = json!({"data": {"id": "1002", "type": "documents",
+                              "attributes": {"filename": "plan.pdf", "revision": 4, "is-deleted": true}}});
+        let server = Server::new(move |req, _| {
+            if req.method == "GET" && req.target == "/project-1552/api/v1/v2/documents/1002" {
+                return reply(200, deleted.clone());
+            }
+            Fault::reply(404, "unexpected")
+        })
+        .await;
+        let api = api_for(&server);
+        let p = project(&server.origin);
+        let progress = |_: u64, _: u64| {};
+
+        let err = create_version(&api, &p, "d1002", "x", "y", &file.0, &progress)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), Some(404));
+        assert!(err.to_string().contains("document is deleted"), "{err}");
+        let err = get_item_upload_info(&api, &p, "d1002").await.err().unwrap();
+        assert_eq!(err.status(), Some(404));
+        assert!(err.to_string().contains("document is deleted"), "{err}");
+        // Only the two reads: no ticket and no upload.
+        assert_eq!(server.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_never_shows_the_presigned_url() {
+        let server = Server::new(|req, _| {
+            let host = req.header("host").unwrap_or_default();
+            match (req.method.as_str(), req.target.as_str()) {
+                ("POST", "/project-1552/api/v1/v2/upload-tickets") => reply(
+                    200,
+                    json!({"data": {"id": "ticket-uuid", "type": "upload-tickets",
+                        "attributes": {"s3presignedurl": format!("http://{host}/s3/bucket/key?X-Amz-Signature=secret-sig")}}}),
+                ),
+                // The storage hangs up on the PUT.
+                ("PUT", _) => Fault::Disconnect,
+                _ => Fault::reply(404, "unexpected"),
+            }
+        })
+        .await;
+        let file = TestFile::new(&pattern(10));
+        let progress = |_: u64, _: u64| {};
+        let err = create_item(
+            &api_for(&server),
+            &project(&server.origin),
+            "7",
+            "plan.pdf",
+            PENDING_STORAGE,
+            &file.0,
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("secret-sig") && !shown.contains("X-Amz"),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_never_shows_the_token_link() {
+        let server = Server::new(|_, _| Fault::Disconnect).await;
+        let d = DownloadUrl {
+            url: format!(
+                "{}/project-1552/api/v1/documents/1002/download/plan.pdf?token=tok-secret",
+                server.origin
+            ),
+            size: 0,
+            bearer: None,
+            ranges: false,
+        };
+        let err = open_download(&api_for(&server), &project(&server.origin), &d, 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("tok-secret") && !shown.contains("plan.pdf"),
+            "{shown}"
+        );
+    }
+
+    /// The `page[skip]` of a document listing request (`usize::MAX` when there is none).
+    fn skip_of(target: &str) -> usize {
+        target
+            .split("page%5Bskip%5D=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(usize::MAX)
+    }
+
+    fn doc_row(n: u32) -> Value {
+        json!({"id": n.to_string(), "type": "documents",
+               "attributes": {"filename": format!("f{n}.pdf"), "filesize": 1, "revision": 1, "is-deleted": false},
+               "relationships": {"parent": {"data": {"id": "7", "type": "folders"}}}})
+    }
+
+    #[tokio::test]
+    async fn a_listing_without_a_total_reads_until_an_empty_page() {
+        let server = Server::new(|req, _| {
+            if req.target.contains("/folders?") {
+                return reply(200, json!({"data": []}));
+            }
+            let ids = match skip_of(&req.target) {
+                0 => 1..=500,
+                500 => 500..=999, // 500 comes again: it is read once
+                1000 => 1000..=1002,
+                _ => return reply(200, json!({"data": []})),
+            };
+            reply(200, json!({"data": ids.map(doc_row).collect::<Vec<_>>()}))
+        })
+        .await;
+        let items = folder_contents(&api_for(&server), &project(&server.origin), "7")
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1002);
+        let docs: Vec<String> = server
+            .requests()
+            .into_iter()
+            .map(|r| r.target)
+            .filter(|t| t.contains("/documents?"))
+            .collect();
+        assert_eq!(docs.len(), 4, "three pages, then the empty one");
+        assert!(docs[3].contains("page%5Bskip%5D=1003&"), "{}", docs[3]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_ends_is_refused_after_the_page_limit() {
+        let server = Server::new(|req, _| {
+            if req.target.contains("/folders?") {
+                return reply(200, json!({"data": []}));
+            }
+            reply(200, json!({"data": [doc_row(1)]}))
+        })
+        .await;
+        let err = folder_contents(&api_for(&server), &project(&server.origin), "7")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Message(_)), "{err:?}");
+        let pages = server
+            .requests()
+            .iter()
+            .filter(|r| r.target.contains("/documents?"))
+            .count();
+        assert_eq!(pages, MAX_DOC_PAGES);
+    }
+
+    #[tokio::test]
+    async fn a_link_to_another_revision_is_refused_with_a_409() {
+        let server = Server::scripted(vec![Fault::reply(
+            200,
+            r#"{"data": "/documents/1002/2/download?token=abc"}"#,
+        )])
+        .await;
+        let p = project(&server.origin);
+        let err = download_url(&api_for(&server), &p, "d1002", "streambim:1002:1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), Some(409));
+        assert!(err.to_string().contains("revision changed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_link_to_the_handle_revision_is_used() {
+        let server = Server::scripted(vec![Fault::reply(
+            200,
+            r#"{"data": "/documents/1002/2/download?token=abc"}"#,
+        )])
+        .await;
+        let d = download_url(
+            &api_for(&server),
+            &project(&server.origin),
+            "d1002",
+            "streambim:1002:2",
+        )
+        .await
+        .unwrap();
+        assert!(d.url.ends_with("/documents/1002/2/download?token=abc"));
+    }
+
+    #[test]
+    fn the_revision_of_a_link_and_of_a_handle() {
+        let base = "https://app.streambim.com/project-1552/api/v1";
+        assert_eq!(
+            revision_in_link(&format!("{base}/documents/1002/3/download?token=t"), "1002").unwrap(),
+            Some(3)
+        );
+        // Other forms name no revision, or another document.
+        for link in [
+            format!("{base}/documents/1002/download/plan.pdf"),
+            format!("{base}/documents/1003/3/download"),
+            "https://bucket.example.invalid/x?X-Amz=1".to_string(),
+        ] {
+            assert_eq!(revision_in_link(&link, "1002").unwrap(), None, "{link}");
+        }
+        assert_eq!(handle_revision("streambim:1002:7"), Some(7));
+        assert_eq!(handle_revision("streambim:pending"), None);
+        assert_eq!(handle_revision("plan"), None);
+    }
+
     #[test]
     fn uploads_above_five_gib_are_unsupported() {
         assert!(ensure_uploadable(MAX_UPLOAD_BYTES).is_ok());
@@ -1776,7 +2246,7 @@ mod tests {
         ));
         let item = Item {
             pid: 1,
-            id: "1002".into(),
+            id: "d1002".into(),
             parent: None,
             name: "plan.pdf".into(),
             kind: Kind::File,
@@ -1857,6 +2327,79 @@ mod tests {
             None
         );
         assert!(parse_download_link(b"  \"\"  ").is_err());
+    }
+
+    #[test]
+    fn folder_and_document_with_the_same_number_get_distinct_ids() {
+        let folder_row = json!({"id": "7", "type": "folders", "attributes": {"name": "Ritningar"}});
+        let doc_row = json!({"id": "7", "type": "documents",
+                             "attributes": {"filename": "plan.pdf", "revision": 3}});
+        let folder = folder_item(1, &folder_row, "0", None).unwrap();
+        let doc = file_item(1, &doc_row, Some("0")).unwrap();
+        assert_eq!(folder.id, "7");
+        assert_eq!(doc.id, "d7");
+        assert_ne!(folder.id, doc.id);
+        // The storage handle keeps the server id and the revision.
+        assert_eq!(doc.storage_urn.as_deref(), Some("streambim:7:3"));
+        assert_eq!(server_doc_id(&doc.id).unwrap(), "7");
+    }
+
+    #[test]
+    fn only_prefixed_ids_name_a_document() {
+        assert_eq!(server_doc_id("d1002").unwrap(), "1002");
+        for bad in ["1002", "d", "", "d1002/../x", "dd1002?token=x"] {
+            assert!(
+                matches!(server_doc_id(bad), Err(ApiError::Message(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_ids_without_the_document_prefix_are_refused_before_any_request() {
+        let server = Server::new(|_, _| Fault::reply(404, "unexpected")).await;
+        let api = api_for(&server);
+        let p = project(&server.origin);
+        let file = TestFile::new(&pattern(10));
+        let progress = |_: u64, _: u64| {};
+        let refused = [
+            download_url(&api, &p, "1002", "streambim:1002:1")
+                .await
+                .err(),
+            get_item_upload_info(&api, &p, "1002").await.err(),
+            create_version(&api, &p, "1002", "x", "y", &file.0, &progress)
+                .await
+                .err(),
+            rename_file(&api, &p, "1002", None, "x.pdf").await.err(),
+            move_file(&api, &p, "1002", "9").await.err(),
+            delete_file(&api, &p, "1002").await.err(),
+        ];
+        for err in refused {
+            assert!(matches!(err, Some(ApiError::Message(_))), "{err:?}");
+        }
+        let item = Item {
+            pid: 1,
+            id: "1002".into(),
+            parent: None,
+            name: "plan.pdf".into(),
+            kind: Kind::File,
+            remote_version: None,
+            base_version: None,
+            size: 0,
+            ctime_ms: 0,
+            mtime_ms: 0,
+            storage_urn: None,
+            version_urn: None,
+            modified_by: None,
+            locked_by: None,
+            local_state: LocalState::Clean,
+            populated: false,
+        };
+        assert!(matches!(
+            web_link(&api, &p, &item).await,
+            Err(ApiError::Message(_))
+        ));
+        assert_eq!(server.count(), 0);
     }
 
     #[test]

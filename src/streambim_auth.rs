@@ -32,6 +32,8 @@ const JSON_API: &str = "application/vnd.api+json";
 const NOT_SIGNED_IN: &str = "Inte inloggad på StreamBIM – logga in igen.";
 const SESSION_EXPIRED: &str = "StreamBIM-sessionen har gått ut – logga in igen. (Session expired)";
 const CODE_EXPIRED: &str = "Koden har gått ut – logga in igen.";
+const REFRESH_RETRY: &str =
+    "StreamBIM-sessionen kunde inte förnyas: inget giltigt svar. Försök igen.";
 
 /// What a password login leads to.
 #[derive(Debug)]
@@ -147,14 +149,16 @@ impl StreamBimAuth {
         }
     }
 
-    /// Signed in: a profile with a user id, and tokens (on disk or in memory).
+    /// Signed in: a profile with a user id, and tokens (on disk or in memory). The tokens are
+    /// loaded here on first use, so a token file that cannot be read is dropped right away.
     pub fn is_signed_in(&self) -> bool {
+        let has_tokens = self.cached_tokens().is_some();
         let st = self.st();
         let has_user = st
             .profile
             .as_ref()
             .is_some_and(|p| !p.user_id.trim().is_empty());
-        has_user && (st.tokens.is_some() || self.token_path().exists())
+        has_user && has_tokens
     }
 
     pub fn user(&self) -> Option<UserInfo> {
@@ -311,7 +315,24 @@ impl StreamBimAuth {
         self.refresh_session().await
     }
 
-    /// Make the next `access_token` refresh (after the server rejected the id token).
+    /// Make the next `access_token` refresh, the server having rejected `failed`: the id token
+    /// that the failing request sent. Only when `failed` is still the current id token. A refresh
+    /// that already replaced it makes this a no-op, so a burst of 401s causes one refresh. The
+    /// current id token is kept, since the refresh sends it.
+    pub async fn invalidate_token(&self, failed: &str) {
+        let _ = self.cached_tokens();
+        if let Some(tokens) = self
+            .st()
+            .tokens
+            .as_mut()
+            .filter(|tokens| tokens.id_token == failed)
+        {
+            tokens.expires_at = 0;
+        }
+    }
+
+    /// Make the next `access_token` refresh whatever the current id token is. Prefer
+    /// `invalidate_token`, which ignores a failure of a token that was already replaced.
     pub async fn invalidate(&self) {
         let _ = self.cached_tokens();
         if let Some(tokens) = self.st().tokens.as_mut() {
@@ -360,16 +381,28 @@ impl StreamBimAuth {
         st.tokens.clone()
     }
 
+    /// The tokens in the token file. A file that is there but cannot be read, decrypted or parsed
+    /// is removed: the account must not stay signed in on a session that can never be used. The
+    /// log line names no contents. Called with the state lock held, so it does not take it.
     fn read_token_file(&self) -> Option<Tokens> {
-        let bytes = std::fs::read(self.token_path()).ok()?;
-        let plain = match dpapi_unprotect(&bytes) {
-            Ok(plain) => plain,
+        let path = self.token_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                warn!("StreamBIM: token-filen kunde inte läsas: {e:#}");
+                warn!(kind = ?e.kind(), "StreamBIM: token-filen kunde inte läsas; den tas bort");
+                drop_token_file(&path);
                 return None;
             }
         };
-        serde_json::from_slice(&plain).ok()
+        let tokens = dpapi_unprotect(&bytes)
+            .ok()
+            .and_then(|plain| serde_json::from_slice::<Tokens>(&plain).ok());
+        if tokens.is_none() {
+            warn!("StreamBIM: token-filen kunde inte tolkas; den tas bort");
+            drop_token_file(&path);
+        }
+        tokens
     }
 
     fn fresh_id_token(&self) -> Option<String> {
@@ -406,29 +439,28 @@ impl StreamBimAuth {
                         }
                         Ok(id_token)
                     }
-                    None => {
-                        self.clear_session();
-                        bail!(SESSION_EXPIRED)
-                    }
+                    // A success without a token is not a sign-out: the next call tries again.
+                    None => bail!(REFRESH_RETRY),
                 }
             }
             // CHALLENGE_REQUESTED: the server wants MFA again, so the user signs in again.
-            Answer::Reply(_) => {
+            Answer::Reply(reply) if reply.result == "CHALLENGE_REQUESTED" => {
                 self.clear_session();
                 bail!(SESSION_EXPIRED)
             }
-            Answer::Status(status) if (400..500).contains(&status) => {
+            // The server refuses the refresh material: the session is over.
+            Answer::Status(status @ (400 | 401 | 403)) => {
                 warn!(status, "StreamBIM: sessionen avvisades");
                 self.clear_session();
                 bail!(SESSION_EXPIRED)
             }
-            // Server errors and no answer: the refresh material may still be good. Keep it.
+            // Everything else is temporary (throttling, timeouts, server errors, no answer, an
+            // unknown reply). The refresh material may still be good: keep it.
             Answer::Status(status) => {
+                warn!(status, "StreamBIM: sessionen kunde inte förnyas");
                 bail!("StreamBIM-sessionen kunde inte förnyas: HTTP {status}. Försök igen.")
             }
-            Answer::Failed => {
-                bail!("StreamBIM-sessionen kunde inte förnyas: inget giltigt svar. Försök igen.")
-            }
+            Answer::Reply(_) | Answer::Failed => bail!(REFRESH_RETRY),
         }
     }
 
@@ -439,9 +471,7 @@ impl StreamBimAuth {
             st.tokens = None;
             st.tokens_loaded = true;
         }
-        if let Err(e) = remove_if_exists(&self.token_path()) {
-            warn!("StreamBIM: kunde inte ta bort token-filen: {e:#}");
-        }
+        drop_token_file(&self.token_path());
     }
 
     /// Persist tokens and profile, then make them the in-memory session.
@@ -618,6 +648,13 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("kunde inte ta bort {}", path.display())),
+    }
+}
+
+/// Remove the token file; a failure is logged (the caller has already cleared the memory).
+fn drop_token_file(path: &Path) {
+    if let Err(e) = remove_if_exists(path) {
+        warn!("StreamBIM: kunde inte ta bort token-filen: {e:#}");
     }
 }
 
@@ -1044,6 +1081,160 @@ mod tests {
         assert!(!dir.path().join(TOKEN_FILE).exists());
         assert!(!dir.path().join(PROFILE_FILE).exists());
         assert!(!StreamBimAuth::new(http(), dir.path()).is_signed_in());
+    }
+
+    /// Server: login with `id-1`/`rt-1`, the profile, and a refresh answered by `refresh`.
+    async fn refresh_server(refresh: impl Fn() -> Fault + Send + Sync + 'static) -> Server {
+        Server::new(move |req, _| match req.target.as_str() {
+            "/auth/v1/login" => reply_json(
+                200,
+                json!({"result": "SUCCESS", "idToken": "id-1", "refreshToken": "rt-1", "expiresIn": 3600}),
+            ),
+            "/auth/v1/refresh" => refresh(),
+            t if t.starts_with("/mgw/api/v2/user-profiles") => profile_reply(),
+            _ => Fault::reply(404, "unexpected"),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_stale_failure_does_not_refresh_again() {
+        let server = Server::new(|req, _| match req.target.as_str() {
+            "/auth/v1/login" => reply_json(
+                200,
+                json!({"result": "SUCCESS", "idToken": "id-1", "refreshToken": "rt-1", "expiresIn": 3600}),
+            ),
+            "/auth/v1/refresh" => {
+                reply_json(200, json!({"result": "SUCCESS", "idToken": "id-2", "expiresIn": 3600}))
+            }
+            t if t.starts_with("/mgw/api/v2/user-profiles") => profile_reply(),
+            _ => Fault::reply(404, "unexpected"),
+        })
+        .await;
+        let dir = TestDir::new("stale");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+
+        // A 401 for a token that is not the current one changes nothing.
+        auth.invalidate_token("id-0").await;
+        assert_eq!(auth.access_token().await.unwrap(), "id-1");
+        assert_eq!(server.count(), 2, "no refresh for a stale failure");
+
+        // The failure of the current token: one refresh, which keeps the refresh token.
+        auth.invalidate_token("id-1").await;
+        assert_eq!(auth.access_token().await.unwrap(), "id-2");
+        assert_eq!(server.count(), 3);
+
+        // A burst of 401s for the token that was already replaced causes no more refreshes.
+        for _ in 0..5 {
+            auth.invalidate_token("id-1").await;
+        }
+        assert_eq!(auth.access_token().await.unwrap(), "id-2");
+        assert_eq!(server.count(), 3);
+        let refresh = server
+            .requests()
+            .into_iter()
+            .find(|r| r.target == "/auth/v1/refresh")
+            .unwrap();
+        assert_eq!(
+            body_json(&refresh),
+            json!({"token": "id-1", "refreshToken": "rt-1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_refresh_failures_keep_the_session() {
+        for status in [404u16, 408, 429, 500, 502, 503] {
+            let server =
+                refresh_server(move || reply_json(status, json!({"error": "later"}))).await;
+            let dir = TestDir::new("temporary");
+            let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+            auth.login("app", "ada@example.com", "pw").await.unwrap();
+            auth.invalidate_token("id-1").await;
+
+            let err = auth.access_token().await.unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("StreamBIM-sessionen kunde inte förnyas: HTTP {status}. Försök igen.")
+            );
+            assert!(auth.is_signed_in(), "{status}: the session stays");
+            assert!(dir.path().join(TOKEN_FILE).exists(), "{status}");
+            // The next call tries the refresh again with the same tokens.
+            let before = server.count();
+            assert!(auth.access_token().await.is_err());
+            assert_eq!(server.count(), before + 1, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_an_answer_keeps_the_session() {
+        let server = refresh_server(|| Fault::Disconnect).await;
+        let dir = TestDir::new("noanswer");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+        auth.invalidate_token("id-1").await;
+
+        assert_eq!(
+            auth.access_token().await.unwrap_err().to_string(),
+            REFRESH_RETRY
+        );
+        assert!(auth.is_signed_in());
+        assert!(dir.path().join(TOKEN_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn refusals_and_a_new_mfa_challenge_end_the_session() {
+        let answers: [(&str, Fault); 4] = [
+            ("400", Fault::reply(400, "bad")),
+            ("401", Fault::reply(401, "bad")),
+            ("403", Fault::reply(403, "bad")),
+            (
+                "challenge",
+                reply_json(
+                    200,
+                    json!({"result": "CHALLENGE_REQUESTED", "session": "s"}),
+                ),
+            ),
+        ];
+        for (name, answer) in answers {
+            let server = refresh_server(move || answer.clone()).await;
+            let dir = TestDir::new("refused");
+            let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+            auth.login("app", "ada@example.com", "pw").await.unwrap();
+            auth.invalidate_token("id-1").await;
+
+            assert_eq!(
+                auth.access_token().await.unwrap_err().to_string(),
+                SESSION_EXPIRED,
+                "{name}"
+            );
+            assert!(!auth.is_signed_in(), "{name}");
+            assert!(!dir.path().join(TOKEN_FILE).exists(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_token_file_ends_the_sign_in() {
+        let server = success_server().await;
+        let dir = TestDir::new("unreadable");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("app", "ada@example.com", "pw").await.unwrap();
+
+        // Bytes that are not DPAPI data, and DPAPI data that is not a token document.
+        let garbage = [
+            b"not protected".to_vec(),
+            dpapi_protect(b"{\"refresh_").unwrap(),
+        ];
+        for bytes in garbage {
+            std::fs::write(dir.path().join(TOKEN_FILE), &bytes).unwrap();
+            let again = StreamBimAuth::new(http(), dir.path());
+            assert!(!again.is_signed_in());
+            assert!(again.user().is_none());
+            assert!(!dir.path().join(TOKEN_FILE).exists(), "the file is removed");
+            let err = again.access_token().await.unwrap_err().to_string();
+            assert!(err.contains("logga in igen"), "{err}");
+        }
+        assert_eq!(server.count(), 2, "no request without a readable session");
     }
 
     #[test]
