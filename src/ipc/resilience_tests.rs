@@ -32,7 +32,10 @@ impl Drop for ServerTask {
 
 fn hub() -> Arc<IpcHub> {
     // This is a label in the snapshots only. These tests never open this path.
-    Arc::new(IpcHub::new(PathBuf::from(r"C:\Synka-resilience-test-only")))
+    Arc::new(IpcHub::new(
+        PathBuf::from(r"C:\Synka-resilience-test-only"),
+        true,
+    ))
 }
 
 fn operations() -> usize {

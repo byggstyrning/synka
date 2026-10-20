@@ -2,7 +2,7 @@
 //! polls and jobs, and the folder and rename rules of a provider without folder creation
 //! (Interaxo, `remote::caps`).
 
-use super::tests::{client_override_signed_in, fixture, row, Fixture};
+use super::tests::{client_override_signed_in, fixture, fixture_interaxo_off, row, Fixture};
 use super::*;
 use crate::app::Secret;
 use crate::config::protect_secret;
@@ -209,6 +209,153 @@ async fn interaxo_client_settings_are_refused_while_interaxo_is_signed_in() {
     assert_eq!(f.ctx.cfg_now().interaxo_client_id, None);
     assert!(!f.ctx.paths.state_dir.join("settings.json").exists());
     assert_eq!(notices(&f, "Logga ut från Interaxo"), 1);
+}
+
+/// The Interaxo refusal the engine sends while Interaxo is off (`config::INTERAXO_OFF_TEXT`).
+const INTERAXO_OFF: &str = "Interaxo-inloggning är avstängd i den här versionen.";
+
+#[test]
+fn providers_and_accounts_leave_interaxo_out_while_it_is_off() {
+    // Off: `settings.providers` names ACC and StreamBIM, and the status has no Interaxo account.
+    let off = fixture_interaxo_off("interaxo-off-view");
+    let engine = Engine::new(off.ctx.clone());
+    engine.publish_settings();
+    let view = off
+        ._rx
+        .try_iter()
+        .find_map(|m| match m {
+            UiMsg::Settings(view) => Some(view),
+            _ => None,
+        })
+        .expect("a settings event");
+    assert_eq!(view.providers, vec!["acc", "streambim"]);
+    engine.publish_now();
+    let status = last_status(&off);
+    assert!(
+        status
+            .accounts
+            .iter()
+            .all(|account| account.provider != Provider::Interaxo),
+        "no Interaxo account while it is off: {:?}",
+        status.accounts
+    );
+    assert_eq!(
+        status.accounts.len(),
+        1,
+        "ACC only: no StreamBIM account is signed in"
+    );
+
+    // On: the same engine lists and reports Interaxo as it always did.
+    let on = fixture("interaxo-on-view");
+    let engine = Engine::new(on.ctx.clone());
+    engine.publish_settings();
+    let view = on
+        ._rx
+        .try_iter()
+        .find_map(|m| match m {
+            UiMsg::Settings(view) => Some(view),
+            _ => None,
+        })
+        .expect("a settings event");
+    assert_eq!(view.providers, vec!["acc", "streambim", "interaxo"]);
+    engine.publish_now();
+    let status = last_status(&on);
+    assert_eq!(
+        status.accounts.last().map(|account| account.provider),
+        Some(Provider::Interaxo)
+    );
+}
+
+#[tokio::test]
+async fn interaxo_sign_in_and_settings_are_refused_while_it_is_off() {
+    let f = fixture_interaxo_off("interaxo-off-refused");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (tx, _) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::Interaxo,
+                streambim: None,
+            },
+            &mut live,
+            &tx,
+        )
+        .await;
+    assert!(live.sign_ins.is_empty(), "no browser attempt started");
+    assert!(!f.ctx.signed_in(Provider::Interaxo));
+    // `notices` drains the window's channel, so each count is what arrived since the last one.
+    assert_eq!(notices(&f, INTERAXO_OFF), 1);
+
+    engine
+        .set_setting("interaxo_client_id", &json!("new-client"))
+        .await;
+    assert_eq!(f.ctx.cfg_now().interaxo_client_id, None);
+    assert!(!f.ctx.paths.state_dir.join("settings.json").exists());
+    assert_eq!(notices(&f, INTERAXO_OFF), 1);
+}
+
+#[tokio::test]
+async fn a_disabled_interaxo_is_signed_out_for_the_list_polls_and_jobs() {
+    let mut f = fixture_interaxo_off("interaxo-off-gating");
+    // An Interaxo session from an earlier run stays on disk and is ignored, not deleted.
+    interaxo_signed_in(&mut f);
+    assert!(f.ctx.interaxo.is_signed_in());
+    assert!(!f.ctx.signed_in(Provider::Interaxo));
+    assert!(f.ctx.user_for(Provider::Interaxo).is_none());
+    assert!(!f.ctx.any_signed_in(), "no ACC or StreamBIM session");
+    let ix = other_provider_project(&f, Provider::Interaxo);
+    assert!(!f.ctx.project_connected(&ix));
+
+    // Not polled: the scheduler drops the project as it drops a signed-out provider's.
+    let engine = Engine::new(f.ctx.clone());
+    engine.st().next_due.insert(ix.pid, Instant::now());
+    engine.on_timers();
+    assert!(!engine.st().next_due.contains_key(&ix.pid));
+    assert!(engine.st().polling.is_empty());
+
+    // Its job waits without an attempt.
+    let job = f.ctx.store.enqueue(ix.pid, "upload", None, "{}").unwrap();
+    let processed = upload::process_due(&f.ctx).await.unwrap();
+    assert_eq!(processed, 0, "the job waits");
+    let waiting = f
+        .ctx
+        .store
+        .due_jobs(i64::MAX, 100)
+        .unwrap()
+        .into_iter()
+        .find(|j| j.id == job)
+        .expect("still queued");
+    assert_eq!(waiting.attempts, 0, "waiting spends no attempt");
+
+    // Not listed: the hub list names no Interaxo hub, although the project is subscribed in the store.
+    engine.refresh_projects().await;
+    let listed = f
+        ._rx
+        .try_iter()
+        .filter_map(|m| match m {
+            UiMsg::Projects {
+                hubs,
+                loading: false,
+            } => Some(hubs),
+            _ => None,
+        })
+        .last()
+        .expect("a projects event");
+    assert!(
+        listed
+            .iter()
+            .all(|(hub, _)| hub.provider != Provider::Interaxo),
+        "no Interaxo hub while it is off"
+    );
+    assert!(
+        f.ctx.store.project(ix.pid).unwrap().is_some(),
+        "the project is kept"
+    );
+    assert!(
+        f.ctx.paths.state_dir.join("token-interaxo.bin").exists(),
+        "the session file is kept"
+    );
 }
 
 #[tokio::test]

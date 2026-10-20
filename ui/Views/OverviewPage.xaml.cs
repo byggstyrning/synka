@@ -253,6 +253,11 @@ public sealed partial class OverviewPage : Page
         var noAccount = connected && status is { SignedIn: false };
         SignInCard.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
         SignInSettingsButton.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
+        var settingsText = SignInSettingsText();
+        if (SignInSettingsButton.Content as string != settingsText)
+        {
+            SignInSettingsButton.Content = settingsText;
+        }
         if (signedIn)
         {
             SignInHint.Text = _signInHintDefault;
@@ -262,6 +267,14 @@ public sealed partial class OverviewPage : Page
         RefreshQueue(status);
         RefreshStorage(status);
     }
+
+    /// <summary>
+    /// The line on the sign-in card's button: the Konton providers the engine offers (settings.providers).
+    /// Without Interaxo it names ACC and StreamBIM only.
+    /// </summary>
+    private static string SignInSettingsText() => Engine.ProviderOffered(ProviderNames.Interaxo)
+        ? Lang.T("Logga in på StreamBIM eller Interaxo under Konton.", "Sign in to StreamBIM or Interaxo under Accounts.")
+        : Lang.T("Logga in på ACC eller StreamBIM under Konton.", "Sign in to ACC or StreamBIM under Accounts.");
 
     /// <summary>The engine's one-liner while any sign-in waits for a browser. It is generic: StreamBIM has no browser.</summary>
     private const string BrowserWaitText = "Väntar på inloggning i webbläsaren…";

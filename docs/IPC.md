@@ -106,6 +106,13 @@ See `docs/PROVIDERS.md`. Clarifications:
   `http://localhost:<port>/<path>` or `http://127.0.0.1:<port>/<path>` (default
   `http://localhost:47864/`); it must match the URI registered with Interaxo exactly. The
   secret is optional, stored DPAPI-protected and reported only as `interaxo_client_secret_set`.
+- **Interaxo is off unless `settings.json` has `"interaxo_enabled": true`** (admin only, read at
+  start, not settable over IPC, like `desktop_sync_feed`; default `false`). While it is off,
+  `settings.providers` is `["acc","streambim"]`, `status.accounts` has no `interaxo` entry,
+  `sign_in` with `provider` `interaxo` and `set_setting` for any `interaxo_*` key are refused in
+  the ack with "Interaxo-inloggning är avstängd i den här versionen.", and Interaxo is not listed,
+  polled or subscribed. An Interaxo session file from earlier is kept and ignored.
+  `cancel_sign_in` and `sign_out` for `interaxo` still work.
 - **`projects`.** `hubs[].provider` is `acc`, `streambim` or `interaxo`. Hub ids and project ids
   are unique across providers (`docs/PROVIDERS.md`). A signed-out provider's subscribed projects
   stay listed (from the store, with `subscribed` true) so they can be unsubscribed; subscribing

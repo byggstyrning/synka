@@ -84,6 +84,8 @@ each. Projects of every signed-in account appear on the Projects page, grouped b
 | StreamBIM | server (region or custom https address), e-mail, password, authenticator code if MFA is on; several servers at once | the project's document library (folders and documents, with revisions) | SSO-only accounts; files over 5 GB; locks |
 | Interaxo | Interaxo browser sign-in (PKCE) with the organisation's own Client ID | simple folders and files of each room you are a member of | creating folders, renaming and moving (the public API has none: such changes stay on this PC with a notice); registers, entries and links; locks |
 
+Interaxo is turned off by default for now: its section on the Konton page only says so, and its sign-in is refused. To turn it on, add `"interaxo_enabled": true` to `settings.json` in the app's LocalState folder (`%LOCALAPPDATA%\Packages\<PFN>\LocalState`), then restart the engine.
+
 ### Set up Interaxo (bring your own Client ID)
 
 Interaxo has no self-service app registration. Ask Interaxo support for a **Native** (public)

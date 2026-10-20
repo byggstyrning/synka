@@ -273,10 +273,16 @@
                     <StackPanel Spacing="2" VerticalAlignment="Center">
                         <TextBlock Text="Interaxo"
                                    Style="{StaticResource SubtitleTextBlockStyle}" />
-                        <TextBlock Text="{loc:T Sv='Logga in med organisationens egen Client ID.', En='Sign in with the Client ID of your organisation.'}"
+                        <TextBlock x:Name="InteraxoCaption"
+                                   Text="{loc:T Sv='Logga in med organisationens egen Client ID.', En='Sign in with the Client ID of your organisation.'}"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    TextWrapping="Wrap"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <!-- Shown instead of the caption while the engine leaves Interaxo out of settings.providers. -->
+                        <TextBlock x:Name="InteraxoOffText"
+                                   Visibility="Collapsed"
+                                   Text="{loc:T Sv='Interaxo-inloggning är avstängd för tillfället.', En='Interaxo sign-in is turned off for now.'}"
+                                   Style="{StaticResource CaptionMutedStyle}" />
                     </StackPanel>
                     <StackPanel x:Name="InteraxoHeaderActions"
                                 Grid.Column="1"

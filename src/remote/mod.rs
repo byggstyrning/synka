@@ -630,7 +630,7 @@ mod tests {
         let ui = crate::app::UiSender {
             tx,
             main_thread_id: 0,
-            hub: Arc::new(IpcHub::new(paths.sync_root.clone())),
+            hub: Arc::new(IpcHub::new(paths.sync_root.clone(), false)),
         };
         let cfg = Config::default();
         let ctx = Ctx {

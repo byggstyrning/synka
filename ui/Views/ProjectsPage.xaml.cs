@@ -958,9 +958,14 @@ public sealed partial class ProjectsPage : Page
         }
         else if (!Engine.IsSignedIn)
         {
-            text = Lang.T(
-                "Logga in på ACC, StreamBIM eller Interaxo under Konton.",
-                "Sign in to ACC, StreamBIM or Interaxo under Accounts.");
+            // Interaxo is named only while the engine offers it (settings.providers).
+            text = Engine.ProviderOffered(ProviderNames.Interaxo)
+                ? Lang.T(
+                    "Logga in på ACC, StreamBIM eller Interaxo under Konton.",
+                    "Sign in to ACC, StreamBIM or Interaxo under Accounts.")
+                : Lang.T(
+                    "Logga in på ACC eller StreamBIM under Konton.",
+                    "Sign in to ACC or StreamBIM under Accounts.");
             signIn = true;
         }
         else if (filtered)

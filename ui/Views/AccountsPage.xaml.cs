@@ -219,7 +219,10 @@ public sealed partial class AccountsPage : Page
             return;
         }
 
-        var signedIn = ReportedAccounts().Where(account => account.SignedIn).ToList();
+        // Only the providers the engine offers count: a provider it leaves out (Interaxo, for now) is not shown.
+        var signedIn = ReportedAccounts()
+            .Where(account => account.SignedIn && _engine.ProviderOffered(ProviderNames.Id(account.Provider)))
+            .ToList();
         var accounts = signedIn.Count == 1
             ? Lang.T("1 konto inloggat", "1 account signed in")
             : Lang.T($"{signedIn.Count} konton inloggade", $"{signedIn.Count} accounts signed in");
@@ -259,11 +262,26 @@ public sealed partial class AccountsPage : Page
         ShowFailure(StreamBimError, ProviderNames.StreamBim, _streamBimFailureKey);
     }
 
+    /// <summary>
+    /// Interaxo while the engine leaves it out of settings.providers (turned off for now): the name and one
+    /// muted line. No sign-in, no account card, no client settings, and no failure bar.
+    /// </summary>
     private void RefreshInteraxoSection(bool connected)
     {
-        var account = connected ? _engine.AccountFor(ProviderNames.Interaxo) : null;
+        var offered = _engine.ProviderOffered(ProviderNames.Interaxo);
+        Show(InteraxoCaption, offered);
+        Show(InteraxoOffText, !offered);
+        Show(InteraxoHeaderActions, offered);
+        Show(InteraxoAdvanced, offered);
+        Show(InteraxoError, offered);
+
+        var account = connected && offered ? _engine.AccountFor(ProviderNames.Interaxo) : null;
         var shown = Shown(account);
         ShowCards(InteraxoCards, ProviderNames.Interaxo, shown);
+        if (!offered)
+        {
+            return;
+        }
 
         var signedIn = account is { SignedIn: true };
         Show(InteraxoSignInButton, !signedIn);

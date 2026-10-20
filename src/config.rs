@@ -94,6 +94,10 @@ pub fn check_setting(key: &str, value: &Value) -> Result<(), String> {
     }
 }
 
+/// The refusal of every Interaxo sign-in and Interaxo setting while `interaxo_enabled` is false.
+/// The IPC layer sends it in the ack; the engine uses it for its own notices.
+pub const INTERAXO_OFF_TEXT: &str = "Interaxo-inloggning är avstängd i den här versionen.";
+
 /// Built-in APS app (Desktop/SPA type, Authorization Code + PKCE, no secret). The app is still
 /// named "Better Desktop Connector" in the APS developer portal; rename it to "Synka" there
 /// (owner action). A public client id is not a secret.
@@ -125,6 +129,10 @@ pub struct Config {
     /// dm/v3 desktop-sync feed as change source. Must stay false unless Autodesk has approved
     /// its use in writing. When false the engine never calls any dm/v3 endpoint.
     pub desktop_sync_feed: bool,
+    /// ADMIN ONLY, settings.json only (not settable over IPC). Interaxo is off unless this is true:
+    /// the engine then offers, lists, polls and signs in only ACC and StreamBIM, refuses Interaxo
+    /// sign-in and Interaxo settings, and leaves an earlier Interaxo session file alone. Read at start.
+    pub interaxo_enabled: bool,
     /// Interaxo OIDC client id ("bring your own client id"). None or blank: not configured.
     pub interaxo_client_id: Option<String>,
     /// Redirect URI registered for the Interaxo client. None or blank: `INTERAXO_DEFAULT_REDIRECT`.
@@ -146,6 +154,7 @@ impl Default for Config {
             update_channel: String::new(),
             auto_update: false,
             desktop_sync_feed: false,
+            interaxo_enabled: false,
             interaxo_client_id: None,
             interaxo_redirect_uri: None,
             interaxo_client_secret_protected: None,
@@ -503,6 +512,31 @@ mod tests {
             serde_json::from_str::<Config>(r#"{"desktop_sync_feed":true}"#)
                 .unwrap()
                 .desktop_sync_feed
+        );
+    }
+
+    #[test]
+    fn interaxo_is_off_by_default_and_is_not_an_ipc_setting() {
+        assert!(!Config::default().interaxo_enabled);
+        assert!(check_setting("interaxo_enabled", &json!(true)).is_err());
+        let mut config = Config::default();
+        assert!(config
+            .apply_setting("interaxo_enabled", &json!(true))
+            .is_err());
+        assert!(!config.interaxo_enabled);
+    }
+
+    #[test]
+    fn interaxo_enabled_loads_from_settings_json_and_is_off_without_it() {
+        assert!(
+            serde_json::from_str::<Config>(r#"{"interaxo_enabled":true}"#)
+                .unwrap()
+                .interaxo_enabled
+        );
+        assert!(
+            !serde_json::from_str::<Config>(r#"{"propagate_deletes":false}"#)
+                .unwrap()
+                .interaxo_enabled
         );
     }
 

@@ -85,6 +85,7 @@ use crate::cf::{
     RenameReq, STATUS_CLOUD_FILE_ACCESS_DENIED, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE,
     STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
+use crate::config::INTERAXO_OFF_TEXT;
 use crate::http::ApiError;
 use crate::model::*;
 use crate::remote::{self, DownloadUrl};
@@ -2526,6 +2527,15 @@ impl Engine {
             return;
         };
         match cmd {
+            // The IPC layer refuses this in the ack already; the engine refuses it too.
+            TrayCmd::SignIn {
+                provider: Provider::Interaxo,
+                ..
+            } if !self.ctx.interaxo_enabled() => {
+                self.ctx
+                    .ui
+                    .send(UiMsg::notify(Severity::Warning, INTERAXO_OFF_TEXT));
+            }
             TrayCmd::SignIn {
                 provider,
                 streambim,
@@ -2823,7 +2833,8 @@ impl Engine {
             .map(|p| p.project_id.clone())
             .collect();
         let lists = futures_util::future::join_all(
-            Provider::ALL
+            self.ctx
+                .offered_providers()
                 .into_iter()
                 .filter(|provider| self.ctx.signed_in(*provider))
                 .map(|provider| {
@@ -2855,7 +2866,8 @@ impl Engine {
         }
         // A signed-out provider cannot be listed. Its subscribed projects still show, so they
         // can be unsubscribed. StreamBIM is listed per account: each account that is not signed in.
-        for provider in Provider::ALL {
+        // A provider the engine does not offer (Interaxo, while it is off) is not listed at all.
+        for provider in self.ctx.offered_providers() {
             match provider {
                 Provider::StreamBim => {
                     for key in offline_streambim_keys(&self.ctx.streambim, &previous, &stored) {
@@ -3740,21 +3752,23 @@ impl Engine {
                 host: account.map(|account| account.auth.host()),
             });
         }
-        out.push(AccountStatus {
-            provider: Provider::Interaxo,
-            account: None,
-            label: Provider::Interaxo.label(),
-            configured: self.ctx.interaxo.is_configured(),
-            signed_in: self.ctx.interaxo.is_signed_in(),
-            signing_in: signing.contains(&(Provider::Interaxo, None)),
-            user: self
-                .ctx
-                .interaxo
-                .is_signed_in()
-                .then(|| self.ctx.user_for(Provider::Interaxo))
-                .flatten(),
-            host: None,
-        });
+        // Interaxo has no entry while it is turned off (settings.json `interaxo_enabled`).
+        if self.ctx.offers(Provider::Interaxo) {
+            out.push(AccountStatus {
+                provider: Provider::Interaxo,
+                account: None,
+                label: Provider::Interaxo.label(),
+                configured: self.ctx.interaxo.is_configured(),
+                signed_in: self.ctx.signed_in(Provider::Interaxo),
+                signing_in: signing.contains(&(Provider::Interaxo, None)),
+                user: self
+                    .ctx
+                    .signed_in(Provider::Interaxo)
+                    .then(|| self.ctx.user_for(Provider::Interaxo))
+                    .flatten(),
+                host: None,
+            });
+        }
         out
     }
 
@@ -3788,7 +3802,12 @@ impl Engine {
             aps_client_id_override_supported: true,
             aps_client_id_validation_supported: true,
             update_channel_configured: !s.update_channel.trim().is_empty(),
-            providers: Provider::ALL.into_iter().map(Provider::as_str).collect(),
+            providers: self
+                .ctx
+                .offered_providers()
+                .into_iter()
+                .map(Provider::as_str)
+                .collect(),
             interaxo_client_id: s
                 .interaxo_client_id
                 .as_deref()
@@ -4148,6 +4167,14 @@ impl Engine {
     /// The Interaxo client (id, redirect URI, secret) is saved only while Interaxo is signed out:
     /// the account keeps tokens for the client it was signed in with.
     fn set_interaxo_setting(self: &Arc<Self>, key: &str, value: &Value) {
+        if !self.ctx.interaxo_enabled() {
+            // Refused by the IPC layer already; nothing is saved while Interaxo is off.
+            self.ctx
+                .ui
+                .send(UiMsg::notify(Severity::Warning, INTERAXO_OFF_TEXT));
+            self.publish_settings();
+            return;
+        }
         let busy = self.ctx.signed_in(Provider::Interaxo)
             || self.st().signing_in.contains(&(Provider::Interaxo, None));
         if busy {
@@ -9720,7 +9747,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// The fixture with Interaxo enabled (`interaxo_enabled` true in its config), as the provider
+    /// tests need it. A fixture that is not about Interaxo sees the same providers as before.
     pub(crate) fn fixture(tag: &str) -> Fixture {
+        fixture_with(tag, true)
+    }
+
+    /// The fixture as a fresh install has it: Interaxo off (`interaxo_enabled` false).
+    pub(crate) fn fixture_interaxo_off(tag: &str) -> Fixture {
+        fixture_with(tag, false)
+    }
+
+    fn fixture_with(tag: &str, interaxo_enabled: bool) -> Fixture {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
@@ -9748,9 +9786,12 @@ pub(crate) mod tests {
         let ui = crate::app::UiSender {
             tx,
             main_thread_id: 0,
-            hub: Arc::new(crate::ipc::IpcHub::new(root.clone())),
+            hub: Arc::new(crate::ipc::IpcHub::new(root.clone(), interaxo_enabled)),
         };
-        let cfg = crate::config::Config::default();
+        let cfg = crate::config::Config {
+            interaxo_enabled,
+            ..crate::config::Config::default()
+        };
         let streambim = Arc::new(crate::streambim_auth::StreamBimAccounts::load(
             http.clone(),
             &state,

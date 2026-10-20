@@ -132,6 +132,8 @@ pub enum Command {
 pub struct IpcHub {
     events: broadcast::Sender<Arc<str>>,
     sync_root: PathBuf,
+    /// `Config::interaxo_enabled`. While false, Interaxo sign-in and `interaxo_*` settings are refused.
+    interaxo_enabled: bool,
     cache: Mutex<Cache>,
     clients: AtomicUsize,
 }
@@ -151,11 +153,12 @@ struct Cache {
 }
 
 impl IpcHub {
-    pub fn new(sync_root: PathBuf) -> IpcHub {
+    pub fn new(sync_root: PathBuf, interaxo_enabled: bool) -> IpcHub {
         let (events, _) = broadcast::channel(EVENT_CAP);
         IpcHub {
             events,
             sync_root,
+            interaxo_enabled,
             cache: Mutex::new(Cache::default()),
             clients: AtomicUsize::new(0),
         }
@@ -319,15 +322,16 @@ impl IpcHub {
     pub fn snapshot(&self) -> Vec<String> {
         let c = self.cache();
         let status = c.status.clone().unwrap_or_else(|| {
+            let mut accounts = vec![AccountStatus::signed_out(Provider::Acc)];
+            if self.interaxo_enabled {
+                accounts.push(AccountStatus::signed_out(Provider::Interaxo));
+            }
             status_json(&Status {
                 text: "Logga in".into(),
                 state: "signed_out",
                 sync_root: self.sync_root.display().to_string(),
                 engine_version: env!("CARGO_PKG_VERSION").into(),
-                accounts: vec![
-                    AccountStatus::signed_out(Provider::Acc),
-                    AccountStatus::signed_out(Provider::Interaxo),
-                ],
+                accounts,
                 ..Default::default()
             })
         });
@@ -771,6 +775,9 @@ fn dispatch(
             password,
         } => {
             let provider = parse_provider(provider.as_deref().unwrap_or("acc"))?;
+            if provider == Provider::Interaxo && !hub.interaxo_enabled {
+                return Err(config::INTERAXO_OFF_TEXT.into());
+            }
             let streambim = match provider {
                 Provider::StreamBim => Some(streambim_login(region, url, username, password)?),
                 _ => None,
@@ -859,6 +866,9 @@ fn dispatch(
             subscribe,
         },
         Command::SetSetting { key, value } => {
+            if key.starts_with("interaxo_") && !hub.interaxo_enabled {
+                return Err(config::INTERAXO_OFF_TEXT.into());
+            }
             config::check_setting(&key, &value)?;
             if key == "aps_client_id" && value.as_str().is_some_and(|id| !id.trim().is_empty()) {
                 return Err("aps_client_id måste testas innan det sparas. Använd Testa och spara i en uppdaterad Synka.".into());
@@ -1040,7 +1050,7 @@ mod tests {
     #[test]
     fn unknown_or_broken_commands_are_rejected() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let r = handle_line(br#"{"cmd":"nope","id":7}"#, &hub, &tx);
         assert_eq!(r.len(), 1);
         let v: Value = serde_json::from_str(&r[0]).unwrap();
@@ -1088,7 +1098,7 @@ mod tests {
     #[test]
     fn client_id_override_commands_are_validated_before_reaching_the_engine() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         for value in [json!(""), json!(" \t\r\n")] {
             let line = json!({
                 "cmd": "set_setting", "id": 21, "key": "aps_client_id", "value": value
@@ -1133,7 +1143,7 @@ mod tests {
     #[test]
     fn client_validation_commands_require_valid_ids_and_preserve_correlation() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let request_id = "82e8eba6-50d1-4be0-a81f-c84f32777725";
         for command in ["test_aps_client_id", "cancel_aps_client_id_test"] {
             let line = json!({"cmd": command, "id": 31, "client_id": " test-client ", "request_id": request_id}).to_string();
@@ -1187,7 +1197,7 @@ mod tests {
 
     #[test]
     fn client_validation_outcome_replays_after_reconnect_without_credentials() {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let request_id = "82e8eba6-50d1-4be0-a81f-c84f32777725";
         for state in ["testing", "saved", "failed", "cancelled"] {
             let mut live = hub.events.subscribe();
@@ -1222,7 +1232,7 @@ mod tests {
 
     #[test]
     fn client_validation_cancel_replays_only_terminal_results() {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let mut events = hub.events.subscribe();
         let request_id = "82e8eba6-50d1-4be0-a81f-c84f32777725";
         assert!(!hub.replay_client_validation_result(request_id));
@@ -1248,7 +1258,7 @@ mod tests {
 
     #[test]
     fn client_validation_replay_keeps_recent_windows_and_has_a_fixed_bound() {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         for operation in 0..17 {
             hub.on_msg(&UiMsg::ApsClientIdValidation {
                 request_id: format!("82e8eba6-50d1-4be0-a81f-{operation:012x}"),
@@ -1276,7 +1286,7 @@ mod tests {
 
     #[test]
     fn a_pending_sign_in_wait_is_replayed_to_a_new_window_until_it_ends() {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let (cmds, _rx) = tokio::sync::mpsc::unbounded_channel();
         let hello = |hub: &IpcHub| -> Vec<Value> {
             handle_line(br#"{"cmd":"hello"}"#, hub, &cmds)
@@ -1391,7 +1401,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let base = std::env::temp_dir().join(format!("synka-ipc-move-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let hub = IpcHub::new(base.join("Synka"));
+        let hub = IpcHub::new(base.join("Synka"), true);
         let to = base.join("Ny plats").join("Synka");
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
         let line =
@@ -1413,7 +1423,7 @@ mod tests {
     #[test]
     fn commands_reach_the_engine_and_are_acked() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let r = handle_line(br#"{"cmd":"sync_now","id":3}"#, &hub, &tx);
         assert_eq!(r.len(), 1);
         assert_eq!(
@@ -1540,7 +1550,7 @@ mod tests {
 
     #[test]
     fn notify_update_settings_and_activity_shapes() {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let mut rx = hub.events.subscribe();
 
         hub.on_msg(&UiMsg::notify(Severity::Warning, "Kan inte avsluta"));
@@ -1612,7 +1622,7 @@ mod tests {
 
     #[test]
     fn settings_snapshot_exposes_only_the_normalized_saved_client_id_override() {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let mut rx = hub.events.subscribe();
         let mut config = config::Config::default();
         for input in [None, Some(" \ttest-client_ID_123\r\n"), Some(" \t\r\n")] {
@@ -1658,7 +1668,7 @@ mod tests {
     #[test]
     fn sign_in_commands_parse_with_defaults_and_validate_each_field() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
 
         // ACC needs no fields.
         let r = handle_line(br#"{"cmd":"sign_in","id":1}"#, &hub, &tx);
@@ -1720,7 +1730,7 @@ mod tests {
     #[test]
     fn mfa_cancel_sign_out_and_regions_commands_validate_their_fields() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
 
         let r = handle_line(
             br#"{"cmd":"sign_in_mfa","id":1,"provider":"streambim","account":"app","code":"123456"}"#,
@@ -1812,7 +1822,7 @@ mod tests {
         const PASSWORD: &str = "Hemligt-Lösen-7731";
         const CODE: &str = "548213";
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let lines = [
             // accepted: the password reaches the engine, but never a text
             format!(r#"{{"cmd":"sign_in","id":1,"provider":"streambim","region":"app","username":"a@x.se","password":"{pw}"}}"#, pw = PASSWORD),
@@ -1950,7 +1960,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens the real named pipe of the current user"]
     async fn pipe_hello_gets_status() {
-        let hub = Arc::new(IpcHub::new(PathBuf::from(r"C:\Synka")));
+        let hub = Arc::new(IpcHub::new(PathBuf::from(r"C:\Synka"), true));
         hub.on_msg(&UiMsg::Status(Status {
             text: "Synkad".into(),
             state: "synced",
@@ -2029,7 +2039,7 @@ mod account_command_tests {
 
     /// The ack of one command line, and the command the engine would get (if any).
     fn send(line: &str) -> (Value, Option<TrayCmd>) {
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let reply = handle_line(line.as_bytes(), &hub, &tx);
         // A success without an id is silent: no ack line.
@@ -2223,7 +2233,7 @@ mod account_command_tests {
         assert!(accounts[2]["user"].is_null());
         assert_eq!(v["signed_in"], true, "any account signed in");
         // Without a status yet, the snapshot names ACC and Interaxo only.
-        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"));
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), true);
         let first: Value = serde_json::from_str(&hub.snapshot()[0]).unwrap();
         let providers: Vec<&str> = first["accounts"]
             .as_array()
@@ -2232,5 +2242,115 @@ mod account_command_tests {
             .map(|a| a["provider"].as_str().unwrap())
             .collect();
         assert_eq!(providers, ["acc", "interaxo"]);
+    }
+}
+
+#[cfg(test)]
+mod interaxo_off_tests {
+    use super::*;
+
+    /// The Interaxo refusal text the ack carries while Interaxo is off.
+    const OFF: &str = "Interaxo-inloggning är avstängd i den här versionen.";
+
+    /// The ack of one command line on a hub with Interaxo on or off, and the command it sent (if any).
+    fn send(line: &str, interaxo_enabled: bool) -> (Value, Option<TrayCmd>) {
+        let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), interaxo_enabled);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = handle_line(line.as_bytes(), &hub, &tx);
+        let ack: Value = reply
+            .first()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .expect("an ack for a command with an id");
+        (ack, rx.try_recv().ok())
+    }
+
+    #[test]
+    fn interaxo_sign_in_is_refused_in_the_ack_while_it_is_off() {
+        let (ack, cmd) = send(r#"{"cmd":"sign_in","id":1,"provider":"interaxo"}"#, false);
+        assert_eq!(ack["ok"], false, "{ack}");
+        assert_eq!(ack["id"], 1);
+        assert_eq!(ack["error"], OFF);
+        assert!(cmd.is_none(), "a refused sign_in reached the engine");
+
+        let (ack, cmd) = send(r#"{"cmd":"sign_in","id":2,"provider":"interaxo"}"#, true);
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(matches!(
+            cmd,
+            Some(TrayCmd::SignIn {
+                provider: Provider::Interaxo,
+                streambim: None
+            })
+        ));
+    }
+
+    #[test]
+    fn interaxo_settings_are_refused_in_the_ack_while_it_is_off() {
+        for line in [
+            r#"{"cmd":"set_setting","id":1,"key":"interaxo_client_id","value":"ix-client"}"#,
+            r#"{"cmd":"set_setting","id":2,"key":"interaxo_redirect_uri","value":""}"#,
+            r#"{"cmd":"set_setting","id":3,"key":"interaxo_client_secret","value":"ix-secret"}"#,
+            r#"{"cmd":"set_setting","id":4,"key":"interaxo_enabled","value":true}"#,
+        ] {
+            let (ack, cmd) = send(line, false);
+            assert_eq!(ack["ok"], false, "{line}: {ack}");
+            assert_eq!(ack["error"], OFF, "{line}");
+            assert!(
+                cmd.is_none(),
+                "a refused setting reached the engine: {line}"
+            );
+        }
+
+        let (ack, cmd) = send(
+            r#"{"cmd":"set_setting","id":5,"key":"interaxo_client_id","value":"ix-client"}"#,
+            true,
+        );
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(matches!(
+            cmd,
+            Some(TrayCmd::SetSetting { ref key, .. }) if key == "interaxo_client_id"
+        ));
+    }
+
+    #[test]
+    fn interaxo_cancel_and_sign_out_stay_harmless_while_it_is_off() {
+        let (ack, cmd) = send(
+            r#"{"cmd":"cancel_sign_in","id":1,"provider":"interaxo"}"#,
+            false,
+        );
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(matches!(
+            cmd,
+            Some(TrayCmd::CancelSignIn {
+                provider: Provider::Interaxo,
+                account: None
+            })
+        ));
+
+        // Sign-out still reaches the engine, so a session from an earlier run can be cleared.
+        let (ack, cmd) = send(r#"{"cmd":"sign_out","id":2,"provider":"interaxo"}"#, false);
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(matches!(
+            cmd,
+            Some(TrayCmd::SignOut {
+                provider: Some(Provider::Interaxo),
+                account: None
+            })
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_before_the_first_status_names_interaxo_only_while_it_is_on() {
+        let providers = |enabled: bool| -> Vec<String> {
+            let hub = IpcHub::new(PathBuf::from(r"C:\Synka"), enabled);
+            let first: Value = serde_json::from_str(&hub.snapshot()[0]).unwrap();
+            first["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["provider"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(providers(false), ["acc"]);
+        assert_eq!(providers(true), ["acc", "interaxo"]);
     }
 }

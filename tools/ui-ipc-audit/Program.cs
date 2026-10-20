@@ -29,6 +29,7 @@ internal static class Program
             ("activity_error_details_redact_credentials", ActivityErrorDetailsRedactCredentials),
             ("activity_local_paths_with_spaces_are_fully_redacted", ActivityLocalPathsWithSpacesAreFullyRedacted),
             ("provider_messages_parse_and_commands_carry_protocol_fields", ProviderMessagesParseAndCommandsCarryProtocolFields),
+            ("providers_without_interaxo_are_not_offered", ProvidersWithoutInteraxoAreNotOffered),
             ("sign_in_progress_is_forgotten_across_connections", SignInProgressIsForgottenAcrossConnections),
             ("settings_retries_and_cancels_acc_and_interaxo_browser_sign_ins", SettingsRetriesAndCancelsBrowserSignInsPerProvider),
         };
@@ -196,6 +197,36 @@ internal static class Program
         return "Two StreamBIM accounts parsed per server with their keys; per-account sign-in progress; an older status fell back to ACC; "
             + "sign_in with region or url (never both, refused locally when both or neither), sign_in_mfa, cancel_sign_in and sign_out "
             + "(per account, per provider, all) and streambim_regions sent their protocol fields";
+    }
+
+    /// <summary>
+    /// Interaxo turned off (settings.json): the engine's `providers` names only ACC and StreamBIM and its status
+    /// has no Interaxo account, so the window offers no Interaxo sign-in. An engine that sends no `providers`
+    /// (older) offers every provider, as it did before.
+    /// </summary>
+    private static async Task<string> ProvidersWithoutInteraxoAreNotOffered()
+    {
+        using var pipes = await PipePair.Connect();
+        var client = NewClient();
+        var serving = Serve(client, pipes.Window);
+        await pipes.AckHello();
+
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":true,"user":{"name":"Anna","email":"a@x.se"},"state":"synced","accounts":[{"provider":"acc","label":"ACC","configured":true,"signed_in":true,"signing_in":false,"user":{"name":"Anna","email":"a@x.se"},"host":null,"account":null}]}""");
+        await Until(() => client.Accounts.Count == 1);
+        Require(client.AccountFor("interaxo") is null, "An account of a provider the engine left out was reported");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"settings","propagate_deletes":false,"max_downloads":4,"max_uploads":2,"poll_active_secs":60,"log_level":"info","start_at_login":false,"sync_root":"C:/Synka","client_id_configured":true,"providers":["acc","streambim"],"interaxo_client_id":null,"interaxo_redirect_uri":"http://localhost:47864/","interaxo_redirect_uri_default":"http://localhost:47864/","interaxo_client_secret_set":false}""");
+        await Until(() => client.Settings?.Providers?.Count == 2);
+        Require(client.ProviderOffered("acc") && client.ProviderOffered("streambim") && !client.ProviderOffered("interaxo"),
+            "providers without interaxo did not leave Interaxo out of the offer");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"settings","propagate_deletes":false,"max_downloads":4,"max_uploads":2,"poll_active_secs":60,"log_level":"info","start_at_login":false,"sync_root":"C:/Synka","client_id_configured":true}""");
+        await Until(() => client.Settings?.Providers is null);
+        Require(client.ProviderOffered("interaxo"), "An engine that sends no providers did not offer Interaxo as before");
+
+        pipes.Engine.Dispose();
+        await serving.WaitAsync(IoDeadline);
+        return "A status and settings without Interaxo left it out of the offer; an engine without providers offers every provider";
     }
 
     /// <summary>

@@ -270,6 +270,29 @@ public sealed class EngineClient : INotifyPropertyChanged
     }
 
     /// <summary>
+    /// True when the engine offers this provider: `settings.providers` names it. Interaxo is left out
+    /// while it is turned off (settings.json `interaxo_enabled`). An engine that does not send
+    /// `providers` (older) offers every provider, as it always did.
+    /// </summary>
+    public bool ProviderOffered(string provider)
+    {
+        var providers = _settings?.Providers;
+        if (providers is null)
+        {
+            return true;
+        }
+
+        foreach (var offered in providers)
+        {
+            if (string.Equals(offered, provider, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// The StreamBIM accounts the engine reports (one per server that is signed in or signing
     /// in), in the engine's order. Empty before the first status and from an older engine.
     /// </summary>

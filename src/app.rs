@@ -45,12 +45,32 @@ impl Ctx {
             .clone()
     }
 
-    /// True when that provider's account has a usable session. StreamBIM: any account.
+    /// Interaxo is turned on: `interaxo_enabled` in settings.json, read at start (not an IPC setting).
+    pub fn interaxo_enabled(&self) -> bool {
+        self.cfg.interaxo_enabled
+    }
+
+    /// Whether the engine offers a provider: it signs in, lists, polls and publishes it. Only Interaxo
+    /// can be off (see `interaxo_enabled`). An Interaxo session file on disk is not deleted either way.
+    pub fn offers(&self, p: Provider) -> bool {
+        p != Provider::Interaxo || self.interaxo_enabled()
+    }
+
+    /// The offered providers, in account order (`settings.providers`).
+    pub fn offered_providers(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| self.offers(*p))
+            .collect()
+    }
+
+    /// True when that provider's account has a usable session. StreamBIM: any account. An Interaxo
+    /// session counts only while Interaxo is enabled.
     pub fn signed_in(&self, p: Provider) -> bool {
         match p {
             Provider::Acc => self.auth.is_signed_in(),
             Provider::StreamBim => self.streambim.any_signed_in(),
-            Provider::Interaxo => self.interaxo.is_signed_in(),
+            Provider::Interaxo => self.interaxo_enabled() && self.interaxo.is_signed_in(),
         }
     }
 
@@ -68,7 +88,10 @@ impl Ctx {
                 .signed_in()
                 .first()
                 .and_then(|account| account.auth.user()),
-            Provider::Interaxo => self.interaxo.user(),
+            Provider::Interaxo => self
+                .interaxo_enabled()
+                .then(|| self.interaxo.user())
+                .flatten(),
         }
     }
 
@@ -260,7 +283,7 @@ pub struct SettingsView {
     pub aps_client_id: Option<String>,
     pub aps_client_id_override_supported: bool,
     pub aps_client_id_validation_supported: bool,
-    /// Every provider the engine knows, in account order.
+    /// The providers the engine offers, in account order (Interaxo only while `interaxo_enabled`).
     pub providers: Vec<&'static str>,
     /// Saved Interaxo client id (trimmed), or None.
     pub interaxo_client_id: Option<String>,

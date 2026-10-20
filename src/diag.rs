@@ -104,6 +104,7 @@ fn settings_summary(config: &crate::config::Config) -> serde_json::Value {
         "auto_update": config.auto_update,
         "update_channel_configured": !config.update_channel.trim().is_empty(),
         "desktop_sync_feed": config.desktop_sync_feed,
+        "interaxo_enabled": config.interaxo_enabled,
         "custom_sync_root": config.sync_root.is_some(),
         "client_id_configured": config.client_id_configured(),
         "client_id_source": config.client_id_source(),

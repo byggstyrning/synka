@@ -141,11 +141,10 @@
                                TextWrapping="Wrap"
                                HorizontalAlignment="Center"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                    <!-- Only when no account at all is signed in: StreamBIM and Interaxo sign in on the Konton page. -->
+                    <!-- Only when no account at all is signed in: StreamBIM (and Interaxo, when the engine offers it) sign in on the Konton page. Its text is set in code. -->
                     <Button x:Name="SignInSettingsButton"
                             Visibility="Collapsed"
                             HorizontalAlignment="Center"
-                            Content="{loc:T Sv='Logga in på StreamBIM eller Interaxo under Konton.', En='Sign in to StreamBIM or Interaxo under Accounts.'}"
                             Click="OnOpenAccounts" />
                 </StackPanel>
             </Border>

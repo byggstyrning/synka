@@ -135,7 +135,10 @@ fn run() -> anyhow::Result<()> {
 
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
     let main_thread_id = unsafe { GetCurrentThreadId() };
-    let hub = Arc::new(ipc::IpcHub::new(paths.sync_root.clone()));
+    let hub = Arc::new(ipc::IpcHub::new(
+        paths.sync_root.clone(),
+        cfg.interaxo_enabled,
+    ));
     let ui = UiSender {
         tx: ui_tx,
         main_thread_id,

@@ -227,6 +227,7 @@ jobs wait as if offline) and leaves its folders in place.
 
 ### Interaxo
 
+- **Off by default.** Interaxo is turned off unless `settings.json` has `"interaxo_enabled": true`; while it is off, `settings.providers` omits `interaxo`, the Interaxo sign-in and settings are refused, and its projects are not listed or polled (`docs/IPC.md`).
 - Hosts `https://api.interaxo.com/v1` and `https://api.interaxo.se/v1`, one token for both. A
   community lives on one host: after sign-in the engine lists `/communities` on both and
   remembers the host per community (in `meta`). A 401 from the wrong host is not a session
