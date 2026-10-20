@@ -907,6 +907,64 @@ async fn a_newer_non_acc_revision_is_not_streamed_into_an_older_placeholder() {
     );
 }
 
+/// A StreamBIM project whose API calls go to a loopback server.
+fn streambim_loopback(f: &mut Fixture, origin: &str) {
+    let mut p = f.p.clone();
+    p.provider = Provider::StreamBim;
+    p.meta = Some(json!({"region": "app", "base": origin, "project": "1552"}).to_string());
+    f.ctx.store.upsert_project(&p).unwrap();
+    f.p = p;
+    let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+    ctx.streambim_api = crate::http::Api::for_test(origin, Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn a_streambim_revision_change_refreshes_the_placeholder_and_fails_the_open() {
+    use crate::cf::{FetchDataReq, OpKeys};
+    use crate::test_support::{Fault, Server};
+    // StreamBIM answers 409 when the file's current revision is not the placeholder's.
+    let server = Server::scripted(vec![Fault::reply(409, r#"{"error":"revision"}"#)]).await;
+    let mut f = fixture("streambim-revision-409");
+    streambim_loopback(&mut f, &server.origin);
+    let mut item = row(&f.p, "d1002", Some("0"), "a.pdf", Kind::File);
+    item.remote_version = Some(6);
+    item.base_version = Some(6);
+    item.storage_urn = Some("streambim:d1002:6".into());
+    item.size = 14;
+    f.ctx.store.upsert_item(&item).unwrap();
+    let engine = Engine::new(f.ctx.clone());
+    let req = FetchDataReq {
+        keys: OpKeys {
+            connection_key: 0,
+            transfer_key: 7,
+            request_key: 0,
+            file_id: 0,
+        },
+        path: f.dir.join("a.pdf"),
+        identity: crate::cf::placeholder::encode_identity(Kind::File, f.p.pid, "d1002"),
+        file_size: 14,
+        required_offset: 0,
+        required_length: 14,
+    };
+    let err = engine
+        .stream_file(&req, f.p.pid, "d1002")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "filen har ändrats i StreamBIM, öppna den igen"
+    );
+    assert_eq!(server.count(), 1, "one download link was asked for");
+    assert!(
+        f.ctx
+            .store
+            .kv_get(&refresh_key(f.p.pid, "d1002"))
+            .unwrap()
+            .is_some(),
+        "the placeholder is scheduled for a refresh"
+    );
+}
+
 #[test]
 fn the_aps_client_id_is_held_by_acc_alone() {
     let mut f = fixture("aps-client-id-holder");

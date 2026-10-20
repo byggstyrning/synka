@@ -1886,7 +1886,19 @@ impl Engine {
             .storage_urn
             .clone()
             .ok_or_else(|| anyhow!("saknar lagringsobjekt"))?;
-        let download = remote::download_url(&self.ctx, &proj, id, &storage).await?;
+        let download = match remote::download_url(&self.ctx, &proj, id, &storage).await {
+            Ok(download) => download,
+            // StreamBIM answers 409 when the file's current revision is not the placeholder's.
+            // Refresh the placeholder, as the size check below does.
+            Err(ApiError::Status { status: 409, .. }) if proj.provider != Provider::Acc => {
+                self.refresh_soon(pid, id.to_string());
+                return Err(anyhow!(
+                    "filen har ändrats i {}, öppna den igen",
+                    proj.provider.label()
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
         if download.size > 0 && download.size != req.file_size {
             // The signed download describes a different byte length than the callback's
             // placeholder, even if the database has not caught up yet. Streaming those
