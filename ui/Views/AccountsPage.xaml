@@ -1,0 +1,375 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="Synka.Views.AccountsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tk="using:CommunityToolkit.WinUI.Controls"
+    xmlns:local="using:Synka.Views"
+    xmlns:loc="using:Synka.Views"
+    Loaded="OnLoaded"
+    Unloaded="OnUnloaded">
+
+    <!-- Text styles for the cards and dialogs, which are built in code and cannot name a theme brush directly. -->
+    <Page.Resources>
+        <Style x:Key="MutedTextStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+        <Style x:Key="CaptionMutedStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionTextBlockStyle}">
+            <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+        <Style x:Key="CaptionCautionStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionTextBlockStyle}">
+            <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCautionBrush}" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+        <Style x:Key="CaptionCriticalStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionTextBlockStyle}">
+            <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCriticalBrush}" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+        <Style x:Key="StatusSuccessStyle" TargetType="TextBlock" BasedOn="{StaticResource BodyStrongTextBlockStyle}">
+            <Setter Property="Foreground" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+        </Style>
+        <Style x:Key="StatusCautionStyle" TargetType="TextBlock" BasedOn="{StaticResource BodyStrongTextBlockStyle}">
+            <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCautionBrush}" />
+        </Style>
+        <Style x:Key="StatusMutedStyle" TargetType="TextBlock" BasedOn="{StaticResource BodyStrongTextBlockStyle}">
+            <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+        </Style>
+    </Page.Resources>
+
+    <ScrollViewer Padding="28,20"
+                  HorizontalScrollMode="Disabled"
+                  HorizontalScrollBarVisibility="Disabled"
+                  VerticalScrollBarVisibility="Auto">
+        <!-- The Grid centres the 900-wide column (see ProjectsPage). Its width is the page's own
+             width, so the WidthTrigger below folds the section headers by the page, not the window. -->
+        <Grid>
+        <StackPanel x:Name="PageColumn"
+                    Spacing="14"
+                    MaxWidth="900"
+                    HorizontalAlignment="Stretch"
+                    local:WidthTrigger.Track="True">
+            <VisualStateManager.VisualStateGroups>
+                <VisualStateGroup x:Name="FoldGroup">
+                    <VisualState x:Name="WideHeaders" />
+                    <!-- Narrow: the primary action of each section goes under its title. -->
+                    <VisualState x:Name="NarrowHeaders">
+                        <VisualState.StateTriggers>
+                            <local:WidthTrigger Below="640" />
+                        </VisualState.StateTriggers>
+                        <VisualState.Setters>
+                            <Setter Target="AccHeaderActions.(Grid.Row)" Value="1" />
+                            <Setter Target="AccHeaderActions.(Grid.Column)" Value="0" />
+                            <Setter Target="AccHeaderActions.Margin" Value="0,8,0,0" />
+                            <Setter Target="StreamBimHeaderActions.(Grid.Row)" Value="1" />
+                            <Setter Target="StreamBimHeaderActions.(Grid.Column)" Value="0" />
+                            <Setter Target="StreamBimHeaderActions.Margin" Value="0,8,0,0" />
+                            <Setter Target="InteraxoHeaderActions.(Grid.Row)" Value="1" />
+                            <Setter Target="InteraxoHeaderActions.(Grid.Column)" Value="0" />
+                            <Setter Target="InteraxoHeaderActions.Margin" Value="0,8,0,0" />
+                        </VisualState.Setters>
+                    </VisualState>
+                </VisualStateGroup>
+            </VisualStateManager.VisualStateGroups>
+
+            <TextBlock Text="{loc:T Sv='Konton', En='Accounts'}"
+                       Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock Text="{loc:T Sv='Plattformar som Synka synkar från. Här loggar du in, lägger till StreamBIM-servrar och ser vilka projekt varje konto synkar.', En='The platforms Synka syncs from. Here you sign in, add StreamBIM servers and see which projects each account syncs.'}"
+                       TextWrapping="Wrap"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            <TextBlock x:Name="SummaryText"
+                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                       TextWrapping="Wrap" />
+
+            <!-- ACC: one account, signed in through the browser. -->
+            <StackPanel Spacing="10" Margin="0,12,0,0">
+                <Grid x:Name="AccHeader" ColumnSpacing="16" RowSpacing="0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Spacing="2" VerticalAlignment="Center">
+                        <TextBlock Text="Autodesk Construction Cloud (ACC)"
+                                   Style="{StaticResource SubtitleTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{loc:T Sv='Autodesk Construction Cloud / Docs', En='Autodesk Construction Cloud / Docs'}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                    <StackPanel x:Name="AccHeaderActions"
+                                Grid.Column="1"
+                                Orientation="Horizontal"
+                                Spacing="12"
+                                VerticalAlignment="Center">
+                        <StackPanel x:Name="AccEmptyPanel" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <Border x:Name="AccEmptyBadge"
+                                    CornerRadius="4"
+                                    Padding="6,1"
+                                    BorderThickness="1"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    VerticalAlignment="Center">
+                                <TextBlock Text="{loc:T Sv='Utloggad', En='Signed out'}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </Border>
+                            <TextBlock x:Name="AccEmptyText"
+                                       VerticalAlignment="Center"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                        <Button x:Name="AccSignInButton"
+                                Content="{loc:T Sv='Logga in', En='Sign in'}"
+                                AutomationProperties.Name="{loc:T Sv='Logga in på ACC', En='Sign in to ACC'}"
+                                Click="OnAccSignIn" />
+                    </StackPanel>
+                </Grid>
+
+                <!-- The account cards are always shown: one per signed-in or signing-in account. -->
+                <StackPanel x:Name="AccCards" Spacing="8" />
+                <InfoBar x:Name="AccError"
+                         Tag="acc"
+                         Severity="Error"
+                         IsOpen="False"
+                         IsClosable="True"
+                         Closed="OnFailureClosed" />
+
+                <tk:SettingsExpander x:Name="AccAdvanced"
+                                     Visibility="Collapsed"
+                                     IsExpanded="False"
+                                     Header="{loc:T Sv='Avancerat', En='Advanced'}"
+                                     Description="{loc:T Sv='Egen Autodesk APS-app. Valfritt; Synkas standardapp räcker för de flesta.', En='Your own Autodesk APS app. Optional; the Synka default app is enough for most.'}">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE713;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard Header="{loc:T Sv='Egen APS-app', En='Your APS app'}"
+                                         Description="{loc:T Sv='Välj apptypen Desktop, Mobile, Single-Page App i Autodesk APS. Synka använder Authorization Code + PKCE.', En='Choose the Desktop, Mobile, Single-Page App type in Autodesk APS. Synka uses Authorization Code + PKCE.'}">
+                            <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
+                                <TextBlock Text="{loc:T Sv='Traditional Web App stöds inte: den kräver en client secret. Testa och spara öppnar webbläsaren och verifierar PKCE-inloggningen innan inställningen sparas.', En='Traditional Web App is not supported: it requires a client secret. Test and save opens your browser and verifies PKCE sign-in before saving the setting.'}"
+                                           TextWrapping="Wrap" />
+                                <TextBox x:Name="ApsClientIdBox"
+                                         Header="Client ID"
+                                         PlaceholderText="{loc:T Sv='Tomt använder Synkas standardapp', En='Leave blank to use the Synka default'}"
+                                         MaxLength="256"
+                                         AcceptsReturn="False"
+                                         IsSpellCheckEnabled="False"
+                                         IsTextPredictionEnabled="False"
+                                         AutomationProperties.Name="{loc:T Sv='Offentligt Autodesk APS Client ID', En='Public Autodesk APS Client ID'}"
+                                         AutomationProperties.HelpText="{loc:T Sv='Logga ut innan du ändrar appen. Ett tomt värde återställer Synkas standardapp.', En='Sign out before changing the app. A blank value restores the Synka default.'}"
+                                         TextChanged="OnApsClientIdChanged" />
+                                <TextBlock Text="{loc:T Sv='Registrera exakt denna callback-URL i APS-appen:', En='Register this exact callback URL in the APS app:'}"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Text="http://localhost:47863/"
+                                           IsTextSelectionEnabled="True"
+                                           AutomationProperties.Name="{loc:T Sv='APS callback-URL: http://localhost:47863/', En='APS callback URL: http://localhost:47863/'}" />
+                                <TextBlock Text="{loc:T Sv='Testet kontrollerar APS-inloggningen. ACC-kontots administratör kan även behöva lägga till appen som en Custom Integration. Motorn startas om om appen ändras; logga sedan in i Synka för att synka.', En='The test checks APS sign-in. The ACC account administrator may also need to add the app as a Custom Integration. The engine restarts if the app changes; then sign in to Synka to sync.'}"
+                                           TextWrapping="Wrap"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                <TextBlock x:Name="ApsClientIdStatus"
+                                           TextWrapping="Wrap"
+                                           AutomationProperties.LiveSetting="Polite"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button x:Name="ApsClientIdSaveButton"
+                                            Content="{loc:T Sv='Testa och spara', En='Test and save'}"
+                                            AutomationProperties.Name="{loc:T Sv='Testa och spara Autodesk APS Client ID', En='Test and save Autodesk APS Client ID'}"
+                                            Click="OnSaveApsClientId" />
+                                    <Button x:Name="ApsClientIdDefaultButton"
+                                            Content="{loc:T Sv='Använd Synkas standard', En='Use Synka default'}"
+                                            AutomationProperties.Name="{loc:T Sv='Återställ Synkas standardapp för Autodesk APS', En='Restore the Synka default Autodesk APS app'}"
+                                            Click="OnUseDefaultApsClientId" />
+                                    <Button x:Name="ApsClientIdCancelButton"
+                                            Visibility="Collapsed"
+                                            Content="{loc:T Sv='Avbryt test', En='Cancel test'}"
+                                            Click="OnCancelApsClientIdTest" />
+                                    <ProgressRing x:Name="ApsClientIdProgress"
+                                                  Width="16" Height="16"
+                                                  IsActive="False"
+                                                  AutomationProperties.Name="{loc:T Sv='Väntar på APS-inställningen', En='Waiting for the APS setting'}" />
+                                </StackPanel>
+                            </StackPanel>
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
+            </StackPanel>
+
+            <!-- StreamBIM: one account per server. "Lägg till server" opens the sign-in dialog. -->
+            <StackPanel Spacing="10" Margin="0,12,0,0">
+                <Grid x:Name="StreamBimHeader" ColumnSpacing="16" RowSpacing="0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Spacing="2" VerticalAlignment="Center">
+                        <TextBlock Text="StreamBIM"
+                                   Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{loc:T Sv='Lösenord och ev. kod från autentiseringsapp. Ett konto per server (region eller egen adress).', En='Password and, if needed, a code from an authenticator app. One account per server (region or your own address).'}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                    <StackPanel x:Name="StreamBimHeaderActions"
+                                Grid.Column="1"
+                                Orientation="Horizontal"
+                                Spacing="12"
+                                VerticalAlignment="Center">
+                        <StackPanel x:Name="StreamBimEmptyPanel" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <Border x:Name="StreamBimEmptyBadge"
+                                    CornerRadius="4"
+                                    Padding="6,1"
+                                    BorderThickness="1"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    VerticalAlignment="Center">
+                                <TextBlock Text="{loc:T Sv='Utloggad', En='Signed out'}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </Border>
+                            <TextBlock x:Name="StreamBimEmptyText"
+                                       VerticalAlignment="Center"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                        <Button x:Name="StreamBimAddButton"
+                                Content="{loc:T Sv='Lägg till server', En='Add server'}"
+                                AutomationProperties.Name="{loc:T Sv='Lägg till StreamBIM-server', En='Add a StreamBIM server'}"
+                                Click="OnAddStreamBimServer" />
+                    </StackPanel>
+                </Grid>
+
+                <StackPanel x:Name="StreamBimCards" Spacing="8" />
+                <InfoBar x:Name="StreamBimError"
+                         Tag="streambim"
+                         Severity="Error"
+                         IsOpen="False"
+                         IsClosable="True"
+                         Closed="OnFailureClosed" />
+                <TextBlock Text="{loc:T Sv='StreamBIM använder e-post och lösenord. Konton som bara kan logga in med SSO stöds inte ännu.', En='StreamBIM uses e-mail and password. Accounts that can only sign in with SSO are not supported yet.'}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </StackPanel>
+
+            <!-- Interaxo: the client id is the organisation's own; the client settings are under Avancerat. -->
+            <StackPanel Spacing="10" Margin="0,12,0,0">
+                <Grid x:Name="InteraxoHeader" ColumnSpacing="16" RowSpacing="0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Spacing="2" VerticalAlignment="Center">
+                        <TextBlock Text="Interaxo"
+                                   Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{loc:T Sv='Logga in med organisationens egen Client ID.', En='Sign in with the Client ID of your organisation.'}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                    <StackPanel x:Name="InteraxoHeaderActions"
+                                Grid.Column="1"
+                                Orientation="Horizontal"
+                                Spacing="12"
+                                VerticalAlignment="Center">
+                        <StackPanel x:Name="InteraxoEmptyPanel" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <Border x:Name="InteraxoEmptyBadge"
+                                    CornerRadius="4"
+                                    Padding="6,1"
+                                    BorderThickness="1"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    VerticalAlignment="Center">
+                                <TextBlock Text="{loc:T Sv='Utloggad', En='Signed out'}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </Border>
+                            <TextBlock x:Name="InteraxoEmptyText"
+                                       VerticalAlignment="Center"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                        <TextBlock x:Name="InteraxoHint"
+                                   VerticalAlignment="Center"
+                                   TextWrapping="Wrap"
+                                   Text="{loc:T Sv='Ange Client ID under Avancerat först.', En='Enter the Client ID under Advanced first.'}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                        <Button x:Name="InteraxoSignInButton"
+                                Content="{loc:T Sv='Logga in', En='Sign in'}"
+                                AutomationProperties.Name="{loc:T Sv='Logga in på Interaxo', En='Sign in to Interaxo'}"
+                                Click="OnInteraxoSignIn" />
+                    </StackPanel>
+                </Grid>
+
+                <StackPanel x:Name="InteraxoCards" Spacing="8" />
+                <InfoBar x:Name="InteraxoError"
+                         Tag="interaxo"
+                         Severity="Error"
+                         IsOpen="False"
+                         IsClosable="True"
+                         Closed="OnFailureClosed" />
+
+                <!-- The client settings: editable only while Interaxo is signed out (docs\IPC.md). -->
+                <tk:SettingsExpander x:Name="InteraxoAdvanced"
+                                     IsExpanded="False"
+                                     Header="{loc:T Sv='Avancerat', En='Advanced'}"
+                                     Description="{loc:T Sv='Egen Interaxo-klient: Client ID, redirect-URI och valfri hemlighet.', En='Your own Interaxo client: Client ID, redirect URI and an optional secret.'}">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE713;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard x:Name="InteraxoClientCard"
+                                         Header="{loc:T Sv='Egen Interaxo-klient', En='Your Interaxo client'}"
+                                         Description="{loc:T Sv='Be Interaxo support om en Native-klient (Authorization Code + PKCE med refresh token) och registrera exakt den här redirect-URI:n.', En='Ask Interaxo support for a Native client (Authorization Code + PKCE with a refresh token) and register exactly this redirect URI.'}">
+                            <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
+                                <TextBox x:Name="InteraxoClientIdBox"
+                                         Header="Client ID"
+                                         PlaceholderText="{loc:T Sv='Client ID från Interaxo', En='Client ID from Interaxo'}"
+                                         MaxLength="256"
+                                         AcceptsReturn="False"
+                                         IsSpellCheckEnabled="False"
+                                         IsTextPredictionEnabled="False"
+                                         TextChanged="OnInteraxoFieldChanged"
+                                         AutomationProperties.Name="{loc:T Sv='Interaxo Client ID', En='Interaxo Client ID'}" />
+                                <TextBox x:Name="InteraxoRedirectBox"
+                                         Header="Redirect URI"
+                                         MaxLength="512"
+                                         AcceptsReturn="False"
+                                         IsSpellCheckEnabled="False"
+                                         IsTextPredictionEnabled="False"
+                                         TextChanged="OnInteraxoFieldChanged"
+                                         AutomationProperties.Name="{loc:T Sv='Interaxo redirect-URI', En='Interaxo redirect URI'}" />
+                                <PasswordBox x:Name="InteraxoSecretBox"
+                                             Header="{loc:T Sv='Client secret (valfritt)', En='Client secret (optional)'}"
+                                             AutomationProperties.Name="{loc:T Sv='Interaxo client secret', En='Interaxo client secret'}" />
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button x:Name="InteraxoSaveButton"
+                                            Content="{loc:T Sv='Spara', En='Save'}"
+                                            AutomationProperties.Name="{loc:T Sv='Spara Interaxo-inställningarna', En='Save the Interaxo settings'}"
+                                            Click="OnSaveInteraxo" />
+                                    <Button x:Name="InteraxoClearSecretButton"
+                                            Visibility="Collapsed"
+                                            Content="{loc:T Sv='Ta bort', En='Remove'}"
+                                            AutomationProperties.Name="{loc:T Sv='Ta bort den sparade Interaxo-hemligheten', En='Remove the saved Interaxo secret'}"
+                                            Click="OnClearInteraxoSecret" />
+                                </StackPanel>
+                            </StackPanel>
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
+            </StackPanel>
+        </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

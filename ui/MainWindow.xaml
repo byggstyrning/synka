@@ -74,6 +74,12 @@
                     </NavigationViewItem.Icon>
                 </NavigationViewItem>
 
+                <NavigationViewItem x:Name="AccountsNavItem" Tag="accounts">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE716;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+
                 <NavigationViewItem x:Name="ActivityNavItem" Tag="activity">
                     <NavigationViewItem.Icon>
                         <FontIcon Glyph="&#xE81C;" />

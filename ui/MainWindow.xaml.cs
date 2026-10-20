@@ -22,6 +22,9 @@ public sealed partial class MainWindow : Window
 
     public const string ProjectsTag = "projects";
 
+    /// <summary>Konton: every account, its server and its projects, and the sign-in of each platform.</summary>
+    public const string AccountsTag = "accounts";
+
     public const string ActivityTag = "activity";
 
     public const string AboutTag = "about";
@@ -57,6 +60,12 @@ public sealed partial class MainWindow : Window
 
     /// <summary>The open window. The settings page reaches the theme through it.</summary>
     public static MainWindow? Instance { get; private set; }
+
+    /// <summary>The parameter of the page on screen (the Projects filter), kept so a language change shows the same page.</summary>
+    private object? _pageParameter;
+
+    /// <summary>The parameter of a <see cref="NavigateTo"/> call, read by the selection change that call raises.</summary>
+    private object? _pendingParameter;
 
     public MainWindow()
     {
@@ -856,6 +865,11 @@ public sealed partial class MainWindow : Window
             "Välj vilka projekt som ska synkas till datorn.",
             "Choose which projects are synced to this computer."));
 
+        AccountsNavItem.Content = Lang.T("Konton", "Accounts");
+        ToolTipService.SetToolTip(AccountsNavItem, Lang.T(
+            "Logga in på ACC, StreamBIM och Interaxo och se vilka projekt varje konto synkar.",
+            "Sign in to ACC, StreamBIM and Interaxo, and see which projects each account syncs."));
+
         ActivityNavItem.Content = Lang.T("Aktivitet", "Activity");
         ToolTipService.SetToolTip(ActivityNavItem, Lang.T(
             "Det senaste som hänt i synken.",
@@ -910,7 +924,7 @@ public sealed partial class MainWindow : Window
         _frame = fresh;
         if (page is not null)
         {
-            _frame.Navigate(page);
+            _frame.Navigate(page, _pageParameter);
         }
     }
 
@@ -1050,9 +1064,10 @@ public sealed partial class MainWindow : Window
     /// <summary>
     /// Shows a page by its tag, the way a click in the navigation would: the
     /// selection moves with it, so the pane never points at another page than the
-    /// one shown. Used by the pages' own links (Visa aktivitet, Välj projekt).
+    /// one shown. Used by the pages' own links (Visa aktivitet, Välj projekt, Visa projekt).
+    /// The parameter goes to the page (the Projects page takes a <see cref="ProjectsFilter"/>).
     /// </summary>
-    public void NavigateTo(string tag)
+    public void NavigateTo(string tag, object? parameter = null)
     {
         if (tag == SettingsTag)
         {
@@ -1076,6 +1091,7 @@ public sealed partial class MainWindow : Window
         {
             OverviewTag => OverviewNavItem,
             ProjectsTag => ProjectsNavItem,
+            AccountsTag => AccountsNavItem,
             ActivityTag => ActivityNavItem,
             AboutTag => AboutNavItem,
             _ => null,
@@ -1088,12 +1104,20 @@ public sealed partial class MainWindow : Window
 
         if (ReferenceEquals(Navigation.SelectedItem, item))
         {
-            Go(PageFor(tag));
+            Go(PageFor(tag), parameter);
         }
         else
         {
-            // Raises SelectionChanged, which navigates.
-            Navigation.SelectedItem = item;
+            // Raises SelectionChanged synchronously, which navigates with _pendingParameter.
+            _pendingParameter = parameter;
+            try
+            {
+                Navigation.SelectedItem = item;
+            }
+            finally
+            {
+                _pendingParameter = null;
+            }
         }
     }
 
@@ -1113,7 +1137,7 @@ public sealed partial class MainWindow : Window
 
         if (args.SelectedItem is NavigationViewItem { Tag: string tag } && PageFor(tag) is { } page)
         {
-            Go(page);
+            Go(page, _pendingParameter);
         }
     }
 
@@ -1121,17 +1145,29 @@ public sealed partial class MainWindow : Window
     {
         OverviewTag => typeof(OverviewPage),
         ProjectsTag => typeof(ProjectsPage),
+        AccountsTag => typeof(AccountsPage),
         ActivityTag => typeof(ActivityPage),
         AboutTag => typeof(AboutPage),
         _ => null,
     };
 
-    /// <summary>A navigation to the page already shown adds nothing and is skipped.</summary>
-    private void Go(Type? page)
+    /// <summary>
+    /// A navigation to the page already shown, without a parameter, adds nothing and is skipped.
+    /// A parameter (or a page that was shown with one) is always navigated, so the page takes it.
+    /// </summary>
+    private void Go(Type? page, object? parameter = null)
     {
-        if (page is not null && _frame.CurrentSourcePageType != page)
+        if (page is null)
         {
-            _frame.Navigate(page);
+            return;
         }
+
+        if (parameter is null && _pageParameter is null && _frame.CurrentSourcePageType == page)
+        {
+            return;
+        }
+
+        _pageParameter = parameter;
+        _frame.Navigate(page, parameter);
     }
 }

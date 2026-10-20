@@ -249,7 +249,7 @@ public sealed partial class OverviewPage : Page
         StartEngineButton.Visibility = canStart ? Visibility.Visible : Visibility.Collapsed;
 
         // Shown while nothing is signed in (ACC is then the account to sign in). Another
-        // provider signed in: the card stays hidden, and Settings has the rest.
+        // provider signed in: the card stays hidden, and the Konton page has the rest.
         var noAccount = connected && status is { SignedIn: false };
         SignInCard.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
         SignInSettingsButton.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
@@ -683,9 +683,9 @@ public sealed partial class OverviewPage : Page
         MainWindow.Instance?.NavigateTo(MainWindow.ProjectsTag);
     }
 
-    private void OnOpenAccountSettings(object sender, RoutedEventArgs e)
+    private void OnOpenAccounts(object sender, RoutedEventArgs e)
     {
-        MainWindow.Instance?.NavigateTo(MainWindow.SettingsTag);
+        MainWindow.Instance?.NavigateTo(MainWindow.AccountsTag);
     }
 
     /// <summary>A refused command goes to the window's message bar with the engine's reason.</summary>

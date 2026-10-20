@@ -12,8 +12,16 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Navigation;
 
 namespace Synka.Views;
+
+/// <summary>
+/// The Projects page opened for one account only (Konton's "Visa projekt"): the hubs in
+/// <paramref name="HubIds"/> are shown and the rest hidden. <paramref name="Label"/> names
+/// the account in the bar that says so.
+/// </summary>
+public sealed record ProjectsFilter(IReadOnlyList<string> HubIds, string Label);
 
 public sealed partial class ProjectsPage : Page
 {
@@ -94,6 +102,9 @@ public sealed partial class ProjectsPage : Page
 
     private string _filter = string.Empty;
 
+    /// <summary>The account filter the page was opened with (Konton's "Visa projekt"). Null shows every hub.</summary>
+    private ProjectsFilter? _accountFilter;
+
     /// <summary>True while the page writes the engine's state into the switches, so Toggled is not taken for the user.</summary>
     private bool _mirroring;
 
@@ -121,6 +132,18 @@ public sealed partial class ProjectsPage : Page
     }
 
     private static EngineClient Engine => EngineClient.Instance;
+
+    /// <summary>The navigation's parameter: an account filter, or nothing for every hub.</summary>
+    protected override void OnNavigatedTo(NavigationEventArgs e)
+    {
+        base.OnNavigatedTo(e);
+        _accountFilter = e.Parameter as ProjectsFilter;
+        ShowAccountFilterBar();
+        if (IsLoaded)
+        {
+            Update();
+        }
+    }
 
     private static string Key(string hubId, string projectId) => hubId + "/" + projectId;
 
@@ -492,6 +515,41 @@ public sealed partial class ProjectsPage : Page
         }
     }
 
+    // -------------------------------------------------------- account filter
+
+    /// <summary>The bar that says the page shows one account's hubs. Hidden when there is no account filter.</summary>
+    private void ShowAccountFilterBar()
+    {
+        if (_accountFilter is { } filter)
+        {
+            HubFilterBar.Message = Lang.T(
+                $"Visar projekt för {filter.Label}",
+                $"Showing projects for {filter.Label}");
+            HubFilterBar.IsOpen = true;
+        }
+        else
+        {
+            HubFilterBar.IsOpen = false;
+        }
+    }
+
+    /// <summary>Closing the bar or Visa alla drops the account filter: every hub shows again.</summary>
+    private void OnHubFilterClosed(InfoBar sender, InfoBarClosedEventArgs args) => ClearAccountFilter();
+
+    private void OnShowAllHubs(object sender, RoutedEventArgs args) => ClearAccountFilter();
+
+    private void ClearAccountFilter()
+    {
+        if (_accountFilter is null)
+        {
+            return;
+        }
+
+        _accountFilter = null;
+        ShowAccountFilterBar();
+        Update();
+    }
+
     private void ShowError(string? message, string fallback)
     {
         ErrorBar.Message = string.IsNullOrWhiteSpace(message) ? fallback : message;
@@ -566,6 +624,12 @@ public sealed partial class ProjectsPage : Page
                 continue;
             }
 
+            // With an account filter only that account's hubs are shown (Konton's "Visa projekt").
+            if (_accountFilter is { } accountFilter && !accountFilter.HubIds.Contains(hub.Id, StringComparer.Ordinal))
+            {
+                continue;
+            }
+
             var all =(hub.Projects ?? new List<ProjectInfo>()).Where(p => p is not null).ToList();
 
             // A hub that matches shows all its projects; otherwise only the matching ones.
@@ -582,7 +646,7 @@ public sealed partial class ProjectsPage : Page
         var layout = string.Join("\n", shown.Select(s => s.Hub.Id + ":" + string.Join(",", s.Visible.Select(p => p.Id))));
         if (layout != _layout)
         {
-            BuildLayout(shown, filter.Length > 0);
+            BuildLayout(shown, filter.Length > 0 || _accountFilter is not null);
             _layout = layout;
         }
 
@@ -895,13 +959,19 @@ public sealed partial class ProjectsPage : Page
         else if (!Engine.IsSignedIn)
         {
             text = Lang.T(
-                "Logga in på ACC, StreamBIM eller Interaxo under Inställningar → Konton.",
-                "Sign in to ACC, StreamBIM or Interaxo under Settings → Accounts.");
+                "Logga in på ACC, StreamBIM eller Interaxo under Konton.",
+                "Sign in to ACC, StreamBIM or Interaxo under Accounts.");
             signIn = true;
         }
         else if (filtered)
         {
             text = Lang.T("Inget matchar filtret.", "Nothing matches the filter.");
+        }
+        else if (_accountFilter is not null && !loading)
+        {
+            text = Lang.T(
+                $"Inga projekt hittades för {_accountFilter.Label}. Tryck på Uppdatera för att hämta dem från molnet.",
+                $"No projects found for {_accountFilter.Label}. Press Refresh to fetch them from the cloud.");
         }
         else if (loading)
         {
@@ -920,7 +990,7 @@ public sealed partial class ProjectsPage : Page
         EmptySpinner.IsActive = spin;
         EmptySpinner.Visibility = spin ? Visibility.Visible : Visibility.Collapsed;
         EmptySignInButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
-        EmptySettingsButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
+        EmptyAccountsButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
         EmptyPanel.Visibility = Visibility.Visible;
     }
 
@@ -939,9 +1009,9 @@ public sealed partial class ProjectsPage : Page
         return starts ? name : $"{label} · {name}";
     }
 
-    private void OnOpenSettings(object sender, RoutedEventArgs e)
+    private void OnOpenAccounts(object sender, RoutedEventArgs e)
     {
-        MainWindow.Instance?.NavigateTo(MainWindow.SettingsTag);
+        MainWindow.Instance?.NavigateTo(MainWindow.AccountsTag);
     }
 
     /// <summary>
