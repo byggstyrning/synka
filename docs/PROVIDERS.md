@@ -58,8 +58,12 @@ impl Provider {
 | Provider | `meta` |
 |---|---|
 | ACC | `null` |
-| StreamBIM | `{"region":"app","host":"app.streambim.com","project":"1552"}` |
-| Interaxo | `{"host":"api.interaxo.se","community":"example-corp","room":"my-room","root":"<uuid>"}` |
+| StreamBIM | `{"region":"app","base":"https://app.streambim.com","project":"1552"}` |
+| Interaxo | `{"base":"https://api.interaxo.se/v1","community":"example-corp","room":"my-room","root":"<uuid>"}` |
+
+`base` is the API origin every request of that project goes to (tests point it at a loopback
+server). Interaxo hubs carry the same `base` in `HubInfo.region`; StreamBIM hubs carry the
+region subdomain there.
 
 ## Versions and content handles
 

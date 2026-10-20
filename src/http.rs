@@ -328,6 +328,45 @@ impl Api {
         }
     }
 
+    /// The current bearer token of this API's account (refreshed when close to expiry).
+    #[allow(dead_code)] // used by the StreamBIM and Interaxo clients
+    pub async fn bearer(&self) -> Result<String, ApiError> {
+        self.source.access_token().await.map_err(ApiError::Auth)
+    }
+
+    /// One authenticated request whose body the caller builds (multipart form, file
+    /// stream). `build` gets the transfer client (no automatic decompression) and returns
+    /// the request without credentials; the bearer header is added here. Never retried,
+    /// because a streamed body cannot be replayed, except that a 401 refreshes the token
+    /// once and calls `build` again. Non-2xx becomes `ApiError::Status`.
+    #[allow(dead_code)] // used by the StreamBIM and Interaxo clients
+    pub(crate) async fn send_custom<F>(&self, build: F) -> Result<reqwest::Response, ApiError>
+    where
+        F: Fn(&reqwest::Client) -> Result<reqwest::RequestBuilder, ApiError>,
+    {
+        let mut reauthed = false;
+        loop {
+            let token = self.bearer().await?;
+            let resp = build(&self.transfer_client)?
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp);
+            }
+            if status == StatusCode::UNAUTHORIZED && !reauthed {
+                reauthed = true;
+                self.source.invalidate().await;
+                continue;
+            }
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                body: error_body(resp).await,
+            });
+        }
+    }
+
     /// `request` + deserialize JSON (any content type).
     pub async fn json<T: DeserializeOwned>(
         &self,
