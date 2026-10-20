@@ -43,7 +43,7 @@
                 <Button x:Name="RefreshButton"
                         Grid.Column="1"
                         Click="OnRefresh"
-                        AutomationProperties.Name="{loc:T Sv='Uppdatera projektlistan från ACC', En='Refresh the project list from ACC'}">
+                        AutomationProperties.Name="{loc:T Sv='Uppdatera projektlistan från molnet', En='Refresh the project list from the cloud'}">
                     <Button.KeyboardAccelerators>
                         <KeyboardAccelerator Key="F5" />
                     </Button.KeyboardAccelerators>
@@ -90,6 +90,12 @@
                         Style="{StaticResource AccentButtonStyle}"
                         Content="{loc:T Sv='Logga in med Autodesk', En='Sign in with Autodesk'}"
                         Click="OnSignIn" />
+                <!-- Signing in to StreamBIM or Interaxo happens in Settings, under Konton. -->
+                <Button x:Name="EmptySettingsButton"
+                        Visibility="Collapsed"
+                        HorizontalAlignment="Center"
+                        Content="{loc:T Sv='Öppna Inställningar', En='Open Settings'}"
+                        Click="OnOpenSettings" />
             </StackPanel>
 
             <!-- One SettingsExpander per hub is built in code. The cards are updated in

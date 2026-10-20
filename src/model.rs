@@ -80,6 +80,46 @@ pub struct TopFolder {
     pub name: String,
 }
 
+/// The platform a hub, project and its files come from. Serialized as "acc", "streambim" or
+/// "interaxo" (see docs/PROVIDERS.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Acc,
+    #[serde(rename = "streambim")]
+    StreamBim,
+    Interaxo,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 3] = [Provider::Acc, Provider::StreamBim, Provider::Interaxo];
+
+    /// Stable name used in the database and on the IPC wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Acc => "acc",
+            Provider::StreamBim => "streambim",
+            Provider::Interaxo => "interaxo",
+        }
+    }
+
+    /// Inverse of `as_str` (exact match).
+    pub fn parse(s: &str) -> Option<Provider> {
+        Provider::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+
+    /// Name shown to the user (the UI shows it from the next step on).
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Acc => "ACC",
+            Provider::StreamBim => "StreamBIM",
+            Provider::Interaxo => "Interaxo",
+        }
+    }
+}
+
 /// A subscribed (synced) project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -106,6 +146,12 @@ pub struct Project {
     pub cursor: Option<String>,
     pub enabled: bool,
     pub last_sync_ms: Option<i64>,
+    /// Which platform this project comes from (`acc` for every project before schema v4).
+    #[serde(default)]
+    pub provider: Provider,
+    /// Provider-specific JSON (region, host, community...). None for ACC.
+    #[serde(default)]
+    pub meta: Option<String>,
 }
 
 impl Project {
@@ -231,6 +277,8 @@ pub struct HubInfo {
     pub id: String,
     pub name: String,
     pub region: Option<String>,
+    #[serde(default)]
+    pub provider: Provider,
 }
 
 /// Project as listed by project/v1.
@@ -241,6 +289,10 @@ pub struct ProjectInfo {
     pub name: String,
     pub root_folder_urn: Option<String>,
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub provider: Provider,
+    #[serde(default)]
+    pub meta: Option<String>,
 }
 
 /// Return the id suffix of a folder or lineage URN (text after the last ':' that precedes
@@ -296,6 +348,59 @@ mod tests {
             parse_storage_urn("urn:adsk.objects:os.object:wip.dm.emea.2/abc-def.rvt"),
             Some(("wip.dm.emea.2", "abc-def.rvt"))
         );
+    }
+
+    #[test]
+    fn provider_names_round_trip() {
+        assert_eq!(Provider::default(), Provider::Acc);
+        assert_eq!(Provider::ALL.len(), 3);
+        for p in Provider::ALL {
+            assert_eq!(Provider::parse(p.as_str()), Some(p));
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.as_str()));
+            assert_eq!(serde_json::from_str::<Provider>(&json).unwrap(), p);
+        }
+        assert_eq!(Provider::StreamBim.as_str(), "streambim");
+        assert_eq!(Provider::parse("StreamBIM"), None, "names are exact");
+        assert_eq!(Provider::parse(""), None);
+        assert_eq!(Provider::Acc.label(), "ACC");
+        assert_eq!(Provider::StreamBim.label(), "StreamBIM");
+        assert_eq!(Provider::Interaxo.label(), "Interaxo");
+    }
+
+    #[test]
+    fn projects_from_before_providers_parse_as_acc() {
+        let project = Project {
+            pid: 3,
+            hub_id: "b.h".into(),
+            hub_name: "Hub".into(),
+            project_id: "b.p".into(),
+            name: "Proj".into(),
+            root_folder_urn: "urn:adsk.wipemea:fs.folder:co.R".into(),
+            urn_ns: "wipemea".into(),
+            tops: vec![],
+            oss_scopes: None,
+            change_source: ChangeSourceKind::Unknown,
+            cursor: None,
+            enabled: true,
+            last_sync_ms: None,
+            provider: Provider::Acc,
+            meta: None,
+        };
+        let mut value = serde_json::to_value(&project).unwrap();
+        value.as_object_mut().unwrap().remove("provider");
+        value.as_object_mut().unwrap().remove("meta");
+        let old: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(old.provider, Provider::Acc);
+        assert_eq!(old.meta, None);
+
+        let mut streambim = project.clone();
+        streambim.provider = Provider::StreamBim;
+        streambim.meta = Some(r#"{"region":"app"}"#.into());
+        let back: Project =
+            serde_json::from_value(serde_json::to_value(&streambim).unwrap()).unwrap();
+        assert_eq!(back.provider, Provider::StreamBim);
+        assert_eq!(back.meta, streambim.meta);
     }
 
     #[test]

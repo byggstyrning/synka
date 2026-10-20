@@ -186,6 +186,11 @@ public sealed class EngineClient : INotifyPropertyChanged
     private ProjectsInfo? _projects;
     private SettingsInfo? _settings;
     private UpdateInfo? _update;
+    private StreamBimRegionsInfo? _streamBimRegions;
+
+    /// <summary>The latest sign_in_progress per provider (UI thread). Kept so a page that opens mid-sign-in can catch up.</summary>
+    private readonly Dictionary<string, SignInProgressInfo> _signInProgress = new();
+
     private bool _isFreeingUp;
     private int _freeUpGeneration;
 
@@ -197,6 +202,15 @@ public sealed class EngineClient : INotifyPropertyChanged
 
     /// <summary>Raised for every `notify` message from the engine.</summary>
     public event EventHandler<NotifyInfo>? Notified;
+
+    /// <summary>
+    /// Raised for every `sign_in_progress` message (on the UI thread). The state is also
+    /// kept per provider, see <see cref="SignInProgressFor"/>.
+    /// </summary>
+    public event Action<SignInProgressInfo>? SignInProgress;
+
+    /// <summary>Raised when the engine sends the StreamBIM region list (on the UI thread).</summary>
+    public event Action<StreamBimRegionsInfo>? StreamBimRegionsChanged;
 
     internal ApsClientIdEditState ApsClientIdEdit { get; } = new();
 
@@ -211,8 +225,53 @@ public sealed class EngineClient : INotifyPropertyChanged
     /// <summary>The engine's last status message.</summary>
     public StatusInfo? Status => _status;
 
-    /// <summary>Connected, and the engine has an account. The commands that need ACC wait for this.</summary>
+    /// <summary>
+    /// Connected, and at least one provider has an account (docs\IPC.md: `signed_in` is true
+    /// when any provider is signed in). The commands that need an account wait for this.
+    /// </summary>
     public bool IsSignedIn => _isConnected && _status is { SignedIn: true };
+
+    /// <summary>
+    /// Every provider's account as the engine last reported it (`acc`, `streambim`,
+    /// `interaxo`). Empty before the first status, and from an engine without `accounts`.
+    /// </summary>
+    public IReadOnlyList<AccountInfo> Accounts => _status?.Accounts ?? Array.Empty<AccountInfo>();
+
+    /// <summary>
+    /// The account of one provider, or null when the engine does not report it. An engine
+    /// without `accounts` (older) reports ACC only, from `signed_in` and `user`.
+    /// </summary>
+    public AccountInfo? AccountFor(string provider)
+    {
+        var status = _status;
+        if (status is null)
+        {
+            return null;
+        }
+
+        if (status.Accounts is { } accounts)
+        {
+            foreach (var account in accounts)
+            {
+                if (account is not null && string.Equals(account.Provider, provider, StringComparison.Ordinal))
+                {
+                    return account;
+                }
+            }
+            return null;
+        }
+
+        return provider == "acc"
+            ? new AccountInfo("acc", "ACC", true, status.SignedIn, false, status.User, null)
+            : null;
+    }
+
+    /// <summary>The latest sign_in_progress for a provider, or null when none has come since the window started.</summary>
+    public SignInProgressInfo? SignInProgressFor(string provider) =>
+        _signInProgress.TryGetValue(provider, out var progress) ? progress : null;
+
+    /// <summary>The StreamBIM regions the engine last sent, or null before the first list.</summary>
+    public StreamBimRegionsInfo? StreamBimRegions => _streamBimRegions;
 
     /// <summary>True until this window's free-up request finishes or its answer expires.</summary>
     public bool IsFreeingUp
@@ -849,6 +908,36 @@ public sealed class EngineClient : INotifyPropertyChanged
                 break;
             }
 
+            case "sign_in_progress":
+            {
+                // docs\IPC.md: the progress of a sign-in. Nothing a password could be in: the
+                // message carries only the provider, the state and the engine's Swedish error text.
+                var progress = JsonSerializer.Deserialize(line, EngineJsonContext.Default.SignInProgressInfo);
+                if (progress is not null && !string.IsNullOrEmpty(progress.Provider))
+                {
+                    Post(() =>
+                    {
+                        _signInProgress[progress.Provider] = progress;
+                        SignInProgress?.Invoke(progress);
+                    });
+                }
+                break;
+            }
+
+            case "streambim_regions":
+            {
+                var regions = JsonSerializer.Deserialize(line, EngineJsonContext.Default.StreamBimRegionsInfo);
+                if (regions is not null)
+                {
+                    Post(() =>
+                    {
+                        _streamBimRegions = regions;
+                        StreamBimRegionsChanged?.Invoke(regions);
+                    });
+                }
+                break;
+            }
+
             case "activity":
             {
                 // The whole list: on `hello`, and again when the window fell behind.
@@ -980,9 +1069,48 @@ public sealed class EngineClient : INotifyPropertyChanged
 
     // ------------------------------------------------------- convenience API
 
-    public Task<Ack> SignInAsync() => SendAsync("sign_in");
+    /// <summary>
+    /// Starts a browser sign-in: ACC (default) or Interaxo. The result comes as
+    /// `sign_in_progress` and then `status`. StreamBIM has its own overload with credentials.
+    /// </summary>
+    public Task<Ack> SignInAsync(string provider = "acc") =>
+        SendAsync("sign_in", new Dictionary<string, object?> { ["provider"] = provider });
 
-    public Task<Ack> SignOutAsync() => SendAsync("sign_out");
+    /// <summary>
+    /// Starts a StreamBIM sign-in with region (subdomain), e-mail and password. The password
+    /// is only handed to the command: it is not kept in a field, logged or echoed back here.
+    /// The caller clears its own copy of the password box. A StreamBIM account that asks
+    /// for an MFA code reports `mfa_required` in <see cref="SignInProgress"/>.
+    /// </summary>
+    public Task<Ack> SignInStreamBimAsync(string region, string username, string password) =>
+        SendAsync("sign_in", new Dictionary<string, object?>
+        {
+            ["provider"] = "streambim",
+            ["region"] = region,
+            ["username"] = username,
+            ["password"] = password,
+        });
+
+    /// <summary>Sends the six-digit code the user typed for a StreamBIM sign-in that is waiting for MFA.</summary>
+    public Task<Ack> SignInMfaAsync(string provider, string code) =>
+        SendAsync("sign_in_mfa", new Dictionary<string, object?>
+        {
+            ["provider"] = provider,
+            ["code"] = code,
+        });
+
+    /// <summary>Cancels a pending browser sign-in or MFA wait for one provider.</summary>
+    public Task<Ack> CancelSignInAsync(string provider) =>
+        SendAsync("cancel_sign_in", new Dictionary<string, object?> { ["provider"] = provider });
+
+    /// <summary>Signs out of one provider, or of every provider when none is given.</summary>
+    public Task<Ack> SignOutAsync(string? provider = null) =>
+        provider is null
+            ? SendAsync("sign_out")
+            : SendAsync("sign_out", new Dictionary<string, object?> { ["provider"] = provider });
+
+    /// <summary>Asks the engine for the StreamBIM region list. The answer is <see cref="StreamBimRegionsChanged"/>.</summary>
+    public Task<Ack> RequestStreamBimRegionsAsync() => SendAsync("streambim_regions");
 
     public Task<Ack> SyncNowAsync() => SendAsync("sync_now");
 

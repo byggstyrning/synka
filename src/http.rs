@@ -12,6 +12,7 @@
 //! - Log at debug: method, path (no query), status, elapsed ms. Never log bodies or tokens.
 
 use crate::auth::Auth;
+use crate::streambim_auth::StreamBimAuth;
 use chrono::{DateTime, Utc};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::StatusCode;
@@ -38,6 +39,14 @@ pub enum ApiError {
     Auth(anyhow::Error),
     #[error("decode: {0}")]
     Decode(String),
+    /// The provider's API does not offer this operation. The text is user-facing (Swedish).
+    /// Not a transient or offline failure: retrying does not help.
+    #[error("{0}")]
+    Unsupported(String),
+    /// A user-facing engine message that is not a decode failure (shown bare, no prefix).
+    /// Not a transient or offline failure: the same request fails the same way.
+    #[error("{0}")]
+    Message(String),
 }
 
 impl ApiError {
@@ -45,6 +54,32 @@ impl ApiError {
         match self {
             ApiError::Status { status, .. } => Some(*status),
             _ => None,
+        }
+    }
+}
+
+/// Where an `Api` gets its bearer token.
+#[derive(Clone)]
+pub enum TokenSource {
+    /// OAuth Authorization Code + PKCE (APS, Interaxo)
+    Aps(Arc<Auth>),
+    /// StreamBIM's own sign-in (region, e-mail, password, optional MFA code).
+    StreamBim(Arc<StreamBimAuth>),
+}
+
+impl TokenSource {
+    pub async fn access_token(&self) -> anyhow::Result<String> {
+        match self {
+            TokenSource::Aps(auth) => auth.access_token().await,
+            TokenSource::StreamBim(auth) => auth.access_token().await,
+        }
+    }
+
+    /// Force a refresh on the next `access_token()` (used after a 401).
+    pub async fn invalidate(&self) {
+        match self {
+            TokenSource::Aps(auth) => auth.invalidate().await,
+            TokenSource::StreamBim(auth) => auth.invalidate().await,
         }
     }
 }
@@ -61,7 +96,7 @@ pub enum Body {
 pub struct Api {
     client: reqwest::Client,
     transfer_client: reqwest::Client,
-    auth: Arc<Auth>,
+    source: TokenSource,
     #[cfg(test)]
     test_policy: Option<TestPolicy>,
 }
@@ -102,11 +137,17 @@ fn build_transfer_client() -> reqwest::Client {
 }
 
 impl Api {
+    /// An API authenticated with the OAuth (APS) session of `auth`.
     pub fn new(client: reqwest::Client, auth: Arc<Auth>) -> Api {
+        Api::with_source(client, TokenSource::Aps(auth))
+    }
+
+    /// An API that takes its bearer token from `source`.
+    pub fn with_source(client: reqwest::Client, source: TokenSource) -> Api {
         Api {
             client,
             transfer_client: build_transfer_client(),
-            auth,
+            source,
             #[cfg(test)]
             test_policy: None,
         }
@@ -139,7 +180,7 @@ impl Api {
         Self {
             client,
             transfer_client,
-            auth,
+            source: TokenSource::Aps(auth),
             test_policy: Some(TestPolicy {
                 origin: origin.to_string(),
                 timeout,
@@ -209,7 +250,7 @@ impl Api {
         let mut retries = 0u32;
         let mut reauthed = false;
         loop {
-            let token = self.auth.access_token().await.map_err(ApiError::Auth)?;
+            let token = self.source.access_token().await.map_err(ApiError::Auth)?;
             let mut rb = self
                 .client
                 .request(method.clone(), &full)
@@ -261,7 +302,7 @@ impl Api {
             }
             if status == StatusCode::UNAUTHORIZED && !reauthed {
                 reauthed = true;
-                self.auth.invalidate().await;
+                self.source.invalidate().await;
                 continue;
             }
             if retryable(status)
@@ -280,6 +321,45 @@ impl Api {
                 continue;
             }
 
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                body: error_body(resp).await,
+            });
+        }
+    }
+
+    /// The current bearer token of this API's account (refreshed when close to expiry).
+    #[allow(dead_code)] // used by the StreamBIM and Interaxo clients
+    pub async fn bearer(&self) -> Result<String, ApiError> {
+        self.source.access_token().await.map_err(ApiError::Auth)
+    }
+
+    /// One authenticated request whose body the caller builds (multipart form, file
+    /// stream). `build` gets the transfer client (no automatic decompression) and returns
+    /// the request without credentials; the bearer header is added here. Never retried,
+    /// because a streamed body cannot be replayed, except that a 401 refreshes the token
+    /// once and calls `build` again. Non-2xx becomes `ApiError::Status`.
+    #[allow(dead_code)] // used by the StreamBIM and Interaxo clients
+    pub(crate) async fn send_custom<F>(&self, build: F) -> Result<reqwest::Response, ApiError>
+    where
+        F: Fn(&reqwest::Client) -> Result<reqwest::RequestBuilder, ApiError>,
+    {
+        let mut reauthed = false;
+        loop {
+            let token = self.bearer().await?;
+            let resp = build(&self.transfer_client)?
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp);
+            }
+            if status == StatusCode::UNAUTHORIZED && !reauthed {
+                reauthed = true;
+                self.source.invalidate().await;
+                continue;
+            }
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 body: error_body(resp).await,
