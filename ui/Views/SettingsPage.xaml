@@ -36,6 +36,12 @@
                                         Content="{loc:T Sv='Logga in', En='Sign in'}"
                                         AutomationProperties.Name="{loc:T Sv='Logga in på ACC', En='Sign in to ACC'}"
                                         Click="OnAccSignIn" />
+                                <!-- While the browser is open: a new click starts the sign-in again, this one cancels it. -->
+                                <Button x:Name="AccCancelSignInButton"
+                                        Visibility="Collapsed"
+                                        Content="{loc:T Sv='Avbryt', En='Cancel'}"
+                                        AutomationProperties.Name="{loc:T Sv='Avbryt inloggningen på ACC', En='Cancel the sign-in to ACC'}"
+                                        Click="OnAccCancelSignIn" />
                                 <Button x:Name="AccSignOutButton"
                                         Content="{loc:T Sv='Logga ut', En='Sign out'}"
                                         AutomationProperties.Name="{loc:T Sv='Logga ut från ACC', En='Sign out of ACC'}"
@@ -218,6 +224,11 @@
                                         Content="{loc:T Sv='Logga in', En='Sign in'}"
                                         AutomationProperties.Name="{loc:T Sv='Logga in på Interaxo', En='Sign in to Interaxo'}"
                                         Click="OnInteraxoSignIn" />
+                                <Button x:Name="InteraxoCancelSignInButton"
+                                        Visibility="Collapsed"
+                                        Content="{loc:T Sv='Avbryt', En='Cancel'}"
+                                        AutomationProperties.Name="{loc:T Sv='Avbryt inloggningen på Interaxo', En='Cancel the sign-in to Interaxo'}"
+                                        Click="OnInteraxoCancelSignIn" />
                                 <Button x:Name="InteraxoSignOutButton"
                                         Content="{loc:T Sv='Logga ut', En='Sign out'}"
                                         AutomationProperties.Name="{loc:T Sv='Logga ut från Interaxo', En='Sign out of Interaxo'}"

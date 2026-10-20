@@ -141,6 +141,12 @@
                                TextWrapping="Wrap"
                                HorizontalAlignment="Center"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <!-- Only when no account at all is signed in: StreamBIM and Interaxo sign in under Settings. -->
+                    <Button x:Name="SignInSettingsButton"
+                            Visibility="Collapsed"
+                            HorizontalAlignment="Center"
+                            Content="{loc:T Sv='Logga in på StreamBIM eller Interaxo under Inställningar → Konton.', En='Sign in to StreamBIM or Interaxo under Settings → Accounts.'}"
+                            Click="OnOpenAccountSettings" />
                 </StackPanel>
             </Border>
 
