@@ -61,7 +61,7 @@ pub fn caps(provider: Provider) -> Caps {
 }
 
 /// A download handle for one version: where to read its bytes from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DownloadUrl {
     pub url: String,
     pub size: u64,
@@ -69,6 +69,20 @@ pub struct DownloadUrl {
     pub bearer: Option<String>,
     /// The server answers Range requests, so the download may run in parallel segments.
     pub ranges: bool,
+}
+
+/// Logs show the handle without its secrets: the bearer is redacted, and the URL loses its query
+/// (a presigned URL carries its signature there).
+impl std::fmt::Debug for DownloadUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url = self.url.split('?').next().unwrap_or_default();
+        f.debug_struct("DownloadUrl")
+            .field("url", &url)
+            .field("size", &self.size)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("ranges", &self.ranges)
+            .finish()
+    }
 }
 
 /// What `subscribe` needs to build a `model::Project` from a listed project.
@@ -689,6 +703,26 @@ mod tests {
             assert!(!intent_proves_commit(p.provider));
         }
         assert!(intent_proves_commit(Provider::Acc));
+    }
+
+    #[test]
+    fn a_download_handle_never_logs_its_bearer_or_its_signature() {
+        let d = DownloadUrl {
+            url: "https://files.example.invalid/object?X-Amz-Signature=abc123".into(),
+            size: 14,
+            bearer: Some("secret-bearer-token".into()),
+            ranges: true,
+        };
+        let text = format!("{d:?}");
+        assert!(!text.contains("secret-bearer-token"), "{text}");
+        assert!(!text.contains("abc123"), "{text}");
+        assert!(text.contains("bearer: Some(\"<redacted>\")"), "{text}");
+        assert!(
+            text.contains("https://files.example.invalid/object"),
+            "{text}"
+        );
+        let open = DownloadUrl { bearer: None, ..d };
+        assert!(format!("{open:?}").contains("bearer: None"));
     }
 
     #[tokio::test]

@@ -496,7 +496,7 @@ impl Engine {
             .project(pid)
             .ok()
             .flatten()
-            .is_some_and(|p| self.ctx.signed_in(p.provider))
+            .is_some_and(|p| self.ctx.project_connected(&p))
     }
 
     /// The user of a provider whose account is signed in.
@@ -888,6 +888,9 @@ impl Engine {
                     }
                     info!("utloggad från {}; övriga konton synkar vidare", p.label());
                     self.publish();
+                    // The signed-out provider's hubs leave the Projects list.
+                    let me = self.clone();
+                    self.spawn_maintenance(async move { me.refresh_projects().await });
                     return;
                 }
             }
@@ -1059,17 +1062,12 @@ impl Engine {
                 .collect()
         };
         for pid in due {
-            // A project of a signed-out provider does not poll. It leaves the schedule and comes
-            // back when that provider signs in (provider_connected).
-            let provider = self
-                .ctx
-                .store
-                .project(pid)
-                .ok()
-                .flatten()
-                .map(|p| p.provider);
-            match provider {
-                Some(provider) if !self.ctx.signed_in(provider) => {
+            // A project that cannot be served (its provider is signed out, or StreamBIM is signed in
+            // to another region) does not poll. It leaves the schedule and comes back when it can
+            // (provider_connected).
+            let project = self.ctx.store.project(pid).ok().flatten();
+            match project {
+                Some(p) if !self.ctx.project_connected(&p) => {
                     self.st().next_due.remove(&pid);
                 }
                 _ => self.spawn_poll(pid),
@@ -1647,6 +1645,14 @@ impl Engine {
             && !item.populated
             && (proj.change_source != ChangeSourceKind::DesktopSync || kids_empty);
         if needs_fetch {
+            // A StreamBIM project of another region must not be listed with this account's token.
+            if !self.ctx.project_connected(&proj) {
+                return Err(ApiError::Auth(anyhow!(
+                    "Logga in på {} för att visa mappen.",
+                    self.ctx.sign_in_target(&proj)
+                ))
+                .into());
+            }
             let mut items = remote::folder_contents(&self.ctx, &proj, &id).await?;
             for it in items.iter_mut() {
                 it.pid = pid;
@@ -1779,15 +1785,20 @@ impl Engine {
             .await;
             return;
         };
-        let provider = db(&self.ctx, move |s| s.project(pid))
-            .await
-            .ok()
-            .flatten()
-            .map_or(Provider::Acc, |p| p.provider);
-        if !self.ctx.signed_in(provider) {
+        let project = db(&self.ctx, move |s| s.project(pid)).await.ok().flatten();
+        let provider = project.as_ref().map_or(Provider::Acc, |p| p.provider);
+        let connected = match &project {
+            Some(p) => self.ctx.project_connected(p),
+            None => self.ctx.signed_in(provider),
+        };
+        if !connected {
+            let target = match &project {
+                Some(p) => self.ctx.sign_in_target(p),
+                None => provider.label().to_string(),
+            };
             self.ctx.ui.send(UiMsg::notify(
                 Severity::Warning,
-                format!("Logga in på {} för att hämta filen.", provider.label()),
+                format!("Logga in på {target} för att hämta filen."),
             ));
             fail_data(
                 req.keys,
@@ -1910,7 +1921,9 @@ impl Engine {
         let last = std::sync::Mutex::new(None::<Instant>);
         let mut parts = Vec::new();
         for (a, b) in segment_plan(start, total, download.ranges) {
-            parts.push(self.stream_segment(&keys, &proj, &download, a, b, total, &progress, &last));
+            parts.push(
+                self.stream_segment(&keys, &proj, id, &download, a, b, total, &progress, &last),
+            );
         }
         if parts.is_empty() {
             // Zero-length file (or nothing left): complete with an empty transfer.
@@ -1940,6 +1953,7 @@ impl Engine {
         self: &Arc<Self>,
         keys: &OpKeys,
         proj: &Project,
+        id: &str,
         download: &DownloadUrl,
         a: u64,
         b: u64,
@@ -1953,6 +1967,19 @@ impl Engine {
         } else {
             remote::open_download(&self.ctx, proj, download, 0).await?
         };
+        // A provider that does not report the size in its download handle (StreamBIM, Interaxo)
+        // gives the length of the whole object in Content-Length. A newer revision than the
+        // placeholder's must not stream into it: refresh the placeholder and fail as the size
+        // check in `stream_file` does.
+        if !download.ranges {
+            if let Some(len) = resp.content_length().filter(|len| *len != total) {
+                self.refresh_soon(proj.pid, id.to_string());
+                return Err(anyhow!(
+                    "filen har ändrats i {} ({total} → {len} byte), öppna den igen",
+                    proj.provider.label()
+                ));
+            }
+        }
         let mut skip = if download.ranges { 0 } else { a };
         let tk = keys.transfer_key;
         let mut buf: Vec<u8> = Vec::with_capacity(CHUNK);
@@ -2278,6 +2305,11 @@ impl Engine {
                     .filter(|attempt| attempt.mfa_pending)
                     .map(|attempt| attempt.generation);
                 let Some(generation) = generation else {
+                    // An attempt that is not waiting for a code is already checking one (a repeat
+                    // of the same code, a double click): nothing to tell the user.
+                    if live.sign_ins.contains_key(&provider) {
+                        return;
+                    }
                     self.ctx.ui.send(UiMsg::notify(
                         Severity::Warning,
                         "Ingen kod väntas. Logga in igen.",
@@ -2763,7 +2795,7 @@ impl Engine {
             ));
             return;
         };
-        if !self.ctx.signed_in(p.provider) || self.st().offline.contains(&p.provider) {
+        if !self.ctx.project_connected(&p) || self.st().offline.contains(&p.provider) {
             self.ctx.ui.send(UiMsg::notify(
                 Severity::Warning,
                 "Återställning kräver att du är inloggad och online",
@@ -2782,7 +2814,7 @@ impl Engine {
             self.ctx.ui.send(UiMsg::notify(Severity::Warning, "Kunde inte återställa: synkarbetet blev inte klart i tid. Lokala filer är kvar. Försök igen när överföringarna är klara."));
             return;
         }
-        if !self.ctx.signed_in(p.provider) || self.st().offline.contains(&p.provider) {
+        if !self.ctx.project_connected(&p) || self.st().offline.contains(&p.provider) {
             self.ctx.ui.send(UiMsg::notify(Severity::Warning, "Återställningen avbröts eftersom anslutningen eller inloggningen ändrades. Dina lokala filer finns kvar."));
             return;
         }
@@ -3487,8 +3519,10 @@ impl Engine {
         });
     }
 
+    /// The APS client id is ACC's: a change waits for ACC to be signed out with no ACC sign-in
+    /// pending. StreamBIM and Interaxo keep their own tokens across the restart a change needs.
     fn client_validation_guard(&self, live: &Live) -> std::result::Result<(), String> {
-        if self.ctx.auth.is_signed_in() || live.conn.is_some() {
+        if self.ctx.auth.is_signed_in() || live.sign_ins.contains_key(&Provider::Acc) {
             Err("Logga ut innan du testar ett APS Client ID. Den sparade inställningen ändrades inte.".into())
         } else if self.client_id_change_busy() {
             Err("Vänta tills pågående synk, återställning och uppdatering är klara. Den sparade inställningen ändrades inte.".into())
@@ -3663,7 +3697,7 @@ impl Engine {
         }
         let changed = next.client_id() != old.client_id();
         if changed {
-            if self.ctx.auth.is_signed_in() || live.conn.is_some() {
+            if self.ctx.auth.is_signed_in() {
                 self.ctx.ui.send(UiMsg::notify(
                     Severity::Warning,
                     "Logga ut innan du ändrar APS Client ID.",
@@ -3686,7 +3720,7 @@ impl Engine {
             self.publish();
             // The previous worker may have finished committing a complete session
             // just before cancellation. It still requires an explicit sign-out.
-            if self.ctx.auth.is_signed_in() || live.conn.is_some() {
+            if self.ctx.auth.is_signed_in() {
                 self.ctx.ui.send(UiMsg::notify(
                     Severity::Warning,
                     "Inloggningen hann slutföras. Logga ut innan du ändrar APS Client ID.",
@@ -3804,27 +3838,29 @@ impl Engine {
             self.publish_settings();
             return;
         }
-        let saved = {
-            let mut s = self.ctx.settings.write().unwrap_or_else(|e| e.into_inner());
-            match s.apply_setting(key, value) {
-                Ok(()) => Ok(s.clone()),
-                Err(e) => Err(e),
-            }
-        };
-        match saved {
-            Ok(cfg) => {
-                if let Err(e) = cfg.save(&self.ctx.paths.state_dir.join("settings.json")) {
-                    warn!("kunde inte spara inställningar: {e:#}");
-                    self.ctx.ui.send(UiMsg::notify(
-                        Severity::Error,
-                        "Kunde inte spara Interaxo-inställningen. Försök igen.",
-                    ));
-                }
-                self.ctx.interaxo.set_interaxo_client(cfg.interaxo_client());
-                info!("inställning {key} ändrad");
-            }
-            Err(e) => warn!("inställning {key}: {e}"),
+        // The candidate is saved first; memory and the client change only once the file holds it.
+        let mut next = self.ctx.cfg_now();
+        if let Err(e) = next.apply_setting(key, value) {
+            warn!("inställning {key}: {e}");
+            self.publish_settings();
+            self.publish();
+            return;
         }
+        if let Err(e) = next.save(&self.ctx.paths.state_dir.join("settings.json")) {
+            warn!("kunde inte spara inställningar: {e:#}");
+            self.ctx.ui.send(UiMsg::notify(
+                Severity::Error,
+                "Kunde inte spara Interaxo-inställningen. Försök igen.",
+            ));
+            self.publish_settings();
+            self.publish();
+            return;
+        }
+        self.ctx
+            .interaxo
+            .set_interaxo_client(next.interaxo_client());
+        *self.ctx.settings.write().unwrap_or_else(|e| e.into_inner()) = next;
+        info!("inställning {key} ändrad");
         self.publish_settings();
         self.publish();
     }
@@ -4799,15 +4835,18 @@ fn offline_hubs(
     stored: &[Project],
     subscribed: &HashSet<String>,
 ) -> HubList {
+    // Only the subscribed projects remain, so they can be unsubscribed; a hub without any of them
+    // leaves the list.
     let mut hubs: HubList = previous
         .iter()
         .filter(|(hub, _)| hub.provider == provider)
-        .map(|(hub, projects)| {
-            let projects = projects
+        .filter_map(|(hub, projects)| {
+            let kept: Vec<(ProjectInfo, bool)> = projects
                 .iter()
-                .map(|(p, _)| (p.clone(), subscribed.contains(&p.id)))
+                .filter(|(p, _)| subscribed.contains(&p.id))
+                .map(|(p, _)| (p.clone(), true))
                 .collect();
-            (hub.clone(), projects)
+            (!kept.is_empty()).then(|| (hub.clone(), kept))
         })
         .collect();
     for project in stored

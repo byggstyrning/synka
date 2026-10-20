@@ -731,3 +731,275 @@ fn a_lock_held_by_the_users_own_interaxo_account_is_not_read_only() {
     other.locked_by = Some("Bo Ek".into());
     assert!(spec_for(&other, me.as_deref()).read_only);
 }
+
+/// Makes StreamBIM look signed in to `region`, the way a sign-in leaves its profile and token.
+fn streambim_signed_in(f: &mut Fixture, region: &str) {
+    let state = f.ctx.paths.state_dir.clone();
+    std::fs::write(
+        state.join("token-streambim.bin"),
+        b"test-only-streambim-credentials",
+    )
+    .unwrap();
+    let profile = json!({
+        "user_id": "test-only-streambim-user",
+        "name": "Testanvändare",
+        "email": "test@example.invalid",
+        "region": region,
+        "base": format!("https://{region}.streambim.com"),
+    });
+    std::fs::write(state.join("user-streambim.json"), profile.to_string()).unwrap();
+    let http = crate::http::build_client();
+    let streambim = Arc::new(crate::streambim_auth::StreamBimAuth::new(
+        http.clone(),
+        &state,
+    ));
+    assert!(streambim.is_signed_in());
+    let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+    ctx.streambim_api =
+        crate::http::Api::with_source(http, crate::http::TokenSource::StreamBim(streambim.clone()));
+    ctx.streambim = streambim;
+}
+
+#[tokio::test]
+async fn a_streambim_project_of_another_region_stays_paused() {
+    let mut f = fixture("streambim-region");
+    streambim_signed_in(&mut f, "sweden");
+    let mut sb = other_provider_project(&f, Provider::StreamBim);
+    sb.meta =
+        Some(r#"{"region":"app","base":"https://app.streambim.com","project":"1552"}"#.into());
+    f.ctx.store.upsert_project(&sb).unwrap();
+    assert!(f.ctx.signed_in(Provider::StreamBim));
+    assert!(!f.ctx.project_connected(&sb), "signed in to another region");
+    assert_eq!(f.ctx.sign_in_target(&sb), "StreamBIM (app)");
+    let mut same_region = sb.clone();
+    same_region.meta = Some(
+        r#"{"region":"sweden","base":"https://sweden.streambim.com","project":"1552"}"#.into(),
+    );
+    assert!(f.ctx.project_connected(&same_region));
+
+    let engine = Engine::new(f.ctx.clone());
+    engine.st().next_due.insert(sb.pid, Instant::now());
+    engine.on_timers();
+    assert!(
+        !engine.st().next_due.contains_key(&sb.pid),
+        "it leaves the schedule"
+    );
+    assert!(engine.st().polling.is_empty(), "and nothing polls it");
+
+    f.ctx.store.enqueue(sb.pid, "upload", None, "{}").unwrap();
+    assert_eq!(
+        upload::process_due(&f.ctx).await.unwrap(),
+        0,
+        "the job waits"
+    );
+    let summary = f.ctx.store.job_summary().unwrap();
+    assert!(
+        summary.iter().any(|(_, _, attempts, error)| *attempts == 0
+            && error.as_deref() == Some("Logga in på StreamBIM (app) för att synka.")),
+        "{summary:?}"
+    );
+}
+
+#[test]
+fn a_signed_out_providers_unsubscribed_projects_leave_the_projects_list() {
+    let project = |id: &str, hub: &str, provider: Provider| ProjectInfo {
+        id: id.into(),
+        hub_id: hub.into(),
+        name: id.into(),
+        root_folder_urn: None,
+        scopes: Vec::new(),
+        provider,
+        meta: None,
+    };
+    let hub = |id: &str, provider: Provider| HubInfo {
+        id: id.into(),
+        name: id.into(),
+        region: None,
+        provider,
+    };
+    let previous: HubList = vec![
+        (
+            hub("streambim:app", Provider::StreamBim),
+            vec![
+                (
+                    project("streambim:app:1", "streambim:app", Provider::StreamBim),
+                    false,
+                ),
+                (
+                    project("streambim:app:2", "streambim:app", Provider::StreamBim),
+                    true,
+                ),
+            ],
+        ),
+        (
+            hub("streambim:other", Provider::StreamBim),
+            vec![(
+                project("streambim:other:3", "streambim:other", Provider::StreamBim),
+                false,
+            )],
+        ),
+        (
+            hub("b.acc-hub", Provider::Acc),
+            vec![(project("b.acc-1", "b.acc-hub", Provider::Acc), false)],
+        ),
+    ];
+    let subscribed: HashSet<String> = HashSet::from(["streambim:app:2".to_string()]);
+    let hubs = offline_hubs(Provider::StreamBim, &previous, &[], &subscribed);
+    assert_eq!(
+        hubs.len(),
+        1,
+        "the hub without a subscribed project is gone"
+    );
+    assert_eq!(hubs[0].0.id, "streambim:app");
+    let ids: Vec<&str> = hubs[0].1.iter().map(|(p, _)| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["streambim:app:2"],
+        "only the subscribed project stays"
+    );
+    assert!(hubs[0].1[0].1);
+}
+
+#[tokio::test]
+async fn a_newer_non_acc_revision_is_not_streamed_into_an_older_placeholder() {
+    use crate::cf::{FetchDataReq, OpKeys};
+    use crate::test_support::{Fault, Server};
+    // The object is now 20 bytes; the placeholder was made for 14. Interaxo's download handle
+    // carries no size, so only the response's Content-Length tells.
+    let server = Server::scripted(vec![Fault::reply(200, "0123456789abcdefghij")]).await;
+    let mut f = fixture("interaxo-download-size");
+    interaxo_loopback(&mut f, &server.origin);
+    let mut item = row(&f.p, "I-1", Some("co.ROOT"), "a.pdf", Kind::File);
+    item.remote_version = Some(2000);
+    item.base_version = Some(2000);
+    item.storage_urn = Some("interaxo:I-1:2.0".into());
+    item.size = 14;
+    f.ctx.store.upsert_item(&item).unwrap();
+    let engine = Engine::new(f.ctx.clone());
+    let req = FetchDataReq {
+        keys: OpKeys {
+            connection_key: 0,
+            transfer_key: 7,
+            request_key: 0,
+            file_id: 0,
+        },
+        path: f.dir.join("a.pdf"),
+        identity: crate::cf::placeholder::encode_identity(Kind::File, f.p.pid, "I-1"),
+        file_size: 14,
+        required_offset: 0,
+        required_length: 14,
+    };
+    let err = engine.stream_file(&req, f.p.pid, "I-1").await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "filen har ändrats i Interaxo (14 → 20 byte), öppna den igen"
+    );
+    assert_eq!(
+        server.count(),
+        1,
+        "the object was asked for and not streamed"
+    );
+}
+
+#[test]
+fn the_aps_client_id_is_held_by_acc_alone() {
+    let mut f = fixture("aps-client-id-holder");
+    streambim_signed_in(&mut f, "app");
+    let engine = Engine::new(f.ctx.clone());
+    assert!(
+        engine.client_validation_guard(&test_live()).is_ok(),
+        "StreamBIM's session does not block a change of the APS client id"
+    );
+
+    let mut acc = fixture("aps-client-id-acc");
+    client_override_signed_in(&mut acc);
+    let engine = Engine::new(acc.ctx.clone());
+    assert!(
+        engine.client_validation_guard(&test_live()).is_err(),
+        "a signed-in ACC account does"
+    );
+}
+
+#[tokio::test]
+async fn an_interaxo_setting_that_cannot_be_saved_is_not_applied() {
+    let f = fixture("interaxo-save-fails");
+    // A directory where settings.json belongs: the save fails.
+    std::fs::create_dir_all(f.ctx.paths.state_dir.join("settings.json")).unwrap();
+    let engine = Engine::new(f.ctx.clone());
+    engine
+        .set_setting("interaxo_client_id", &json!("new-client"))
+        .await;
+    assert_eq!(
+        f.ctx.cfg_now().interaxo_client_id,
+        None,
+        "the saved value stays in memory too"
+    );
+    let sent: Vec<UiMsg> = f._rx.try_iter().collect();
+    assert!(sent.iter().any(|m| matches!(
+        m,
+        UiMsg::Notify { body, .. } if body.contains("Kunde inte spara Interaxo-inställningen")
+    )));
+    assert!(
+        sent.iter().any(|m| matches!(m, UiMsg::Settings(_))),
+        "the UI is sent the unchanged settings again"
+    );
+}
+
+#[tokio::test]
+async fn sign_in_steps_are_admitted_during_a_move() {
+    let f = fixture("sign-in-during-move");
+    let engine = Engine::new(f.ctx.clone());
+    engine.st().moving = true;
+    let mfa = TrayCmd::SignInMfa {
+        provider: Provider::StreamBim,
+        code: Secret("123456".into()),
+    };
+    assert!(
+        engine.begin_command(&mfa).is_some(),
+        "a code may be sent during a move"
+    );
+    let cancel = TrayCmd::CancelSignIn {
+        provider: Provider::StreamBim,
+    };
+    assert!(engine.begin_command(&cancel).is_some());
+    let reset = TrayCmd::SignOut { provider: None };
+    assert!(
+        engine.begin_command(&reset).is_none(),
+        "other commands still wait for the move"
+    );
+}
+
+#[tokio::test]
+async fn a_second_code_while_one_is_being_checked_is_a_quiet_repeat() {
+    let f = fixture("mfa-repeat");
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    live.sign_ins.insert(
+        Provider::StreamBim,
+        SignInAttempt {
+            task: tokio::spawn(std::future::pending::<()>()),
+            generation: 3,
+            started_at: Instant::now(),
+            mfa_pending: false,
+        },
+    );
+    let (itx, _irx) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignInMfa {
+                provider: Provider::StreamBim,
+                code: Secret("123456".into()),
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    assert_eq!(notices(&f, "Ingen kod väntas"), 0, "no warning");
+    assert_eq!(
+        live.sign_ins
+            .get(&Provider::StreamBim)
+            .map(|a| a.generation),
+        Some(3),
+        "the check that is running stays"
+    );
+}

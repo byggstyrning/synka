@@ -238,14 +238,23 @@ fn job_provider(ctx: &CtxRef, job: &OutboxJob) -> Provider {
         .unwrap_or_default()
 }
 
-/// A job of a signed-out provider waits like offline work: it is postponed without a request and
-/// without spending an attempt. True when it waits.
+/// A job whose project cannot be served (its provider is signed out, or StreamBIM is signed in to
+/// another region) waits like offline work: it is postponed without a request and without spending
+/// an attempt. True when it waits.
 fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
-    let provider = job_provider(ctx, job);
-    if ctx.signed_in(provider) {
+    let project = ctx.store.project(job.pid).ok().flatten();
+    let connected = match &project {
+        Some(p) => ctx.project_connected(p),
+        None => ctx.signed_in(Provider::Acc),
+    };
+    if connected {
         return false;
     }
-    let waiting = format!("Logga in på {} för att synka.", provider.label());
+    let target = match &project {
+        Some(p) => ctx.sign_in_target(p),
+        None => Provider::Acc.label().to_string(),
+    };
+    let waiting = format!("Logga in på {target} för att synka.");
     let _ = ctx
         .store
         .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);

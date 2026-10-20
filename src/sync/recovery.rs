@@ -39,6 +39,9 @@ impl Engine {
                     | TrayCmd::CheckUpdates
                     | TrayCmd::TestApsClientId { .. }
                     | TrayCmd::CancelApsClientIdTest { .. }
+                    // Sign-in steps touch no files: they may run during a rebuild or a move.
+                    | TrayCmd::SignInMfa { .. }
+                    | TrayCmd::CancelSignIn { .. }
                     | TrayCmd::FreeUpSpace { .. }
                     | TrayCmd::InstallUpdate
                     | TrayCmd::Quit
