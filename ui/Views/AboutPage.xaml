@@ -39,7 +39,7 @@
             </tk:SettingsCard>
 
             <tk:SettingsCard Header="{loc:T Sv='Integritet', En='Privacy'}"
-                             Description="{loc:T Sv='Synka skickar filinnehåll bara mellan den här datorn och Autodesk (developer.api.autodesk.com och Autodesks fillagring). Ingen telemetri. Nya versioner delas internt.', En='Synka sends file content only between this PC and Autodesk (developer.api.autodesk.com and Autodesk file storage). No telemetry. New versions are shared internally.'}">
+                             Description="{loc:T Sv='Synka skickar filinnehåll bara mellan den här datorn och den plattform filen tillhör: Autodesk (APS och Autodesks fillagring), StreamBIM (den inloggade regionens servrar och S3-lagringen de ger uppladdningslänkar till) eller Interaxo (dess API-servrar). Ingen telemetri. Nya versioner delas internt.', En='Synka sends file content only between this PC and the platform the file belongs to: Autodesk (the APS endpoints and file storage), StreamBIM (the servers of the signed-in region and the S3 storage they hand out upload links for) or Interaxo (its API hosts). No telemetry. New versions are shared internally.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE72E;" />
                 </tk:SettingsCard.HeaderIcon>
