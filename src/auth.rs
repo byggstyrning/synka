@@ -63,6 +63,65 @@ const PUBLIC_APP_GUIDANCE: &str = "Välj apptypen Desktop, Mobile, Single-Page A
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 const PORT_BUSY_MSG: &str = "Kan inte öppna inloggningsport 47863 – porten används redan eller är blockerad. Stäng programmet som använder porten och försök igen. (Sign-in port 47863 is unavailable)";
 
+/// Default loopback redirect of the Interaxo client (what Interaxo support registers).
+pub const INTERAXO_DEFAULT_REDIRECT: &str = "http://localhost:47864/";
+
+/// Interaxo OIDC client ("bring your own client id").
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct InteraxoClient {
+    pub client_id: String,
+    /// Only for a confidential client. Never printed (see the `Debug` impl).
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for InteraxoClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteraxoClient")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
+}
+
+/// Ok when `uri` is a loopback redirect Synka can listen on: `http://localhost:<port>/<path>`
+/// or `http://127.0.0.1:<port>/<path>` with an explicit port from 1 to 65535, and no user
+/// info, query or fragment. The Err text is shown to the user (Swedish).
+pub fn check_loopback_redirect(uri: &str) -> Result<(), String> {
+    const HOST: &str = "Omdirigerings-URI:n måste börja med http://localhost eller http://127.0.0.1 (redirect URI must be http://localhost or http://127.0.0.1)";
+    const PORT: &str = "Omdirigerings-URI:n måste ange en port från 1 till 65535, till exempel http://localhost:47864/ (redirect URI needs an explicit port)";
+    if uri.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(HOST.into());
+    }
+    let url = url::Url::parse(uri).map_err(|_| HOST.to_string())?;
+    if url.scheme() != "http" || !matches!(url.host_str(), Some("localhost" | "127.0.0.1")) {
+        return Err(HOST.into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Omdirigerings-URI:n får inte innehålla användarnamn eller lösenord (redirect URI must not contain user info)".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Omdirigerings-URI:n får inte innehålla frågesträng eller fragment (redirect URI must not contain a query or fragment)".into());
+    }
+    // `url` drops a port that equals the scheme default (":80"), so read the port from the text.
+    let authority = uri
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .unwrap_or_default();
+    let port = authority
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    match port.map(str::parse::<u16>) {
+        Some(Ok(port)) if port >= 1 => Ok(()),
+        _ => Err(PORT.into()),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct UserInfo {
     /// OIDC `sub` (Autodesk user id / oxygen id).
@@ -123,6 +182,12 @@ pub struct Auth {
     client_id: String,
     http: reqwest::Client,
     state_dir: PathBuf,
+    /// File names in `state_dir` (ACC: token.bin / user.json; other OAuth providers use their own).
+    token_file: &'static str,
+    user_file: &'static str,
+    /// The Interaxo client, for the Interaxo account only (None for ACC). Its client id
+    /// overrides `client_id`.
+    interaxo: RwLock<Option<InteraxoClient>>,
     token: Mutex<TokenState>,
     user: RwLock<Option<UserInfo>>,
     #[cfg(test)]
@@ -135,13 +200,28 @@ impl Auth {
     /// `client_id` empty => `is_configured()` false; sign_in returns an error explaining the
     /// APS app must be configured.
     pub fn new(client_id: String, http: reqwest::Client, state_dir: &Path) -> Auth {
-        let user = std::fs::read(state_dir.join("user.json"))
+        Auth::with_files(client_id, http, state_dir, "token.bin", "user.json")
+    }
+
+    /// Like `new`, with the token and profile files named by the caller (one pair per OAuth
+    /// account). The endpoints and scopes are the APS ones; the Interaxo spec is wired later.
+    pub fn with_files(
+        client_id: String,
+        http: reqwest::Client,
+        state_dir: &Path,
+        token_file: &'static str,
+        user_file: &'static str,
+    ) -> Auth {
+        let user = std::fs::read(state_dir.join(user_file))
             .ok()
             .and_then(|b| serde_json::from_slice::<UserInfo>(&b).ok());
         Auth {
             client_id,
             http,
             state_dir: state_dir.to_path_buf(),
+            token_file,
+            user_file,
+            interaxo: RwLock::new(None),
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(user),
             #[cfg(test)]
@@ -158,6 +238,9 @@ impl Auth {
             client_id: String::new(),
             http,
             state_dir: PathBuf::new(),
+            token_file: "token.bin",
+            user_file: "user.json",
+            interaxo: RwLock::new(None),
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(None),
             test_access_token: Some("synka-loopback-test-token".to_string()),
@@ -165,8 +248,48 @@ impl Auth {
         }
     }
 
+    /// The Interaxo account: an `Auth` for Interaxo's OIDC client, with its own token and
+    /// profile files. An empty client id means not configured yet.
+    pub fn interaxo(client: InteraxoClient, http: reqwest::Client, state_dir: &Path) -> Auth {
+        let base = Auth::with_files(
+            client.client_id.clone(),
+            http,
+            state_dir,
+            "token-interaxo.bin",
+            "user-interaxo.json",
+        );
+        Auth {
+            interaxo: RwLock::new(Some(client)),
+            ..base
+        }
+    }
+
+    /// Replace the stored Interaxo client (the caller makes sure the account is signed out).
+    #[allow(dead_code)] // the settings step calls it; tests use it now
+    pub fn set_interaxo_client(&self, client: InteraxoClient) {
+        *self.interaxo.write().unwrap_or_else(|e| e.into_inner()) = Some(client);
+    }
+
+    /// The stored Interaxo client; None for the ACC account.
+    #[allow(dead_code)] // the settings step reads it; tests use it now
+    pub fn interaxo_client(&self) -> Option<InteraxoClient> {
+        self.interaxo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The client id in use: the stored Interaxo client's, else the constructor's.
+    fn current_client_id(&self) -> String {
+        let interaxo = self.interaxo.read().unwrap_or_else(|e| e.into_inner());
+        match interaxo.as_ref() {
+            Some(client) => client.client_id.clone(),
+            None => self.client_id.clone(),
+        }
+    }
+
     pub fn is_configured(&self) -> bool {
-        !self.client_id.trim().is_empty()
+        !self.current_client_id().trim().is_empty()
     }
 
     /// A complete local session needs credentials and a validated user profile.
@@ -203,6 +326,9 @@ impl Auth {
             client_id,
             http,
             state_dir: PathBuf::new(),
+            token_file: "token.bin",
+            user_file: "user.json",
+            interaxo: RwLock::new(None),
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(None),
             #[cfg(test)]
@@ -235,11 +361,12 @@ impl Auth {
             .context(PORT_BUSY_MSG)?;
         let redirect = redirect_uri(REDIRECT_PORT);
 
+        let client_id = self.current_client_id();
         let mut authorize = url::Url::parse(AUTHORIZE_URL).context("authorize-URL")?;
         {
             let mut q = authorize.query_pairs_mut();
             q.append_pair("response_type", "code")
-                .append_pair("client_id", &self.client_id)
+                .append_pair("client_id", &client_id)
                 .append_pair("redirect_uri", &redirect)
                 .append_pair("scope", SCOPES)
                 .append_pair("code_challenge", &challenge)
@@ -330,11 +457,12 @@ impl Auth {
             None => bail!("Inte inloggad – logga in igen. (Not signed in)"),
         };
 
+        let client_id = self.current_client_id();
         let result = self
             .token_request(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", rt.as_str()),
-                ("client_id", self.client_id.as_str()),
+                ("client_id", client_id.as_str()),
                 ("scope", SCOPES),
             ])
             .await;
@@ -379,11 +507,11 @@ impl Auth {
     // ---- internals -------------------------------------------------------------------------
 
     fn token_path(&self) -> PathBuf {
-        self.state_dir.join("token.bin")
+        self.state_dir.join(self.token_file)
     }
 
     fn user_path(&self) -> PathBuf {
-        self.state_dir.join("user.json")
+        self.state_dir.join(self.user_file)
     }
 
     /// Read and decrypt the stored refresh token. An unreadable blob (e.g. another Windows
@@ -434,12 +562,13 @@ impl Auth {
         verifier: &str,
         redirect: &str,
     ) -> Result<VerifiedSignIn> {
+        let client_id = self.current_client_id();
         let tr = self
             .token_request(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
                 ("redirect_uri", redirect),
-                ("client_id", self.client_id.as_str()),
+                ("client_id", client_id.as_str()),
                 ("code_verifier", verifier),
             ])
             .await
@@ -768,7 +897,8 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
+/// Protect `data` for the current Windows user (DPAPI).
+pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
@@ -789,7 +919,8 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
     Ok(take_blob(output))
 }
 
-fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
+/// Reverse of `dpapi_protect`; fails for a blob another Windows user protected.
+pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
@@ -1201,5 +1332,130 @@ mod tests {
         assert!(message.contains("oauth_error"));
         assert!(!message.contains("sensitive"));
         assert!(!auth.token_path().exists());
+    }
+}
+
+#[cfg(test)]
+mod interaxo_client_tests {
+    use super::*;
+
+    /// A private state directory, removed on drop.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            let path = std::env::temp_dir().join(format!(
+                "synka-interaxo-{tag}-{}-{}",
+                std::process::id(),
+                random_b64(8).unwrap()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Dir(path)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn http() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[test]
+    fn loopback_redirects_with_an_explicit_port_are_accepted() {
+        for uri in [
+            "http://localhost:47864/",
+            "http://127.0.0.1:1/",
+            "http://localhost:65535/callback/interaxo",
+            "http://localhost:80/",
+            "http://LOCALHOST:47864/",
+            INTERAXO_DEFAULT_REDIRECT,
+        ] {
+            assert_eq!(check_loopback_redirect(uri), Ok(()), "{uri}");
+        }
+    }
+
+    #[test]
+    fn redirects_outside_the_loopback_rules_are_rejected() {
+        for uri in [
+            "",
+            "https://localhost:47864/",
+            "http://example.com:47864/",
+            "http://localhost.example:47864/",
+            "http://[::1]:47864/",
+            "http://localhost/",
+            "http://localhost:/",
+            "http://localhost:0/",
+            "http://localhost:65536/",
+            "http://localhost:+80/",
+            "http://localhost:47864/?x=1",
+            "http://localhost:47864/#fragment",
+            "http://user@localhost:47864/",
+            "http://user:pw@localhost:47864/",
+            "http://localhost:47864/a b",
+            "http://localhost:47864/\n",
+            "localhost:47864",
+        ] {
+            assert!(
+                check_loopback_redirect(uri).is_err(),
+                "{uri:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn interaxo_account_is_configured_by_its_stored_client_id() {
+        let dir = Dir::new("configured");
+        let auth = Auth::interaxo(InteraxoClient::default(), http(), &dir.0);
+        assert!(!auth.is_configured());
+        assert!(auth.interaxo_client().is_some());
+
+        let client = InteraxoClient {
+            client_id: "my-client".into(),
+            client_secret: None,
+            redirect_uri: INTERAXO_DEFAULT_REDIRECT.into(),
+        };
+        auth.set_interaxo_client(client.clone());
+        assert!(auth.is_configured());
+        assert_eq!(auth.current_client_id(), "my-client");
+        assert_eq!(auth.interaxo_client(), Some(client));
+
+        auth.set_interaxo_client(InteraxoClient {
+            client_id: "  ".into(),
+            ..Default::default()
+        });
+        assert!(!auth.is_configured());
+    }
+
+    #[test]
+    fn acc_account_has_no_interaxo_client() {
+        let dir = Dir::new("acc");
+        let acc = Auth::new("aps-client".into(), http(), &dir.0);
+        assert!(acc.is_configured());
+        assert!(acc.interaxo_client().is_none());
+        assert!(!Auth::new(String::new(), http(), &dir.0).is_configured());
+    }
+
+    #[test]
+    fn interaxo_account_keeps_its_own_token_and_profile_files() {
+        let dir = Dir::new("files");
+        let auth = Auth::interaxo(InteraxoClient::default(), http(), &dir.0);
+        assert_eq!(auth.token_path(), dir.0.join("token-interaxo.bin"));
+        assert_eq!(auth.user_path(), dir.0.join("user-interaxo.json"));
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_client_secret() {
+        let client = InteraxoClient {
+            client_id: "id".into(),
+            client_secret: Some("very-secret-value".into()),
+            redirect_uri: INTERAXO_DEFAULT_REDIRECT.into(),
+        };
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("very-secret-value"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
     }
 }

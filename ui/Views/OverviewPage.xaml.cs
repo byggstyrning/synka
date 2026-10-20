@@ -234,7 +234,7 @@ public sealed partial class OverviewPage : Page
         SetText(StatusText, explanation ?? (routineSync || echo ? string.Empty : text));
         SetVisibility(StatusText, StatusText.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible);
 
-        SetText(AccountText, signedIn && status?.User is { } user ? AccountLabel(user) : string.Empty);
+        SetText(AccountText, AccountSummary(status));
         SetVisibility(AccountText, AccountText.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible);
 
         SetText(ErrorText, ErrorDisplay.FriendlyDetail(status?.Error));
@@ -259,14 +259,34 @@ public sealed partial class OverviewPage : Page
         RefreshStorage(status);
     }
 
-    private static string AccountLabel(UserInfo user)
+    /// <summary>
+    /// Who is signed in. One account: "Inloggad som …". Several (ACC and StreamBIM, say): each
+    /// with its provider, "ACC: … · StreamBIM: …". An engine without per-provider accounts
+    /// reports only `status.user`, and that one is shown.
+    /// </summary>
+    private static string AccountSummary(StatusInfo? status)
     {
-        var name = user.Name?.Trim();
-        var email = user.Email?.Trim();
-        var who = string.IsNullOrEmpty(name)
-            ? email
-            : string.IsNullOrEmpty(email) ? name : $"{name} ({email})";
-        return string.IsNullOrEmpty(who) ? string.Empty : Lang.T($"Inloggad som {who}", $"Signed in as {who}");
+        if (!Engine.IsConnected)
+        {
+            return string.Empty;
+        }
+
+        var accounts = Engine.Accounts.Where(account => account is { SignedIn: true }).ToList();
+        if (accounts.Count > 1)
+        {
+            return string.Join(" · ", accounts.Select(account =>
+            {
+                var label = ProviderNames.Label(account.Provider);
+                var who = ProviderNames.Who(account.User);
+                return who.Length == 0 ? label : $"{label}: {who}";
+            }));
+        }
+
+        var user = accounts.Count == 1
+            ? accounts[0].User
+            : status is { SignedIn: true } ? status.User : null;
+        var single = ProviderNames.Who(user);
+        return single.Length == 0 ? string.Empty : Lang.T($"Inloggad som {single}", $"Signed in as {single}");
     }
 
     private enum Tone
@@ -491,8 +511,8 @@ public sealed partial class OverviewPage : Page
                 $"{Fmt.Count(failed)} misslyckades. Aktiviteten och loggen säger varför.",
                 $"{Fmt.Count(failed)} failed. The activity and the log say why.")
             : Lang.T(
-                "Ändringar du gör i synkmappen laddas upp till ACC.",
-                "Changes you make in the sync folder are uploaded to ACC.");
+                "Ändringar du gör i synkmappen laddas upp till molnet.",
+                "Changes you make in the sync folder are uploaded to the cloud.");
 
         SetText(QueueCard, header, description);
         QueueLogButton.Visibility = failed > 0 ? Visibility.Visible : Visibility.Collapsed;

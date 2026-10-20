@@ -254,5 +254,7 @@ pub(crate) fn project() -> crate::model::Project {
         cursor: None,
         enabled: true,
         last_sync_ms: None,
+        provider: crate::model::Provider::Acc,
+        meta: None,
     }
 }
