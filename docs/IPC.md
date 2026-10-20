@@ -31,14 +31,17 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 | cmd | fields | effect |
 |---|---|---|
 | `hello` | `version` (UI version string) | engine replies with `status`, `settings`, `projects` (cached, may be empty), `activity` |
-| `sign_in` | | browser sign-in; result arrives as `status` |
-| `sign_out` | | |
+| `sign_in` | `provider?` (`acc` default, `streambim`, `interaxo`); StreamBIM also `region` (subdomain), `username`, `password` | ACC/Interaxo: browser sign-in. StreamBIM: password login, may ask for an MFA code. Progress arrives as `sign_in_progress`, the result as `status` |
+| `sign_in_mfa` | `provider` (`streambim`), `code` (6 digits) | answers a `sign_in_progress` `mfa_required` |
+| `cancel_sign_in` | `provider` | cancels a pending browser sign-in or MFA wait → `sign_in_progress` `cancelled` |
+| `sign_out` | `provider?` | signs out of that provider; without `provider`, of every provider |
+| `streambim_regions` | | → `streambim_regions` event (live list, built-in fallback) |
 | `sync_now` | | |
 | `open_folder` | `path?` (absolute; default sync root) | opens Explorer |
 | `open_log` | | opens the log folder |
-| `refresh_projects` | | reloads hubs/projects from ACC → `projects` event |
+| `refresh_projects` | | reloads hubs/projects from every signed-in provider → `projects` event |
 | `set_project` | `hub_id`, `project_id`, `subscribe` (bool) | subscribe/unsubscribe → `projects` + `status` |
-| `set_setting` | `key`, `value` | keys: `propagate_deletes` (bool), `max_downloads` (1–8), `max_uploads` (1–4), `poll_active_secs` (15–300), `log_level` ("info"/"debug"), `start_at_login` (bool, StartupTask), `auto_update` (bool), `aps_client_id` (string, blank clears the optional override); `desktop_sync_feed` is not settable (settings.json only) → `settings` |
+| `set_setting` | `key`, `value` | keys: `propagate_deletes` (bool), `max_downloads` (1–8), `max_uploads` (1–4), `poll_active_secs` (15–300), `log_level` ("info"/"debug"), `start_at_login` (bool, StartupTask), `auto_update` (bool), `aps_client_id` (string, blank clears the optional override), `interaxo_client_id` (string, blank clears), `interaxo_redirect_uri` (string, blank = default), `interaxo_client_secret` (string, blank clears; never echoed); `desktop_sync_feed` is not settable (settings.json only) → `settings` |
 | `test_aps_client_id` | `client_id` (nonblank public ID), `request_id` (UUID string) | validates fresh public PKCE sign-in before saving → `aps_client_id_validation`; saved changed ID restarts the engine |
 | `cancel_aps_client_id_test` | `request_id` (UUID string) | cancels that test; the correlated terminal event decides a completion/cancellation race |
 | `free_up_space` | `project_id?` | dehydrates clean local files and clears offline pinning for synced files and folders in the selected project, or all enabled projects when `project_id` is omitted |
@@ -57,9 +60,11 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 
 | type | fields |
 |---|---|
-| `status` | `signed_in` bool, `user` `{name,email}` or null, `state` one of `signed_out`,`synced`,`syncing`,`waiting`,`attention`,`offline`,`error`, `text` (Swedish one-liner), `error` string or null, `pending_jobs`, `failed_jobs`, `transfers` `[{name, project, direction:"down"\|"up", done, total}]` (bytes), `sync_root` (abs path), `held_deletes` `[{project_id, project, count}]` (delete bursts waiting for `confirm_deletes`; a folder counts its contents), `local_bytes` (bytes of file data on disk across projects, null until first counted), `engine_version` |
-| `projects` | `loading` bool, `hubs` `[{id, name, projects:[{id, name, subscribed, local_path}]}]` (sorted by name) |
-| `settings` | `propagate_deletes`, `max_downloads`, `max_uploads`, `poll_active_secs`, `log_level`, `start_at_login`, `auto_update`, `sync_root`, `client_id_configured`, `aps_client_id` (string or null), `aps_client_id_override_supported` (bool), `aps_client_id_validation_supported` (bool), `update_channel_configured` (bool; false = no update channel, the window hides update controls) |
+| `status` | `signed_in` bool, `user` `{name,email}` or null, `state` one of `signed_out`,`synced`,`syncing`,`waiting`,`attention`,`offline`,`error`, `text` (Swedish one-liner), `error` string or null, `pending_jobs`, `failed_jobs`, `transfers` `[{name, project, direction:"down"\|"up", done, total}]` (bytes), `sync_root` (abs path), `held_deletes` `[{project_id, project, count}]` (delete bursts waiting for `confirm_deletes`; a folder counts its contents), `local_bytes` (bytes of file data on disk across projects, null until first counted), `engine_version`, `accounts` `[{provider, label, configured, signed_in, signing_in, user:{name,email}\|null, host}]` (always `acc`, `streambim`, `interaxo` in that order) |
+| `projects` | `loading` bool, `hubs` `[{id, name, provider, projects:[{id, name, subscribed, local_path}]}]` (sorted by name) |
+| `settings` | `propagate_deletes`, `max_downloads`, `max_uploads`, `poll_active_secs`, `log_level`, `start_at_login`, `auto_update`, `sync_root`, `client_id_configured`, `aps_client_id` (string or null), `aps_client_id_override_supported` (bool), `aps_client_id_validation_supported` (bool), `update_channel_configured` (bool; false = no update channel, the window hides update controls), `providers` (`["acc","streambim","interaxo"]`), `interaxo_client_id` (string or null), `interaxo_redirect_uri` (effective), `interaxo_redirect_uri_default`, `interaxo_client_secret_set` (bool) |
+| `sign_in_progress` | `provider`, `state` (`browser`\|`mfa_required`\|`signed_in`\|`failed`\|`cancelled`), `error` (Swedish text or null) |
+| `streambim_regions` | `regions` `[{subdomain, title, is_default}]` |
 | `aps_client_id_validation` | `request_id`, `state` (`testing`\|`saved`\|`failed`\|`cancelled`), `error` (safe text or null). Recent per-request outcomes replay on hello/reconnect |
 | `activity` | `items` `[{ts_ms, kind, name, project, detail}]` newest first, at most 200. `kind`: `download`,`upload`,`new_version`,`rename`,`move`,`delete`,`conflict`,`error`,`unsupported` (ACC rejected a file type and will not retry),`remote_change`,`free_up`,`reset`,`restore`,`lock`,`unlock` (Explorer verbs Lås / Lås upp). Sent in full on `hello`, then as `activity_item` |
 | `activity_item` | `item` = one item as above, i.e. `{"type":"activity_item","item":{ts_ms,kind,name,project,detail}}` |
@@ -68,6 +73,31 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 | `ack` | see above |
 
 `status` is pushed on every change (throttled to 2/s); `transfers` progress rides on it.
+
+## Providers and accounts
+
+See `docs/PROVIDERS.md`. Clarifications:
+
+- **One account per provider.** `status.signed_in` is true when any provider is signed in;
+  `status.user` is the first signed-in account in the order `acc`, `streambim`, `interaxo`.
+  `accounts[].configured` is false when the provider cannot sign in yet (ACC without a client id,
+  Interaxo without `interaxo_client_id`). `host` is the StreamBIM region host or null.
+- **`sign_in`.** A new `sign_in` for a provider replaces a pending attempt for the same provider
+  (as the ACC rule: clicks within one second share it). StreamBIM requires `region`, `username`
+  and `password`; missing fields are refused in the ack. The password is used once and never
+  stored or logged. `sign_in_progress` reports `browser` (ACC/Interaxo, waiting for the browser),
+  `mfa_required` (StreamBIM, send `sign_in_mfa` within five minutes), then `signed_in`, `failed`
+  (with `error`) or `cancelled`. A failed MFA code gives `failed`; the user starts over.
+- **`sign_out`.** Signing out of one provider stops polling and uploading its projects; their
+  folders stay. The sync root is unregistered only when no provider is signed in.
+- **Interaxo settings.** `interaxo_client_id`, `interaxo_redirect_uri` and
+  `interaxo_client_secret` can change only while Interaxo is signed out; otherwise the engine
+  sends an error `notify` and republishes `settings`. The redirect URI must be
+  `http://localhost:<port>/<path>` or `http://127.0.0.1:<port>/<path>` (default
+  `http://localhost:47864/`); it must match the URI registered with Interaxo exactly. The
+  secret is optional, stored DPAPI-protected and reported only as `interaxo_client_secret_set`.
+- **`projects`.** `hubs[].provider` is `acc`, `streambim` or `interaxo`. Hub ids and project ids
+  are unique across providers (`docs/PROVIDERS.md`).
 
 ## Language
 
@@ -136,7 +166,7 @@ These pin down details the table above left open. The engine implements them as 
   warning `notify`. Unopened cloud folders are not enumerated. It emits activity
   `kind: "free_up"` (name `"N filer"`, project set when a single project was selected) and a
   `notify` (severity `info`).
-- **Activity names.** `remote_change` has `name` `"N ändringar från ACC"` and `project` set to
+- **Activity names.** `remote_change` has `name` `"N ändringar från <ACC|StreamBIM|Interaxo>"` and `project` set to
   the project name. `rename` and `move` carry the new name and `detail` `"från <old name>"`.
   `conflict` has `name` = the original file, `detail` = the name of the kept local copy. `error`
   has `name` = the file (or job id) and `detail` = the error text.
