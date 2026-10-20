@@ -39,7 +39,7 @@
             </tk:SettingsCard>
 
             <tk:SettingsCard Header="{loc:T Sv='Integritet', En='Privacy'}"
-                             Description="{loc:T Sv='Synka skickar filinnehåll bara mellan den här datorn och Autodesk (developer.api.autodesk.com och Autodesks fillagring). Ingen telemetri. Uppdateringskontrollen via internet är avstängd; nya versioner delas internt.', En='Synka sends file content only between this PC and Autodesk (developer.api.autodesk.com and Autodesk file storage). No telemetry. The online update check is off; new versions are shared internally.'}">
+                             Description="{loc:T Sv='Synka skickar filinnehåll bara mellan den här datorn och Autodesk (developer.api.autodesk.com och Autodesks fillagring). Ingen telemetri. Nya versioner delas internt.', En='Synka sends file content only between this PC and Autodesk (developer.api.autodesk.com and Autodesk file storage). No telemetry. New versions are shared internally.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE72E;" />
                 </tk:SettingsCard.HeaderIcon>
