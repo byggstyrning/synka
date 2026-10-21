@@ -783,8 +783,10 @@ async fn upload(
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Decode(e.to_string()))
 }
 
+/// A local read failure (a file still locked by the app that saved it) is retried by the outbox,
+/// as on ACC and StreamBIM: not `ApiError::Message`, which parks the job for good.
 fn local_error(path: &Path, e: &std::io::Error) -> ApiError {
-    ApiError::Message(format!("kunde inte läsa {}: {e}", path.display()))
+    ApiError::Decode(format!("kunde inte läsa {}: {e}", path.display()))
 }
 
 /// A random multipart boundary (128 bits).
