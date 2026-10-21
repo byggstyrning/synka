@@ -1,0 +1,6 @@
+# Synka's own exceptions for the release gate (claude-kit tools/release-scan, --allow).
+# Synka is Byggstyrning's product and names its publisher on purpose: the package identity
+# (Byggstyrning.Synka), PublisherDisplayName, the engine's CompanyName, the trademark notices,
+# the recipients' README and the legacy package names Install.ps1 removes. The organisation's
+# name is allowed for this app only; it stays denied for every other app. Decided 2026-10-21.
+Byggstyrning

@@ -567,7 +567,9 @@ finally { $archive.Dispose() }
 
 Invoke-Step "Release gate" {
     $env:PYTHONIOENCODING = "utf-8"
-    & $python $gate $zip.FullName $signedItem.FullName | ForEach-Object { Write-Host "   $_" }
+    # release-allow.txt: what Synka ships on purpose (its publisher's name), for this app only.
+    & $python $gate --allow (Join-Path $PSScriptRoot "release-allow.txt") $zip.FullName $signedItem.FullName |
+        ForEach-Object { Write-Host "   $_" }
     if ($LASTEXITCODE -ne 0) {
         throw "The release gate stopped the release (see above). Nothing was published. Fix the cause, then -OnlyPublish."
     }

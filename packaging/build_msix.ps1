@@ -300,7 +300,15 @@ try {
     }
     else {
         Write-Host "== 2. Building the engine (cargo build --release) ==" -ForegroundColor Cyan
-        Invoke-Native $cargo @("build", "--release") "cargo build --release"
+        # Panic locations carry source paths, and the dependencies' paths start with
+        # the builder's profile (C:\Users\<name>\.cargo\registry\...). The release gate
+        # refuses a user name in a package, so the profile is written as "~".
+        # CARGO_ENCODED_RUSTFLAGS takes the flag whole, spaces in the path included.
+        $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
+        $remap = "--remap-path-prefix=$($env:USERPROFILE)=~"
+        $env:CARGO_ENCODED_RUSTFLAGS = if ($previousFlags) { "$previousFlags$([char]0x1f)$remap" } else { $remap }
+        try { Invoke-Native $cargo @("build", "--release") "cargo build --release" }
+        finally { $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags }
     }
 }
 finally { Pop-Location }

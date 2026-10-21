@@ -3,8 +3,8 @@
 //!
 //! Left click (single) opens the window:
 //!   packaged   -> explorer.exe shell:AppsFolder\<PFN>!App
-//!   unpackaged -> env SYNKA_UI, else the first Synka.exe under the dev ui folder (searched
-//!                 once), else the sync folder.
+//!   unpackaged -> env SYNKA_UI, else (debug builds) the first Synka.exe under the dev ui
+//!                 folder (searched once), else the sync folder.
 //! Menu:
 //!   <status line, disabled>     e.g. "Synkad · jonatan@…" / "Logga in"
 //!   Öppna Synka               -> open the window
@@ -43,8 +43,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYSMICON, WM_SETICON,
 };
 
-/// Dev build of the window (unpackaged runs). Searched once.
-const UI_DEV_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), r"\ui\bin\x64\Debug");
+/// Dev build of the window (unpackaged debug runs). Searched once. Left out of release
+/// builds: it is the builder's checkout path, and a package must not carry it.
+#[cfg(debug_assertions)]
+const UI_DEV_DIR: Option<&str> = Some(concat!(env!("CARGO_MANIFEST_DIR"), r"\ui\bin\x64\Debug"));
+#[cfg(not(debug_assertions))]
+const UI_DEV_DIR: Option<&str> = None;
 const TOAST_WINDOW: Duration = Duration::from_secs(10);
 const TOASTS_PER_WINDOW: usize = 3;
 /// Permanent Windows notification-icon identity. Never change this between releases.
@@ -431,14 +435,14 @@ fn open_ui(paths: &Paths) {
     let _ = Command::new("explorer.exe").arg(&paths.sync_root).spawn();
 }
 
-/// SYNKA_UI, else the first Synka.exe under UI_DEV_DIR (up to 4 levels deep).
+/// SYNKA_UI, else (debug builds) the first Synka.exe under UI_DEV_DIR (up to 4 levels deep).
 fn find_ui_exe() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SYNKA_UI").map(PathBuf::from) {
         if p.is_file() {
             return Some(p);
         }
     }
-    search(Path::new(UI_DEV_DIR), 4)
+    search(Path::new(UI_DEV_DIR?), 4)
 }
 
 fn search(dir: &Path, depth: u32) -> Option<PathBuf> {
