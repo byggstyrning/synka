@@ -877,21 +877,23 @@ impl Engine {
             debug!("ignorerar svar från en ersatt inloggning");
             return;
         }
+        // A code check that failed for a transient reason keeps its challenge (`verify_mfa`), so
+        // the attempt waits for the code again instead of ending.
+        let code_kept = r.is_err()
+            && account
+                .as_deref()
+                .and_then(|key| self.ctx.streambim.get(key))
+                .is_some_and(|found| found.auth.has_pending_mfa());
         match r {
             Ok(LoginOutcome::MfaRequired) => {
-                // The login task is finished; the attempt now waits for the code.
-                let timer = mfa_timer(key.clone(), generation, itx);
-                if let Some(attempt) = live.sign_ins.get_mut(&key) {
-                    attempt.task = timer;
-                    attempt.mfa_pending = true;
-                    attempt.started_at = Instant::now();
-                }
-                self.ctx.ui.send(UiMsg::SignInProgress {
-                    provider,
-                    account,
-                    state: "mfa_required",
-                    error: None,
-                });
+                self.wait_for_code(live, &key, generation, itx, None);
+            }
+            Err(e) if code_kept => {
+                warn!(
+                    "koden kunde inte kontrolleras ({}): {e:#}",
+                    provider.label()
+                );
+                self.wait_for_code(live, &key, generation, itx, Some(format!("{e:#}")));
             }
             Ok(LoginOutcome::SignedIn(_)) => {
                 live.sign_ins.remove(&key);
@@ -937,6 +939,30 @@ impl Engine {
             }
         }
         self.publish();
+    }
+
+    /// The attempt `key` (its login or code check finished) now waits for an MFA code, for
+    /// MFA_WAIT. `error` tells why a code that was sent is asked for again.
+    fn wait_for_code(
+        &self,
+        live: &mut Live,
+        key: &SignInKey,
+        generation: u64,
+        itx: &UnboundedSender<Internal>,
+        error: Option<String>,
+    ) {
+        let timer = mfa_timer(key.clone(), generation, itx);
+        if let Some(attempt) = live.sign_ins.get_mut(key) {
+            attempt.task = timer;
+            attempt.mfa_pending = true;
+            attempt.started_at = Instant::now();
+        }
+        self.ctx.ui.send(UiMsg::SignInProgress {
+            provider: key.0,
+            account: key.1.clone(),
+            state: "mfa_required",
+            error,
+        });
     }
 
     /// The MFA wait ran out: the attempt ends, the user starts over.
@@ -1030,24 +1056,15 @@ impl Engine {
         live: &mut Live,
     ) {
         let Some(provider) = provider else {
-            self.cancel_all_sign_ins(live).await;
+            self.end_sign_ins(live, |_| true).await;
             self.sign_out_everything(live).await;
             return;
         };
         // The sign-ins of the accounts that go are cancelled first.
-        let targets = |key: &SignInKey| {
+        self.end_sign_ins(live, |key| {
             key.0 == provider && (account.is_none() || key.1.as_deref() == account.as_deref())
-        };
-        let pending: HashSet<SignInKey> = live
-            .sign_ins
-            .keys()
-            .cloned()
-            .chain(self.st().signing_in.iter().cloned())
-            .filter(|key| targets(key))
-            .collect();
-        for key in pending {
-            self.cancel_sign_in(live, &key).await;
-        }
+        })
+        .await;
         if self.signed_in_outside(provider, account.as_deref()) {
             self.sign_out_account(provider, account.as_deref()).await;
             let paused: Vec<Pid> = self
@@ -1081,6 +1098,27 @@ impl Engine {
             return;
         }
         self.sign_out_everything(live).await;
+    }
+
+    /// Cancels the pending sign-ins that `targets` selects and ends each one for the UI
+    /// (`cancelled`), so a sign-out leaves no browser or code wait in the hello replay.
+    async fn end_sign_ins(self: &Arc<Self>, live: &mut Live, targets: impl Fn(&SignInKey) -> bool) {
+        let pending: HashSet<SignInKey> = live
+            .sign_ins
+            .keys()
+            .cloned()
+            .chain(self.st().signing_in.iter().cloned())
+            .filter(|key| targets(key))
+            .collect();
+        for key in pending {
+            self.cancel_sign_in(live, &key).await;
+            self.ctx.ui.send(UiMsg::SignInProgress {
+                provider: key.0,
+                account: key.1,
+                state: "cancelled",
+                error: None,
+            });
+        }
     }
 
     /// True when a signed-in account lies outside the sign-out of `provider` (and `account`).
@@ -3633,10 +3671,14 @@ impl Engine {
                     "Starta om Synka för att slutföra återställningen.".to_string(),
                 )
             } else if !signed_in {
-                let text = if st.signing_in.is_empty() {
-                    "Logga in"
-                } else {
+                // Only ACC and Interaxo sign in in the browser; StreamBIM logs in here.
+                let browser = st.signing_in.iter().any(|key| key.0 != Provider::StreamBim);
+                let text = if browser {
                     "Väntar på inloggning i webbläsaren…"
+                } else if !st.signing_in.is_empty() {
+                    "Loggar in på StreamBIM…"
+                } else {
+                    "Logga in"
                 };
                 ("signed_out", text.to_string())
             } else if let Some(e) = &st.last_error {
@@ -5679,9 +5721,22 @@ fn keep_pending_local(store: &Store, pid: Pid, delta: &mut Delta) -> Result<()> 
     // A move or rename still queued, or refused by the provider, keeps the item where the user put
     // it. The listing of its remote place (the old or the new parent) does not show it there, and
     // must not delete it: that would re-create it at the other place on every poll.
-    let mut moved_locally = store.pending_items(pid, &["rename", "move"])?;
-    moved_locally.extend(store.refused_renames(pid)?);
-    delta.deletes.retain(|id| !moved_locally.contains(id));
+    let queued = store.pending_items(pid, &["rename", "move"])?;
+    // A refused one (its job is parked for good) is kept only while the server still has the item:
+    // its local row differs from the remote one, so every poll that sees the item upserts it. With
+    // no upsert it was deleted remotely, and that delete goes through.
+    let refused = store.refused_renames(pid)?;
+    let still_listed: HashSet<&str> = delta
+        .upserts
+        .iter()
+        .filter(|up| refused.contains(&up.id))
+        .map(|up| up.id.as_str())
+        .collect();
+    delta
+        .deletes
+        .retain(|id| !queued.contains(id) && !still_listed.contains(id.as_str()));
+    let mut moved_locally = queued;
+    moved_locally.extend(refused);
     if delta.upserts.is_empty() {
         return Ok(());
     }

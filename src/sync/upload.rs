@@ -199,7 +199,7 @@ pub async fn process_due_except(
         .store
         .due_jobs(now_ms(), BATCH)?
         .into_iter()
-        .filter(|job| !waits_for_sign_in(ctx, job) && !waits_while_offline(ctx, job, offline))
+        .filter(|job| !waits(ctx, job, offline))
         .collect();
     if jobs.is_empty() {
         return Ok(0);
@@ -228,47 +228,29 @@ pub async fn process_due_except(
     Ok(processed)
 }
 
-/// The provider of a job's project (ACC when the project is gone).
-fn job_provider(ctx: &CtxRef, job: &OutboxJob) -> Provider {
-    ctx.store
-        .project(job.pid)
-        .ok()
-        .flatten()
-        .map(|p| p.provider)
-        .unwrap_or_default()
-}
-
-/// A job whose project cannot be served (its provider is signed out, or StreamBIM is signed in to
-/// another region) waits like offline work: it is postponed without a request and without spending
-/// an attempt. True when it waits.
-fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
+/// A job waits like offline work (see `handle_failure`): it is postponed without a request and
+/// without spending an attempt, when its project cannot be served (its provider is signed out, or
+/// StreamBIM is signed in to another region) or its provider has no connection (`offline`). The
+/// other providers' jobs are not affected. A job of a gone project counts as ACC's. True when it
+/// waits.
+fn waits(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
     let project = ctx.store.project(job.pid).ok().flatten();
+    let provider = project.as_ref().map(|p| p.provider).unwrap_or_default();
     let connected = match &project {
         Some(p) => ctx.project_connected(p),
-        None => ctx.signed_in(Provider::Acc),
+        None => ctx.signed_in(provider),
     };
-    if connected {
+    let waiting = if !connected {
+        let target = match &project {
+            Some(p) => ctx.sign_in_target(p),
+            None => provider.label().to_string(),
+        };
+        format!("Logga in på {target} för att synka.")
+    } else if offline.contains(&provider) {
+        format!("Ingen anslutning till {}.", provider.label())
+    } else {
         return false;
-    }
-    let target = match &project {
-        Some(p) => ctx.sign_in_target(p),
-        None => Provider::Acc.label().to_string(),
     };
-    let waiting = format!("Logga in på {target} för att synka.");
-    let _ = ctx
-        .store
-        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
-    true
-}
-
-/// A job of a provider without a connection waits like offline work (see `handle_failure`): no
-/// request, no attempt. The other providers' jobs are not affected. True when it waits.
-fn waits_while_offline(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
-    let provider = job_provider(ctx, job);
-    if !offline.contains(&provider) {
-        return false;
-    }
-    let waiting = format!("Ingen anslutning till {}.", provider.label());
     let _ = ctx
         .store
         .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
