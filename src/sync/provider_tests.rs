@@ -530,6 +530,51 @@ fn a_rename_the_provider_refuses_keeps_the_local_name_and_queues_nothing_more() 
     }
 }
 
+#[test]
+fn a_refused_rename_or_move_gives_way_to_a_remote_delete() {
+    let f = fixture("interaxo-refused-then-deleted");
+    make_interaxo(&f);
+    for it in [
+        row(&f.p, "fa", Some("co.ROOT"), "Ritningar", Kind::Folder),
+        row(&f.p, "fb", Some("co.ROOT"), "Arkiv", Kind::Folder),
+        // Renamed here from "a.txt"; the server still has the old name.
+        row(&f.p, "I1", Some("co.ROOT"), "b.txt", Kind::File),
+        // Moved here from "fa"; the server still has it there.
+        row(&f.p, "F1", Some("fb"), "plan.pdf", Kind::File),
+    ] {
+        f.ctx.store.upsert_item(&it).unwrap();
+    }
+    for (kind, id) in [("rename", "I1"), ("move", "F1")] {
+        let job = f.ctx.store.enqueue(f.p.pid, kind, Some(id), "{}").unwrap();
+        f.ctx
+            .store
+            .job_unsupported(job, "Interaxo API:t stöder inte det.")
+            .unwrap();
+    }
+    let refused = f.ctx.store.refused_renames(f.p.pid).unwrap();
+    assert!(refused.contains("I1") && refused.contains("F1"));
+
+    // A colleague deletes both in Interaxo: no listing shows them any more.
+    let listings = vec![
+        (
+            "co.ROOT",
+            vec![
+                row(&f.p, "fa", Some("co.ROOT"), "Ritningar", Kind::Folder),
+                row(&f.p, "fb", Some("co.ROOT"), "Arkiv", Kind::Folder),
+            ],
+        ),
+        ("fa", Vec::new()),
+        ("fb", Vec::new()),
+    ];
+    assert_eq!(refused_move_poll(&f, listings), 2, "both deletes apply");
+    for id in ["I1", "F1"] {
+        assert!(
+            f.ctx.store.item(f.p.pid, id).unwrap().is_none(),
+            "{id} is gone after its remote delete"
+        );
+    }
+}
+
 /// One poll over the given folder listings (the walk of `poll_project`, minus the disk); returns
 /// how many store changes it applied, which is what the engine reports as activity.
 fn refused_move_poll(f: &Fixture, listings: Vec<(&str, Vec<crate::model::Item>)>) -> usize {
