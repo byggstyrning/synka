@@ -12,10 +12,10 @@
 //! an error message. A refused call is logged with the server's reason, but only after the
 //! submitted secrets are removed from it (see `clean`).
 
-use crate::auth::{dpapi_protect, dpapi_unprotect, UserInfo};
+use crate::auth::{dpapi_protect, dpapi_unprotect, remove_if_exists, write_atomic, UserInfo};
 use crate::http::{Api, TokenSource};
 use crate::model::{HubInfo, Project};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -1259,27 +1259,6 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Write via `<path>.tmp` then rename over the target (atomic on the same volume). The same as
-/// `auth::write_atomic`, which is private to that module.
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    std::fs::write(&tmp, data).with_context(|| format!("kunde inte skriva {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("kunde inte byta ut {}", path.display()))?;
-    Ok(())
-}
-
-fn remove_if_exists(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("kunde inte ta bort {}", path.display())),
-    }
 }
 
 /// Remove the token file; a failure is logged (the caller has already cleared the memory).
