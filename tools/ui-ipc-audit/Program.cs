@@ -28,6 +28,10 @@ internal static class Program
             ("activity_mime_mismatch_preserves_item_reason", ActivityMimeMismatchPreservesItemReason),
             ("activity_error_details_redact_credentials", ActivityErrorDetailsRedactCredentials),
             ("activity_local_paths_with_spaces_are_fully_redacted", ActivityLocalPathsWithSpacesAreFullyRedacted),
+            ("provider_messages_parse_and_commands_carry_protocol_fields", ProviderMessagesParseAndCommandsCarryProtocolFields),
+            ("providers_without_interaxo_are_not_offered", ProvidersWithoutInteraxoAreNotOffered),
+            ("sign_in_progress_is_forgotten_across_connections", SignInProgressIsForgottenAcrossConnections),
+            ("settings_retries_and_cancels_acc_and_interaxo_browser_sign_ins", SettingsRetriesAndCancelsBrowserSignInsPerProvider),
         };
         var selected = args.Length == 0 ? null : args[0];
         if (selected is not null && !scenarios.Any(s => s.Name == selected))
@@ -75,6 +79,222 @@ internal static class Program
         Console.WriteLine($"Report: {reportPath}");
         Console.WriteLine($"UI audit: {results.Count - failures} passed; {failures} failed;");
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// The multi-provider messages (accounts, hub provider, provider settings, sign-in progress,
+    /// StreamBIM regions) parse, StreamBIM accounts are one per server (keyed), an older engine's
+    /// status still gives the ACC account, and each new command carries exactly the fields of
+    /// docs\IPC.md through the real pipe: sign_in with exactly one of region and url, and the
+    /// account on sign_in_mfa, cancel_sign_in and sign_out.
+    /// </summary>
+    private static async Task<string> ProviderMessagesParseAndCommandsCarryProtocolFields()
+    {
+        using var pipes = await PipePair.Connect();
+        var client = NewClient();
+        var progress = new List<string>();
+        client.SignInProgress += info => progress.Add(info.Provider + ":" + (info.Account ?? "-") + ":" + info.State);
+        var serving = Serve(client, pipes.Window);
+        await pipes.AckHello();
+
+        // Two StreamBIM accounts, one per server: the default region (app) is signed in, a custom address is signing in.
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":true,"user":{"name":"Anna","email":"a@x.se"},"state":"synced","accounts":[{"provider":"acc","label":"ACC","configured":true,"signed_in":true,"signing_in":false,"user":{"name":"Anna","email":"a@x.se"},"host":null,"account":null},{"provider":"streambim","label":"StreamBIM","configured":true,"signed_in":true,"signing_in":false,"user":{"name":"Bo","email":"b@x.se"},"host":"app.streambim.com","account":"app"},{"provider":"streambim","label":"StreamBIM","configured":true,"signed_in":false,"signing_in":true,"user":null,"host":"streambim.example.se","account":"streambim.example.se"},{"provider":"interaxo","label":"Interaxo","configured":false,"signed_in":false,"signing_in":false,"user":null,"host":null,"account":null}]}""");
+        await Until(() => client.Accounts.Count == 4);
+        Require(client.IsSignedIn, "Status with accounts did not make the window signed in");
+        Require(client.AccountFor("acc") is { SignedIn: true } acc && acc.User?.Name == "Anna" && acc.Account is null,
+            "ACC account did not parse, or its account key is not null");
+        Require(client.AccountFor("interaxo") is { Configured: false, SignedIn: false }, "Interaxo account did not parse");
+        var streamBim = client.StreamBimAccounts;
+        Require(streamBim.Count == 2
+            && streamBim[0] is { Account: "app", SignedIn: true, Host: "app.streambim.com" } bo && bo.User?.Name == "Bo"
+            && streamBim[1] is { Account: "streambim.example.se", SignedIn: false, SigningIn: true, Host: "streambim.example.se" },
+            "StreamBIM accounts did not parse as one entry per server, in the engine's order, with their keys");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"projects","loading":false,"hubs":[{"id":"streambim:app","name":"StreamBIM","provider":"streambim","projects":[{"id":"streambim:app:1552","name":"Projekt","subscribed":true,"local_path":"C:/Synka/StreamBIM/Projekt"}]},{"id":"b.1","name":"Byggbolaget","projects":[]}]}""");
+        await Until(() => client.Projects?.Hubs?.Count == 2);
+        Require(client.Projects!.Hubs![0].Provider == "streambim" && client.Projects.Hubs[1].Provider is null,
+            "Hub provider did not parse, or a hub without one is not null (ACC by default)");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"settings","propagate_deletes":false,"max_downloads":4,"max_uploads":2,"poll_active_secs":60,"log_level":"info","start_at_login":false,"sync_root":"C:/Synka","client_id_configured":true,"providers":["acc","streambim","interaxo"],"interaxo_client_id":"my-client","interaxo_redirect_uri":"http://localhost:47864/","interaxo_redirect_uri_default":"http://localhost:47864/","interaxo_client_secret_set":true}""");
+        await Until(() => client.Settings?.InteraxoClientSecretSet == true);
+        Require(client.Settings!.Providers?.Count == 3 && client.Settings.InteraxoClientId == "my-client"
+            && client.Settings.InteraxoRedirectUriDefault == "http://localhost:47864/",
+            "Provider settings did not parse");
+
+        // The code prompt belongs to its account: the other StreamBIM account has no progress of its own.
+        await pipes.Writer.WriteLineAsync("""{"type":"sign_in_progress","provider":"streambim","account":"streambim.example.se","state":"mfa_required","error":null}""");
+        await Until(() => client.SignInProgressFor("streambim", "streambim.example.se")?.State == "mfa_required");
+        Require(client.SignInProgressFor("streambim", "app") is null, "A code prompt of one StreamBIM account showed for another");
+        Require(progress.Contains("streambim:streambim.example.se:mfa_required"), "sign_in_progress event was not raised with its account");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"streambim_regions","regions":[{"subdomain":"app","title":"Europa","is_default":true},{"subdomain":"sweden","title":"Sverige","is_default":false}]}""");
+        await Until(() => client.StreamBimRegions?.Regions?.Count == 2);
+        Require(client.StreamBimRegions!.Regions![0] is { Subdomain: "app", IsDefault: true }, "StreamBIM regions did not parse");
+
+        // An older engine: no accounts. The ACC account comes from signed_in and user; StreamBIM is unknown,
+        // and its progress carries no account (null), so it is kept under the provider alone.
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":true,"user":{"name":"Anna","email":"a@x.se"},"state":"synced"}""");
+        await Until(() => client.Accounts.Count == 0 && client.Status?.State == "synced");
+        Require(client.AccountFor("acc") is { SignedIn: true } older && older.User?.Email == "a@x.se",
+            "Older engine: ACC account was not taken from signed_in and user");
+        Require(client.AccountFor("streambim") is null && client.StreamBimAccounts.Count == 0,
+            "Older engine: a StreamBIM account it does not report was not empty");
+        await pipes.Writer.WriteLineAsync("""{"type":"sign_in_progress","provider":"streambim","state":"failed","error":"Fel"}""");
+        await Until(() => client.SignInProgressFor("streambim")?.State == "failed");
+        Require(client.SignInProgressFor("streambim", null) is { Account: null }, "Older engine: StreamBIM progress without an account was not kept without one");
+
+        // sign_in: exactly one of region and url.
+        var byRegion = await ExpectCommand(pipes, client.SignInStreamBimAsync("sweden", null, "b@x.se", "Hemligt-123"), "sign_in");
+        Require(byRegion.GetProperty("provider").GetString() == "streambim" && byRegion.GetProperty("region").GetString() == "sweden"
+            && !byRegion.TryGetProperty("url", out _)
+            && byRegion.GetProperty("username").GetString() == "b@x.se" && byRegion.GetProperty("password").GetString() == "Hemligt-123",
+            "sign_in with a region did not carry provider, region, username and password, and no url");
+
+        var byUrl = await ExpectCommand(pipes, client.SignInStreamBimAsync(null, "https://streambim.example.se", "c@x.se", "Hemligt-456"), "sign_in");
+        Require(byUrl.GetProperty("provider").GetString() == "streambim" && byUrl.GetProperty("url").GetString() == "https://streambim.example.se"
+            && !byUrl.TryGetProperty("region", out _) && byUrl.GetProperty("username").GetString() == "c@x.se",
+            "sign_in with a url did not carry the url, and no region");
+
+        // Both or neither is refused before anything is sent: the next command on the pipe is the one after them.
+        var both = await client.SignInStreamBimAsync("app", "https://streambim.example.se", "d@x.se", "Hemligt-789");
+        var neither = await client.SignInStreamBimAsync(null, null, "d@x.se", "Hemligt-789");
+        Require(!both.Ok && !neither.Ok, "sign_in with both a region and a url, or with neither, was not refused");
+
+        var mfa = await ExpectCommand(pipes, client.SignInMfaAsync("streambim", "streambim.example.se", "012345"), "sign_in_mfa");
+        Require(mfa.GetProperty("provider").GetString() == "streambim" && mfa.GetProperty("account").GetString() == "streambim.example.se"
+            && mfa.GetProperty("code").GetString() == "012345",
+            "sign_in_mfa did not send the account and the code as a string with its leading zero");
+
+        var cancel = await ExpectCommand(pipes, client.CancelSignInAsync("streambim", "streambim.example.se"), "cancel_sign_in");
+        Require(cancel.GetProperty("provider").GetString() == "streambim" && cancel.GetProperty("account").GetString() == "streambim.example.se",
+            "cancel_sign_in did not name the provider and the account");
+
+        var cancelAll = await ExpectCommand(pipes, client.CancelSignInAsync("streambim"), "cancel_sign_in");
+        Require(cancelAll.GetProperty("provider").GetString() == "streambim" && !cancelAll.TryGetProperty("account", out _),
+            "cancel_sign_in without an account sent one");
+
+        var signOutOne = await ExpectCommand(pipes, client.SignOutAsync("streambim", "app"), "sign_out");
+        Require(signOutOne.GetProperty("provider").GetString() == "streambim" && signOutOne.GetProperty("account").GetString() == "app",
+            "sign_out for one StreamBIM account did not name the provider and the account");
+
+        var signOutStreamBim = await ExpectCommand(pipes, client.SignOutAsync("streambim"), "sign_out");
+        Require(signOutStreamBim.GetProperty("provider").GetString() == "streambim" && !signOutStreamBim.TryGetProperty("account", out _),
+            "sign_out for a provider sent an account");
+
+        var signOutAll = await ExpectCommand(pipes, client.SignOutAsync(), "sign_out");
+        Require(!signOutAll.TryGetProperty("provider", out _) && !signOutAll.TryGetProperty("account", out _),
+            "sign_out without a provider sent one");
+
+        var signOutInteraxo = await ExpectCommand(pipes, client.SignOutAsync("interaxo"), "sign_out");
+        Require(signOutInteraxo.GetProperty("provider").GetString() == "interaxo" && !signOutInteraxo.TryGetProperty("account", out _),
+            "sign_out did not name the provider");
+
+        var signIn = await ExpectCommand(pipes, client.SignInAsync(), "sign_in");
+        Require(signIn.GetProperty("provider").GetString() == "acc", "sign_in without an argument did not mean ACC");
+
+        await ExpectCommand(pipes, client.RequestStreamBimRegionsAsync(), "streambim_regions");
+
+        return "Two StreamBIM accounts parsed per server with their keys; per-account sign-in progress; an older status fell back to ACC; "
+            + "sign_in with region or url (never both, refused locally when both or neither), sign_in_mfa, cancel_sign_in and sign_out "
+            + "(per account, per provider, all) and streambim_regions sent their protocol fields";
+    }
+
+    /// <summary>
+    /// Interaxo turned off (settings.json): the engine's `providers` names only ACC and StreamBIM and its status
+    /// has no Interaxo account, so the window offers no Interaxo sign-in. An engine that sends no `providers`
+    /// (older) offers every provider, as it did before.
+    /// </summary>
+    private static async Task<string> ProvidersWithoutInteraxoAreNotOffered()
+    {
+        using var pipes = await PipePair.Connect();
+        var client = NewClient();
+        var serving = Serve(client, pipes.Window);
+        await pipes.AckHello();
+
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":true,"user":{"name":"Anna","email":"a@x.se"},"state":"synced","accounts":[{"provider":"acc","label":"ACC","configured":true,"signed_in":true,"signing_in":false,"user":{"name":"Anna","email":"a@x.se"},"host":null,"account":null}]}""");
+        await Until(() => client.Accounts.Count == 1);
+        Require(client.AccountFor("interaxo") is null, "An account of a provider the engine left out was reported");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"settings","propagate_deletes":false,"max_downloads":4,"max_uploads":2,"poll_active_secs":60,"log_level":"info","start_at_login":false,"sync_root":"C:/Synka","client_id_configured":true,"providers":["acc","streambim"],"interaxo_client_id":null,"interaxo_redirect_uri":"http://localhost:47864/","interaxo_redirect_uri_default":"http://localhost:47864/","interaxo_client_secret_set":false}""");
+        await Until(() => client.Settings?.Providers?.Count == 2);
+        Require(client.ProviderOffered("acc") && client.ProviderOffered("streambim") && !client.ProviderOffered("interaxo"),
+            "providers without interaxo did not leave Interaxo out of the offer");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"settings","propagate_deletes":false,"max_downloads":4,"max_uploads":2,"poll_active_secs":60,"log_level":"info","start_at_login":false,"sync_root":"C:/Synka","client_id_configured":true}""");
+        await Until(() => client.Settings?.Providers is null);
+        Require(client.ProviderOffered("interaxo"), "An engine that sends no providers did not offer Interaxo as before");
+
+        pipes.Engine.Dispose();
+        await serving.WaitAsync(IoDeadline);
+        return "A status and settings without Interaxo left it out of the offer; an engine without providers offers every provider";
+    }
+
+    /// <summary>
+    /// The cached sign-in progress belongs to one connection: a disconnect and a reconnect both forget
+    /// it, so a StreamBIM code prompt from an engine that is gone is not shown again. Each StreamBIM
+    /// account's prompt is forgotten the same way (here the account key is "app").
+    /// </summary>
+    private static Task<string> SignInProgressIsForgottenAcrossConnections()
+    {
+        var client = NewClient();
+        var handle = typeof(EngineClient).GetMethod("HandleLine", PrivateInstance)!;
+        var publish = typeof(EngineClient).GetMethod("PublishState", PrivateInstance)!;
+        const string prompt = """{"type":"sign_in_progress","provider":"streambim","account":"app","state":"mfa_required","error":null}""";
+
+        publish.Invoke(client, new object[] { EngineConnectionState.Connected, true });
+        handle.Invoke(client, new object[] { prompt });
+        Require(client.SignInProgressFor("streambim", "app")?.State == "mfa_required", "The MFA prompt was not kept while connected");
+
+        publish.Invoke(client, new object[] { EngineConnectionState.Disconnected, false });
+        Require(client.SignInProgressFor("streambim", "app") is null, "A disconnect kept the cached MFA prompt");
+
+        handle.Invoke(client, new object[] { prompt });
+        publish.Invoke(client, new object[] { EngineConnectionState.Connected, true });
+        Require(client.SignInProgressFor("streambim", "app") is null, "A reconnect kept the cached MFA prompt");
+
+        return Task.FromResult("A prompt was kept while connected and forgotten by the disconnect and by the reconnect");
+    }
+
+    /// <summary>
+    /// Settings retries an ACC or Interaxo sign-in while its browser is open (sign_in again, which the
+    /// engine answers by replacing the pending attempt), and Avbryt sends cancel_sign_in for that provider only.
+    /// </summary>
+    private static async Task<string> SettingsRetriesAndCancelsBrowserSignInsPerProvider()
+    {
+        using var pipes = await PipePair.Connect();
+        var client = NewClient();
+        _ = Serve(client, pipes.Window);
+        await pipes.AckHello();
+        await pipes.Writer.WriteLineAsync("""{"type":"status","signed_in":false,"user":null,"state":"signed_out","accounts":[{"provider":"acc","label":"ACC","configured":true,"signed_in":false,"signing_in":true,"user":null,"host":null},{"provider":"streambim","label":"StreamBIM","configured":true,"signed_in":false,"signing_in":false,"user":null,"host":null},{"provider":"interaxo","label":"Interaxo","configured":true,"signed_in":false,"signing_in":true,"user":null,"host":null}]}""");
+        await Until(() => client.Accounts.Count == 3);
+        Require(client.AccountFor("acc") is { SigningIn: true, SignedIn: false }, "ACC was not seen signing in");
+
+        var retry = await ExpectCommand(pipes, client.SignInAsync("acc"), "sign_in");
+        Require(retry.GetProperty("provider").GetString() == "acc", "A retry while the ACC browser is open did not name ACC");
+
+        var cancelAcc = await ExpectCommand(pipes, client.CancelSignInAsync("acc"), "cancel_sign_in");
+        Require(cancelAcc.GetProperty("provider").GetString() == "acc", "cancel_sign_in did not name ACC");
+
+        await pipes.Writer.WriteLineAsync("""{"type":"sign_in_progress","provider":"acc","state":"cancelled","error":null}""");
+        await Until(() => client.SignInProgressFor("acc")?.State == "cancelled");
+
+        var cancelInteraxo = await ExpectCommand(pipes, client.CancelSignInAsync("interaxo"), "cancel_sign_in");
+        Require(cancelInteraxo.GetProperty("provider").GetString() == "interaxo", "cancel_sign_in did not name Interaxo");
+
+        return "A retry sent sign_in for ACC while signing in; cancel_sign_in named ACC, then Interaxo, and the cancelled progress was kept per provider";
+    }
+
+    /// <summary>Takes the next command the client writes, checks its name, acks it, and returns it.</summary>
+    private static async Task<JsonElement> ExpectCommand(PipePair pipes, Task<Ack> call, string cmd)
+    {
+        using var document = JsonDocument.Parse(await pipes.Read());
+        var root = document.RootElement.Clone();
+        var name = root.GetProperty("cmd").GetString();
+        Require(name == cmd, $"Expected the command {cmd}, the client sent {name}");
+        await pipes.Writer.WriteLineAsync(JsonSerializer.Serialize(new { type = "ack", id = root.GetProperty("id").GetInt64(), ok = true }));
+        var ack = await call;
+        Require(ack.Ok, $"{cmd} was not acknowledged: {ack.Error}");
+        return root;
     }
 
     private static string FindRepo()

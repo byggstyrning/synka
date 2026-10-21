@@ -1,7 +1,7 @@
 //! SQLite state: one file, WAL, small page cache. All writes for one delta happen in one
 //! transaction together with the cursor. An empty delta must not write anything.
 //!
-//! Schema (create on open, `PRAGMA user_version` = 3):
+//! Schema (create on open, `PRAGMA user_version` = 4):
 //!   PRAGMA journal_mode=WAL; synchronous=NORMAL; cache_size=-2048; foreign_keys=OFF;
 //!   kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)
 //!   project(pid INTEGER PRIMARY KEY, hub_id TEXT NOT NULL, hub_name TEXT NOT NULL,
@@ -21,6 +21,8 @@
 //!   v3: project.tops TEXT = JSON `[{"id","name"}]`, the folders shown in the project directory
 //!       (`model::TopFolder`). NULL for projects from v2, whose rows still use the old layout
 //!       (the project directory was "Project Files"); the engine rebuilds those.
+//!   v4: project.provider TEXT NOT NULL DEFAULT 'acc' (`model::Provider::as_str`) and
+//!       project.meta TEXT (provider JSON, NULL for ACC). Existing rows are ACC.
 //!   outbox(id INTEGER PRIMARY KEY, pid INTEGER NOT NULL, kind TEXT NOT NULL, item TEXT,
 //!          payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL,
 //!          created_ms INTEGER NOT NULL, dead INTEGER NOT NULL DEFAULT 0, last_error TEXT)
@@ -129,7 +131,8 @@ const ITEM_COLS: &str = "pid, id, parent, name, kind, rver, bver, size, ctime_ms
 
 /// Column list shared by every project SELECT; order matches `project_from_row`.
 const PROJECT_COLS: &str = "pid, hub_id, hub_name, project_id, name, root_folder_urn, urn_ns, \
-                            oss_scopes, change_source, cursor, enabled, last_sync_ms, tops";
+                            oss_scopes, change_source, cursor, enabled, last_sync_ms, tops, \
+                            provider, meta";
 
 fn u8_of(v: i64) -> u8 {
     v.clamp(0, 255) as u8
@@ -179,6 +182,13 @@ fn project_from_row(r: &Row<'_>) -> rusqlite::Result<Project> {
             .get::<_, Option<String>>(12)?
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default(),
+        // An unknown name (a newer build wrote it) reads as ACC rather than failing the row.
+        provider: r
+            .get::<_, Option<String>>(13)?
+            .as_deref()
+            .and_then(Provider::parse)
+            .unwrap_or_default(),
+        meta: r.get(14)?,
     })
 }
 
@@ -332,12 +342,21 @@ fn migrate(conn: &Connection) -> Result<()> {
             )?;
             tx.commit()?;
         }
-        2 | 3 => {}
+        2..=4 => {}
         other => bail!("synka.db schema version {other} is newer than this build supports"),
     }
     if v < 3 {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch("ALTER TABLE project ADD COLUMN tops TEXT; PRAGMA user_version = 3;")?;
+        tx.commit()?;
+    }
+    if v < 4 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE project ADD COLUMN provider TEXT NOT NULL DEFAULT 'acc';
+             ALTER TABLE project ADD COLUMN meta TEXT;
+             PRAGMA user_version = 4;",
+        )?;
         tx.commit()?;
     }
     Ok(())
@@ -431,15 +450,15 @@ impl Store {
     }
 
     /// Insert or update by `project_id`; returns pid. Ignores `p.pid` on insert.
-    /// On update only the descriptive fields (hub, name, root, namespace, scopes, top folders)
-    /// are overwritten; `change_source`, `cursor`, `enabled` and `last_sync_ms` are owned by
-    /// their dedicated setters / `apply_delta` and are kept.
+    /// On update only the descriptive fields (hub, name, root, namespace, scopes, top folders,
+    /// provider, meta) are overwritten; `change_source`, `cursor`, `enabled` and `last_sync_ms`
+    /// are owned by their dedicated setters / `apply_delta` and are kept.
     pub fn upsert_project(&self, p: &Project) -> Result<Pid> {
         let c = self.conn()?;
         c.prepare_cached(
             "INSERT INTO project (hub_id, hub_name, project_id, name, root_folder_urn, urn_ns, \
-             oss_scopes, change_source, cursor, enabled, last_sync_ms, tops) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             oss_scopes, change_source, cursor, enabled, last_sync_ms, tops, provider, meta) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(project_id) DO UPDATE SET \
                hub_id = excluded.hub_id, \
                hub_name = excluded.hub_name, \
@@ -447,7 +466,9 @@ impl Store {
                root_folder_urn = excluded.root_folder_urn, \
                urn_ns = excluded.urn_ns, \
                oss_scopes = excluded.oss_scopes, \
-               tops = excluded.tops",
+               tops = excluded.tops, \
+               provider = excluded.provider, \
+               meta = excluded.meta",
         )?
         .execute(params![
             p.hub_id,
@@ -462,6 +483,8 @@ impl Store {
             p.enabled as i64,
             p.last_sync_ms,
             tops_json(&p.tops),
+            p.provider.as_str(),
+            p.meta,
         ])?;
         let pid: Pid = c.query_row(
             "SELECT pid FROM project WHERE project_id = ?1",
@@ -1088,6 +1111,22 @@ impl Store {
         Ok(removed)
     }
 
+    /// Items whose rename or move the provider refused (`dead = 3`, see `job_unsupported`). Their
+    /// local name and place stay until the user changes them again.
+    pub fn refused_renames(&self, pid: Pid) -> Result<HashSet<String>> {
+        let c = self.conn()?;
+        let mut st = c.prepare_cached(
+            "SELECT item FROM outbox WHERE pid = ?1 AND dead = 3 AND item IS NOT NULL \
+             AND kind IN ('rename', 'move')",
+        )?;
+        let rows = st.query_map(params![pid], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     /// Items with a live job of one of `kinds` (their local state wins over the next poll).
     pub fn pending_items(&self, pid: Pid, kinds: &[&str]) -> Result<HashSet<String>> {
         let c = self.conn()?;
@@ -1441,6 +1480,8 @@ mod tests {
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: Provider::Acc,
+            meta: None,
         }
     }
 
@@ -2025,7 +2066,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         // v3: the project's top folders are unknown and its rows use the old layout (its
         // root row is an ACC folder), so the engine rebuilds it.
         assert!(store.project(1).unwrap().unwrap().tops.is_empty());
@@ -2067,6 +2108,77 @@ mod tests {
         store.upsert_item(&it).unwrap();
         assert_eq!(store.children_named(1, "co.R", "NY.PDF").unwrap().len(), 1);
         drop(store);
+    }
+
+    #[test]
+    fn provider_and_meta_round_trip() {
+        let (store, _g) = open_temp("provider");
+        let mut p = project();
+        p.project_id = "streambim:app:1552".into();
+        p.provider = Provider::StreamBim;
+        p.meta = Some(r#"{"region":"app"}"#.into());
+        let pid = store.upsert_project(&p).unwrap();
+        let back = store.project(pid).unwrap().unwrap();
+        assert_eq!(back.provider, Provider::StreamBim);
+        assert_eq!(back.meta.as_deref(), Some(r#"{"region":"app"}"#));
+
+        // The update path writes both columns too.
+        p.provider = Provider::Interaxo;
+        p.meta = None;
+        assert_eq!(store.upsert_project(&p).unwrap(), pid);
+        let back = store.project(pid).unwrap().unwrap();
+        assert_eq!(back.provider, Provider::Interaxo);
+        assert_eq!(back.meta, None);
+
+        // A provider name this build does not know reads as ACC instead of failing the row.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE project SET provider = 'future' WHERE pid = ?1",
+                [pid],
+            )
+            .unwrap();
+        assert_eq!(store.project(pid).unwrap().unwrap().provider, Provider::Acc);
+    }
+
+    #[test]
+    fn v3_databases_upgrade_and_their_projects_are_acc() {
+        let path = std::env::temp_dir().join(format!("synka-store-v3-{}.db", std::process::id()));
+        let _g = TempDb(path.clone());
+        let _ = std::fs::remove_file(&path);
+        {
+            // The v3 layout by hand: v1 tables, then the v2 and v3 column additions.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(
+                "ALTER TABLE item ADD COLUMN lkey TEXT;
+                 CREATE INDEX IF NOT EXISTS item_by_key ON item (pid, parent, lkey);
+                 ALTER TABLE project ADD COLUMN tops TEXT;
+                 PRAGMA user_version = 3;
+                 INSERT INTO project (pid, hub_id, hub_name, project_id, name, root_folder_urn, urn_ns, tops)
+                   VALUES (1, 'b.h', 'Hub', 'b.p', 'Proj', 'urn:adsk.wipemea:fs.folder:co.R', 'wipemea',
+                           '[{\"id\":\"co.R\",\"name\":\"Project Files\"}]');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let v: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+        let p = store.project(1).unwrap().unwrap();
+        assert_eq!(p.provider, Provider::Acc);
+        assert_eq!(p.meta, None);
+        assert_eq!(p.tops.len(), 1, "the v3 columns survive the upgrade");
+        // A v4 database opens again unchanged.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.project(1).unwrap().unwrap().provider, Provider::Acc);
     }
 
     #[test]

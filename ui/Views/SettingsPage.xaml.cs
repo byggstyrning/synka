@@ -1,10 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using CommunityToolkit.WinUI.Controls;
 using Synka.Services;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Windows.Storage.Pickers;
 
@@ -19,11 +22,6 @@ public sealed partial class SettingsPage : Page
     private static readonly TimeSpan InstallAnswerTimeout = TimeSpan.FromSeconds(60);
 
     private readonly EngineClient _engine = EngineClient.Instance;
-
-    // Five minutes for the browser, bounded token/profile calls, then reconnect margin.
-    private static readonly TimeSpan ApsClientIdAnswerTimeout = TimeSpan.FromMinutes(8);
-    private ApsClientIdEditState _apsClientIdEdit => _engine.ApsClientIdEdit;
-    private bool _apsMirroring;
 
     /// <summary>
     /// True while the page mirrors the engine's values into the controls. Without it
@@ -43,9 +41,6 @@ public sealed partial class SettingsPage : Page
 
     /// <summary>A refusal of the last update command, shown until the engine says something newer.</summary>
     private string? _updateProblem;
-
-    /// <summary>Sign-in was started and the engine does not yet report an account.</summary>
-    private bool _signInStarted;
 
     /// <summary>True from Flytta… until the engine has answered: the folder buttons wait meanwhile.</summary>
     private bool _choosingFolder;
@@ -79,8 +74,6 @@ public sealed partial class SettingsPage : Page
         _attached = true;
 
         _engine.PropertyChanged += OnEngineChanged;
-        _engine.Notified += OnApsClientIdNotified;
-        RefreshAccount();
         RefreshSettings();
         RefreshEnabled();
         ShowUpdate();
@@ -95,7 +88,6 @@ public sealed partial class SettingsPage : Page
         _attached = false;
 
         _engine.PropertyChanged -= OnEngineChanged;
-        _engine.Notified -= OnApsClientIdNotified;
     }
 
     // ---------------------------------------------------------- the engine's values
@@ -103,7 +95,7 @@ public sealed partial class SettingsPage : Page
     /// <summary>
     /// Each engine message refreshes only its own part of the page. `status` comes up
     /// to twice a second and must not rewrite the settings controls under the user's
-    /// hands (a NumberBox being typed into, say).
+    /// hands (a NumberBox being typed into, say). The accounts are on the Konton page.
     /// </summary>
     private void OnEngineChanged(object? sender, PropertyChangedEventArgs args)
     {
@@ -117,49 +109,26 @@ public sealed partial class SettingsPage : Page
                 RefreshSettings();
                 break;
 
-            case nameof(EngineClient.ApsClientIdValidation):
-                RefreshApsClientIdSettings(_engine.Settings);
-                break;
-
             case nameof(EngineClient.IsFreeingUp):
                 RefreshEnabled();
                 break;
 
             case nameof(EngineClient.Status):
-                RefreshAccount();
+                RefreshFolder();
                 break;
 
             case nameof(EngineClient.IsConnected):
+                RefreshFolder();
+                RefreshEnabled();
+                ShowUpdate();
+                break;
+
             case nameof(EngineClient.IsSignedIn):
-                RefreshAccount();
+                RefreshFolder();
                 RefreshEnabled();
                 ShowUpdate();
                 break;
         }
-    }
-
-    private void RefreshAccount()
-    {
-        var status = _engine.IsConnected ? _engine.Status : null;
-        if (status is { SignedIn: true })
-        {
-            _signInStarted = false;
-        }
-
-        AccountText.Text = !_engine.IsConnected
-            ? Lang.T("Ingen kontakt med motorn.", "No contact with the engine.")
-            : status is null
-                ? Lang.T("Hämtar kontot …", "Fetching the account …")
-                : status.SignedIn
-                    ? AccountLabel(status)
-                    : _signInStarted
-                        ? Lang.T("Slutför inloggningen i webbläsaren.", "Finish signing in in the browser.")
-                        : Lang.T("Inte inloggad.", "Not signed in.");
-        SignInButton.Visibility = status is { SignedIn: false } ? Visibility.Visible : Visibility.Collapsed;
-        SignOutButton.Visibility = status is { SignedIn: true } ? Visibility.Visible : Visibility.Collapsed;
-
-        RefreshFolder();
-        RefreshApsClientIdControls();
     }
 
     /// <summary>Copies the engine's last settings into the controls.</summary>
@@ -167,7 +136,6 @@ public sealed partial class SettingsPage : Page
     {
         var settings = _engine.Settings;
         RefreshFolder();
-        RefreshApsClientIdSettings(settings);
 
         // No update channel (the default): the engine never checks, so the update controls
         // are hidden and a note says where new versions come from instead.
@@ -196,6 +164,7 @@ public sealed partial class SettingsPage : Page
             {
                 AutoUpdateSwitch.IsOn = autoUpdate;
             }
+
         }
         finally
         {
@@ -215,8 +184,6 @@ public sealed partial class SettingsPage : Page
     private void RefreshEnabled()
     {
         var connected = _engine.IsConnected;
-        SignInButton.IsEnabled = connected;
-        SignOutButton.IsEnabled = connected;
         OpenFolderButton.IsEnabled = connected;
         StartAtLoginSwitch.IsEnabled = connected;
         PropagateSwitch.IsEnabled = connected;
@@ -231,38 +198,15 @@ public sealed partial class SettingsPage : Page
         LogLevelChoice.IsEnabled = connected;
         AutoUpdateSwitch.IsEnabled = connected;
         RestartEngineButton.IsEnabled = connected;
-        RefreshApsClientIdControls();
     }
 
-    private static string AccountLabel(StatusInfo status)
+    /// <summary>The accounts, their servers and the client settings are on the Konton page.</summary>
+    private void OnOpenAccounts(object sender, RoutedEventArgs args)
     {
-        var parts = new[] { status.User?.Name, status.User?.Email }
-            .Where(part => !string.IsNullOrWhiteSpace(part));
-        var label = string.Join(" · ", parts);
-        return label.Length > 0 ? label : Lang.T("Inloggad.", "Signed in.");
+        MainWindow.Instance?.NavigateTo(MainWindow.AccountsTag);
     }
 
-    // ----------------------------------------------------------- account, folder
-
-    private async void OnSignIn(object sender, RoutedEventArgs args)
-    {
-        var ack = await _engine.SignInAsync();
-        if (ack.Ok)
-        {
-            // The answer is a `status` once the browser is done; until then the account line says what to do.
-            _signInStarted = true;
-            RefreshAccount();
-        }
-        else
-        {
-            ReportIfFailed(ack, Lang.T("Inloggningen gick inte att starta", "Sign-in could not be started"));
-        }
-    }
-
-    private async void OnSignOut(object sender, RoutedEventArgs args)
-    {
-        ReportIfFailed(await _engine.SignOutAsync(), Lang.T("Utloggningen gick inte igenom", "Sign-out did not go through"));
-    }
+    // ----------------------------------------------------------- folder
 
     private async void OnOpenFolder(object sender, RoutedEventArgs args)
     {
@@ -284,142 +228,6 @@ public sealed partial class SettingsPage : Page
             Lang.T("Utrymmet gick inte att frigöra", "The space could not be freed"));
     }
 
-
-    // ------------------------------------------------------- optional APS app
-
-    private void RefreshApsClientIdSettings(SettingsInfo? settings)
-    {
-        var supported = settings?.ApsClientIdOverrideSupported == true;
-        ApsClientIdExpander.Visibility = supported ? Visibility.Visible : Visibility.Collapsed;
-        if (supported)
-        {
-            _apsClientIdEdit.ObserveSettings(settings!.ApsClientId);
-            if (ApsClientIdBox.Text != _apsClientIdEdit.Draft)
-            {
-                _apsMirroring = true;
-                try { ApsClientIdBox.Text = _apsClientIdEdit.Draft; }
-                finally { _apsMirroring = false; }
-            }
-        }
-        else
-        {
-            _apsClientIdEdit.FailIfPending(_apsClientIdEdit.RequestVersion, null);
-        }
-        RefreshApsClientIdControls();
-    }
-
-    private void RefreshApsClientIdControls()
-    {
-        var connected = _engine.IsConnected;
-        var supported = _engine.Settings?.ApsClientIdOverrideSupported == true;
-        var signedOut = _engine.Status is { SignedIn: false };
-        var available = connected && supported && signedOut && !_engine.IsSignedIn
-            && !_engine.IsFreeingUp && !_engine.IsMovingSyncRoot && !_apsClientIdEdit.IsWaiting;
-        ApsClientIdBox.IsEnabled = available;
-        ApsClientIdSaveButton.IsEnabled = available && _apsClientIdEdit.CanSave
-            && _engine.Settings?.ApsClientIdValidationSupported == true;
-        ApsClientIdDefaultButton.IsEnabled = available && _apsClientIdEdit.CanUseDefault;
-        ApsClientIdCancelButton.Visibility = _apsClientIdEdit.IsTesting ? Visibility.Visible : Visibility.Collapsed;
-        ApsClientIdCancelButton.IsEnabled = connected && _apsClientIdEdit.IsTesting;
-        ApsClientIdProgress.IsActive = _apsClientIdEdit.IsWaiting;
-        SignInButton.IsEnabled = connected && !_apsClientIdEdit.IsWaiting;
-
-        ApsClientIdStatus.Text = !connected
-            ? Lang.T("Ingen kontakt med motorn. Ditt utkast behålls.", "No contact with the engine. Your draft is kept.")
-            : !signedOut || _engine.IsSignedIn
-                ? Lang.T("Logga ut innan du byter APS-app.", "Sign out before changing the APS app.")
-                : _apsClientIdEdit.IsWaiting
-                    ? _apsClientIdEdit.IsTesting
-                        ? Lang.T("Slutför testinloggningen i webbläsaren. Inställningen sparas bara om PKCE-testet lyckas …", "Complete the test sign-in in your browser. The setting is saved only if the PKCE test succeeds …")
-                        : Lang.T("Väntar på att motorn bekräftar ändringen …", "Waiting for the engine to confirm the change …")
-                    : _apsClientIdEdit.Problem
-                        ?? (_apsClientIdEdit.Saved
-                            ? Lang.T("Inställningen är sparad. Logga in i Synka för att börja synka.", "The setting is saved. Sign in to Synka to start syncing.")
-                            : _engine.Settings?.ApsClientIdValidationSupported != true
-                            ? Lang.T("Uppdatera motorn för att testa och spara en egen APS-app.", "Update the engine to test and save a custom APS app.")
-                            : _apsClientIdEdit.HasChanges
-                            ? Lang.T("Ändringen är inte sparad.", "The change has not been saved.")
-                            : _apsClientIdEdit.Confirmed.Length == 0
-                                ? Lang.T("Synkas standardapp används.", "The Synka default app is in use.")
-                                : Lang.T("En egen APS-app används.", "A custom APS app is in use."));
-    }
-
-    private void OnApsClientIdChanged(object sender, TextChangedEventArgs args)
-    {
-        if (!_attached || _apsMirroring) return;
-        _apsClientIdEdit.Edit(ApsClientIdBox.Text);
-        RefreshApsClientIdControls();
-    }
-
-    private async void OnSaveApsClientId(object sender, RoutedEventArgs args) =>
-        await SaveApsClientIdAsync(ApsClientIdBox.Text);
-
-    private async void OnUseDefaultApsClientId(object sender, RoutedEventArgs args) =>
-        await SaveApsClientIdAsync(string.Empty);
-
-    private async Task SaveApsClientIdAsync(string value)
-    {
-        if (_apsClientIdEdit.IsWaiting || !_engine.IsConnected || _engine.IsSignedIn
-            || _engine.Status is not { SignedIn: false }
-            || _engine.Settings?.ApsClientIdOverrideSupported != true
-            || _engine.IsFreeingUp || _engine.IsMovingSyncRoot) return;
-
-        var normalized = ApsClientIdEditState.Normalize(value);
-        var validate = normalized.Length > 0;
-        if (validate && _engine.Settings?.ApsClientIdValidationSupported != true) return;
-        var request = _apsClientIdEdit.Begin(normalized, validate);
-        var validationId = _apsClientIdEdit.RequestId;
-        RefreshApsClientIdControls();
-        var ack = validate
-            ? await _engine.TestApsClientIdAsync(normalized, validationId!)
-            : await _engine.SetSettingAsync("aps_client_id", normalized);
-        // A settings event may confirm the write before the enqueue ACK arrives.
-        if (!_apsClientIdEdit.IsPending(request)) return;
-        if (_apsClientIdEdit.ObserveAck(request, ack))
-        {
-            RefreshApsClientIdControls();
-            ReportIfFailed(ack, Lang.T("APS-inställningen gick inte igenom", "The APS setting did not go through"));
-            return;
-        }
-
-        // A successful ACK only means enqueued; validation has its own correlated result.
-        // A changed settings snapshot also recovers a completion lost during restart.
-        await Task.Delay(validate ? ApsClientIdAnswerTimeout : TimeSpan.FromSeconds(30));
-        if (_apsClientIdEdit.IsPending(request) && validationId is not null)
-            await _engine.CancelApsClientIdTestAsync(validationId);
-        if (_apsClientIdEdit.FailIfPending(request, Lang.T(
-                "Motorn har inte bekräftat ändringen. Ditt utkast behålls; kontrollera anslutningen och försök igen.",
-                "The engine has not confirmed the change. Your draft is kept; check the connection and try again.")))
-        {
-            RefreshApsClientIdControls();
-        }
-    }
-
-    private void OnApsClientIdNotified(object? sender, NotifyInfo notify)
-    {
-        if (!_apsClientIdEdit.IsWaiting
-            || _apsClientIdEdit.IsTesting
-            || notify.Severity is not ("warning" or "error")
-            || notify.Body?.Contains("APS", StringComparison.OrdinalIgnoreCase) != true) return;
-
-        // MainWindow displays the actual refusal. Release this editor while preserving
-        // the draft so an asynchronous validation/save failure is easy to correct.
-        if (_apsClientIdEdit.FailIfPending(_apsClientIdEdit.RequestVersion, Lang.T(
-                "Ändringen bekräftades inte. Se meddelandet från motorn.",
-                "The change was not confirmed. See the message from the engine.")))
-        {
-            RefreshApsClientIdControls();
-        }
-    }
-
-    private async void OnCancelApsClientIdTest(object sender, RoutedEventArgs args)
-    {
-        if (_apsClientIdEdit.RequestId is not { } requestId || !_engine.IsConnected) return;
-        var ack = await _engine.CancelApsClientIdTestAsync(requestId);
-        ReportIfFailed(ack, Lang.T("Testet kunde inte avbrytas", "The test could not be cancelled"));
-        // Only the correlated cancelled/saved event decides the outcome of a race.
-        RefreshApsClientIdControls();
-    }
 
     // ------------------------------------------------------- moving the folder
 
@@ -575,8 +383,8 @@ public sealed partial class SettingsPage : Page
             IsTextSelectionEnabled = true,
         });
         body.Children.Add(Line(Lang.T(
-            "Alla projekt byggs om där från ACC. Filerna laddas ner igen när du öppnar dem.",
-            "Every project is rebuilt there from ACC. The files are downloaded again when you open them.")));
+            "Alla projekt byggs om där från molnet. Filerna laddas ner igen när du öppnar dem.",
+            "Every project is rebuilt there from the cloud. The files are downloaded again when you open them.")));
         body.Children.Add(Line(Lang.T(
             "Ändringar som inte hunnit synkas sparas först i mappen \"Synka - återställda filer\".",
             "Changes that have not been synced yet are first saved in the folder \"Synka - återställda filer\".")));
@@ -800,15 +608,15 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// Every project rebuilt from ACC where it is, once the user has said yes. Each
+    /// Every project rebuilt from the cloud where it is, once the user has said yes. Each
     /// project reports in its own notify, so nothing more is shown here on success.
     /// </summary>
     private async void OnRebuildAll(object sender, RoutedEventArgs args)
     {
         var body = new StackPanel { Spacing = 8 };
         body.Children.Add(Line(Lang.T(
-            "Varje projekt byggs om från ACC där det ligger. Filerna laddas ner igen när du öppnar dem. Ändringar som inte hunnit synkas sparas först i \"Synka - återställda filer\".",
-            "Every project is rebuilt from ACC where it is. The files are downloaded again when you open them. Changes that have not been synced yet are first saved in \"Synka - återställda filer\".")));
+            "Varje projekt byggs om från molnet där det ligger. Filerna laddas ner igen när du öppnar dem. Ändringar som inte hunnit synkas sparas först i \"Synka - återställda filer\".",
+            "Every project is rebuilt from the cloud where it is. The files are downloaded again when you open them. Changes that have not been synced yet are first saved in \"Synka - återställda filer\".")));
 
         if (!await ConfirmAsync(
                 Lang.T("Bygga om alla projekt?", "Rebuild all projects?"),

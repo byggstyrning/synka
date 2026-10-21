@@ -15,86 +15,17 @@
             <TextBlock Text="{loc:T Sv='Inställningar', En='Settings'}"
                        Style="{StaticResource TitleTextBlockStyle}" />
 
-            <!-- The account the engine syncs. Signing out stops the sync for it. -->
-            <tk:SettingsCard Header="{loc:T Sv='Konto', En='Account'}"
-                             Description="{loc:T Sv='Kontot som synkar ACC Docs-filerna. Logga ut stoppar synken.', En='The account that syncs the ACC Docs files. Signing out stops the sync.'}">
+            <!-- The accounts, their servers and the client settings are on the Konton page. -->
+            <tk:SettingsCard Header="{loc:T Sv='Konton', En='Accounts'}"
+                             Description="{loc:T Sv='Inloggningar, StreamBIM-servrar och klientinställningar finns på sidan Konton.', En='Sign-ins, StreamBIM servers and client settings are on the Accounts page.'}">
                 <tk:SettingsCard.HeaderIcon>
-                    <FontIcon Glyph="&#xE77B;" />
+                    <FontIcon Glyph="&#xE716;" />
                 </tk:SettingsCard.HeaderIcon>
-                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
-                    <TextBlock x:Name="AccountText"
-                               VerticalAlignment="Center"
-                               MaxWidth="320"
-                               TextWrapping="Wrap"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                    <Button x:Name="SignInButton"
-                            Content="{loc:T Sv='Logga in', En='Sign in'}"
-                            Click="OnSignIn" />
-                    <Button x:Name="SignOutButton"
-                            Content="{loc:T Sv='Logga ut', En='Sign out'}"
-                            Click="OnSignOut" />
-                </StackPanel>
+                <Button x:Name="OpenAccountsButton"
+                        Content="{loc:T Sv='Öppna Konton', En='Open Accounts'}"
+                        AutomationProperties.Name="{loc:T Sv='Öppna Konton', En='Open Accounts'}"
+                        Click="OnOpenAccounts" />
             </tk:SettingsCard>
-
-
-            <!-- Optional public APS app override. Older engines omit the capability flag. -->
-            <tk:SettingsExpander x:Name="ApsClientIdExpander"
-                                 Visibility="Collapsed"
-                                 Header="{loc:T Sv='Autodesk APS-app', En='Autodesk APS app'}"
-                                 Description="{loc:T Sv='Avancerat och valfritt: använd en egen offentlig APS-app i stället för Synkas standardapp.', En='Advanced and optional: use your own public APS app instead of the Synka default.'}">
-                <tk:SettingsExpander.HeaderIcon>
-                    <FontIcon Glyph="&#xE943;" />
-                </tk:SettingsExpander.HeaderIcon>
-                <tk:SettingsExpander.Items>
-                    <tk:SettingsCard Header="{loc:T Sv='Egen APS-app', En='Your APS app'}"
-                                     Description="{loc:T Sv='Välj apptypen Desktop, Mobile, Single-Page App i Autodesk APS. Synka använder Authorization Code + PKCE.', En='Choose the Desktop, Mobile, Single-Page App type in Autodesk APS. Synka uses Authorization Code + PKCE.'}">
-                        <StackPanel Spacing="10" MinWidth="260" MaxWidth="470">
-                            <TextBlock Text="{loc:T Sv='Traditional Web App stöds inte: den kräver en client secret. Testa och spara öppnar webbläsaren och verifierar PKCE-inloggningen innan inställningen sparas.', En='Traditional Web App is not supported: it requires a client secret. Test and save opens your browser and verifies PKCE sign-in before saving the setting.'}"
-                                       TextWrapping="Wrap" />
-                            <TextBox x:Name="ApsClientIdBox"
-                                     Header="Client ID"
-                                     PlaceholderText="{loc:T Sv='Tomt använder Synkas standardapp', En='Leave blank to use the Synka default'}"
-                                     MaxLength="256"
-                                     AcceptsReturn="False"
-                                     IsSpellCheckEnabled="False"
-                                     IsTextPredictionEnabled="False"
-                                     AutomationProperties.Name="{loc:T Sv='Offentligt Autodesk APS Client ID', En='Public Autodesk APS Client ID'}"
-                                     AutomationProperties.HelpText="{loc:T Sv='Logga ut innan du ändrar appen. Ett tomt värde återställer Synkas standardapp.', En='Sign out before changing the app. A blank value restores the Synka default.'}"
-                                     TextChanged="OnApsClientIdChanged" />
-                            <TextBlock Text="{loc:T Sv='Registrera exakt denna callback-URL i APS-appen:', En='Register this exact callback URL in the APS app:'}"
-                                       TextWrapping="Wrap" />
-                            <TextBlock Text="http://localhost:47863/"
-                                       IsTextSelectionEnabled="True"
-                                       AutomationProperties.Name="{loc:T Sv='APS callback-URL: http://localhost:47863/', En='APS callback URL: http://localhost:47863/'}" />
-                            <TextBlock Text="{loc:T Sv='Testet kontrollerar APS-inloggningen. ACC-kontots administratör kan även behöva lägga till appen som en Custom Integration. Motorn startas om om appen ändras; logga sedan in i Synka för att synka.', En='The test checks APS sign-in. The ACC account administrator may also need to add the app as a Custom Integration. The engine restarts if the app changes; then sign in to Synka to sync.'}"
-                                       TextWrapping="Wrap"
-                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                            <TextBlock x:Name="ApsClientIdStatus"
-                                       TextWrapping="Wrap"
-                                       AutomationProperties.LiveSetting="Polite"
-                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <Button x:Name="ApsClientIdSaveButton"
-                                        Content="{loc:T Sv='Testa och spara', En='Test and save'}"
-                                        AutomationProperties.Name="{loc:T Sv='Testa och spara Autodesk APS Client ID', En='Test and save Autodesk APS Client ID'}"
-                                        Click="OnSaveApsClientId" />
-                                <Button x:Name="ApsClientIdDefaultButton"
-                                        Content="{loc:T Sv='Använd Synkas standard', En='Use Synka default'}"
-                                        AutomationProperties.Name="{loc:T Sv='Återställ Synkas standardapp för Autodesk APS', En='Restore the Synka default Autodesk APS app'}"
-                                        Click="OnUseDefaultApsClientId" />
-                                <Button x:Name="ApsClientIdCancelButton"
-                                        Visibility="Collapsed"
-                                        Content="{loc:T Sv='Avbryt test', En='Cancel test'}"
-                                        Click="OnCancelApsClientIdTest" />
-                                <ProgressRing x:Name="ApsClientIdProgress"
-                                              Width="16" Height="16"
-                                              IsActive="False"
-                                              AutomationProperties.Name="{loc:T Sv='Väntar på APS-inställningen', En='Waiting for the APS setting'}" />
-                            </StackPanel>
-                        </StackPanel>
-                    </tk:SettingsCard>
-                </tk:SettingsExpander.Items>
-            </tk:SettingsExpander>
 
             <!--
                 Moving the folder is a full rebuild:
@@ -103,7 +34,7 @@
                 Återställ standardplats shows only while the folder is somewhere else.
             -->
             <tk:SettingsCard Header="{loc:T Sv='Synkmapp', En='Sync folder'}"
-                             Description="{loc:T Sv='Mappen där ACC Docs-filerna synkas. Flyttar du den byggs alla projekt om på den nya platsen.', En='The folder where the ACC Docs files are synced. Moving it rebuilds every project in the new place.'}">
+                             Description="{loc:T Sv='Mappen där projektfilerna synkas. Flyttar du den byggs alla projekt om på den nya platsen.', En='The folder where the project files are synced. Moving it rebuilds every project in the new place.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE8B7;" />
                 </tk:SettingsCard.HeaderIcon>
@@ -141,14 +72,14 @@
                               AutomationProperties.Name="{loc:T Sv='Starta vid inloggning', En='Start at sign-in'}" />
             </tk:SettingsCard>
 
-            <tk:SettingsCard Header="{loc:T Sv='Radera i ACC när du raderar lokalt', En='Delete in ACC when you delete locally'}"
-                             Description="{loc:T Sv='Av: en fil som raderas här ligger kvar i ACC. På: raderingen följer med till ACC.', En='Off: a file deleted here stays in ACC. On: the deletion is passed on to ACC.'}">
+            <tk:SettingsCard Header="{loc:T Sv='Radera i molnet när du raderar lokalt', En='Delete in the cloud when you delete locally'}"
+                             Description="{loc:T Sv='Av: en fil som raderas här ligger kvar i molnet. På: raderingen följer med till molnet.', En='Off: a file deleted here stays in the cloud. On: the deletion is passed on to the cloud.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE74D;" />
                 </tk:SettingsCard.HeaderIcon>
                 <ToggleSwitch x:Name="PropagateSwitch"
                               Toggled="OnPropagateToggled"
-                              AutomationProperties.Name="{loc:T Sv='Radera i ACC', En='Delete in ACC'}" />
+                              AutomationProperties.Name="{loc:T Sv='Radera i molnet', En='Delete in the cloud'}" />
             </tk:SettingsCard>
 
             <tk:SettingsCard Header="{loc:T Sv='Samtidiga nedladdningar', En='Simultaneous downloads'}"
@@ -183,7 +114,7 @@
                            ValueChanged="OnMaxUploadsChanged" />
             </tk:SettingsCard>
 
-            <tk:SettingsCard Header="{loc:T Sv='Hur ofta ACC kontrolleras', En='How often ACC is checked'}"
+            <tk:SettingsCard Header="{loc:T Sv='Hur ofta molnet kontrolleras', En='How often the cloud is checked'}"
                              Description="{loc:T Sv='Sekunder mellan kontrollerna medan du arbetar, 15–300. Motorn kontrollerar glesare när datorn inte används.', En='Seconds between the checks while you work, 15–300. The engine checks less often when the computer is idle.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE916;" />
@@ -200,7 +131,7 @@
             </tk:SettingsCard>
 
             <tk:SettingsCard Header="{loc:T Sv='Frigör utrymme', En='Free up space'}"
-                             Description="{loc:T Sv='Tar bort lokala kopior av synkade filer i alla projekt och avmarkerar Behåll alltid på den här enheten för dem och deras mappar. Osynkade ändringar behålls lokalt. Filerna finns kvar i ACC.', En='Removes local copies of synced files in all projects and clears Always keep on this device for them and their folders. Unsynced changes stay local. The files remain in ACC.'}">
+                             Description="{loc:T Sv='Tar bort lokala kopior av synkade filer i alla projekt och avmarkerar Behåll alltid på den här enheten för dem och deras mappar. Osynkade ändringar behålls lokalt. Filerna finns kvar i molnet.', En='Removes local copies of synced files in all projects and clears Always keep on this device for them and their folders. Unsynced changes stay local. The files remain in the cloud.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xEDA2;" />
                 </tk:SettingsCard.HeaderIcon>
@@ -338,11 +269,11 @@
                                 Click="OnRestartEngine" />
                     </tk:SettingsCard>
                     <!-- The last resort: asks first. Each project reports in its own notify. -->
-                    <tk:SettingsCard Header="{loc:T Sv='Bygg om alla projekt från ACC', En='Rebuild all projects from ACC'}"
-                                     Description="{loc:T Sv='Varje projekt byggs om från ACC där det ligger. Hjälper när synken har kört fast.', En='Every project is rebuilt from ACC where it is. Helps when the sync is stuck.'}">
+                    <tk:SettingsCard Header="{loc:T Sv='Bygg om alla projekt från molnet', En='Rebuild all projects from the cloud'}"
+                                     Description="{loc:T Sv='Varje projekt byggs om från molnet där det ligger. Hjälper när synken har kört fast.', En='Every project is rebuilt from the cloud where it is. Helps when the sync is stuck.'}">
                         <Button x:Name="RebuildAllButton"
                                 Content="{loc:T Sv='Bygg om…', En='Rebuild…'}"
-                                AutomationProperties.Name="{loc:T Sv='Bygg om alla projekt från ACC', En='Rebuild all projects from ACC'}"
+                                AutomationProperties.Name="{loc:T Sv='Bygg om alla projekt från molnet', En='Rebuild all projects from the cloud'}"
                                 Click="OnRebuildAll" />
                     </tk:SettingsCard>
                 </tk:SettingsExpander.Items>

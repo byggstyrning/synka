@@ -206,7 +206,9 @@ pub(super) fn begin(ctx: &Ctx, p: &Project, folder: Option<&Path>) -> Result<Set
                     .item(p.pid, &r.id)?
                     .ok_or_else(|| anyhow!("mappen försvann"))?;
                 if let Some(parent) = dir.parent() {
-                    ph::create_placeholders(parent, &[spec_for(&fresh, me(ctx).as_deref())])?;
+                    // The lock holder is named by the project's own provider.
+                    let me = me_for(ctx, p.provider);
+                    ph::create_placeholders(parent, &[spec_for(&fresh, me.as_deref())])?;
                 }
                 Ok(())
             }

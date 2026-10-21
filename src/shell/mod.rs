@@ -459,6 +459,8 @@ mod tests {
             cursor: None,
             enabled: true,
             last_sync_ms: None,
+            provider: crate::model::Provider::Acc,
+            meta: None,
         }
     }
 

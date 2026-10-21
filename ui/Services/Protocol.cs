@@ -21,9 +21,30 @@ public sealed record TransferInfo(string? Name, string? Project, string? Directi
 public sealed record HeldDeleteInfo(string? ProjectId, string? Project, long Count);
 
 /// <summary>
+/// One document provider's account (docs\IPC.md, `status.accounts`). Provider is
+/// `acc`, `streambim` or `interaxo`. Configured is false when the provider cannot
+/// sign in yet (no client id). Host is the StreamBIM server's host (a region's
+/// `<subdomain>.streambim.com` or a custom address's host), or null.
+/// <c>account</c> is the StreamBIM account key (the region subdomain, or the lowercase
+/// host of a custom address) and null for the other providers. It is newer than the
+/// rest: an older engine leaves it out, and it arrives as null.
+/// </summary>
+public sealed record AccountInfo(
+    string Provider,
+    string Label,
+    bool Configured,
+    bool SignedIn,
+    bool SigningIn,
+    UserInfo? User,
+    string? Host,
+    string? Account = null);
+
+/// <summary>
 /// The engine's own picture of the sync. Pushed on every change, throttled to 2/s.
 /// The job counts are 64-bit on the engine side (i64), so they are read as long.
 /// <c>held_deletes</c> is newer than the rest; an engine without it leaves it out.
+/// <c>accounts</c> is newer still: an older engine leaves it out (null), and the window
+/// then reads the ACC account from <c>signed_in</c> and <c>user</c>.
 /// </summary>
 public sealed record StatusInfo(
     bool SignedIn,
@@ -37,13 +58,17 @@ public sealed record StatusInfo(
     string? SyncRoot,
     long? LocalBytes,
     string? EngineVersion,
-    List<HeldDeleteInfo>? HeldDeletes);
+    List<HeldDeleteInfo>? HeldDeletes,
+    IReadOnlyList<AccountInfo>? Accounts = null);
 
 /// <summary>One project in the hub tree.</summary>
 public sealed record ProjectInfo(string Id, string Name, bool Subscribed, string? LocalPath);
 
-/// <summary>An ACC account (hub) and its projects.</summary>
-public sealed record HubInfo(string Id, string Name, List<ProjectInfo>? Projects);
+/// <summary>
+/// A hub (ACC account, StreamBIM, Interaxo community) and its projects.
+/// <c>provider</c> is newer than the rest: null from an older engine means ACC.
+/// </summary>
+public sealed record HubInfo(string Id, string Name, List<ProjectInfo>? Projects, string? Provider = null);
 
 /// <summary>The hub tree. `loading` while the engine asks ACC.</summary>
 public sealed record ProjectsInfo(bool Loading, List<HubInfo>? Hubs);
@@ -55,6 +80,8 @@ public sealed record ProjectsInfo(bool Loading, List<HubInfo>? Hubs);
 /// is also capability-gated so older engines never show a setting they cannot apply.
 /// <c>update_channel_configured</c> is false when no update channel is set (the default):
 /// the engine never checks for updates, and the window hides the update controls.
+/// The provider fields (<c>providers</c> and the Interaxo settings) are newest: an older
+/// engine leaves them out. Interaxo settings can change only while Interaxo is signed out.
 /// </summary>
 public sealed record SettingsInfo(
     bool PropagateDeletes,
@@ -69,7 +96,26 @@ public sealed record SettingsInfo(
     string? ApsClientId,
     bool? ApsClientIdOverrideSupported,
     bool? ApsClientIdValidationSupported,
-    bool? UpdateChannelConfigured);
+    bool? UpdateChannelConfigured,
+    IReadOnlyList<string>? Providers = null,
+    string? InteraxoClientId = null,
+    string? InteraxoRedirectUri = null,
+    string? InteraxoRedirectUriDefault = null,
+    bool InteraxoClientSecretSet = false);
+
+/// <summary>
+/// Progress of a sign-in (docs\IPC.md, `sign_in_progress`). State is `browser`,
+/// `mfa_required` (StreamBIM: send a code), `signed_in`, `failed` (Error set) or `cancelled`.
+/// <c>Account</c> is the StreamBIM account key the progress belongs to (null for the other
+/// providers, and from an older engine). Each StreamBIM account has its own progress.
+/// </summary>
+public sealed record SignInProgressInfo(string Provider, string State, string? Error, string? Account = null);
+
+/// <summary>One StreamBIM region: the subdomain is the region id sent with `sign_in`.</summary>
+public sealed record StreamBimRegion(string Subdomain, string Title, bool IsDefault);
+
+/// <summary>The StreamBIM regions the engine offers (live list, or its built-in fallback).</summary>
+public sealed record StreamBimRegionsInfo(IReadOnlyList<StreamBimRegion>? Regions);
 
 /// <summary>Correlated result of testing and saving a candidate APS public client.</summary>
 public sealed record ApsClientIdValidationInfo(string? RequestId, string? State, string? Error);
@@ -116,6 +162,10 @@ public sealed record Ack(long? Id, bool Ok, string? Error)
 [JsonSerializable(typeof(ProjectsInfo))]
 [JsonSerializable(typeof(SettingsInfo))]
 [JsonSerializable(typeof(ApsClientIdValidationInfo))]
+[JsonSerializable(typeof(AccountInfo))]
+[JsonSerializable(typeof(SignInProgressInfo))]
+[JsonSerializable(typeof(StreamBimRegion))]
+[JsonSerializable(typeof(StreamBimRegionsInfo))]
 [JsonSerializable(typeof(ActivityItem))]
 [JsonSerializable(typeof(ActivityList))]
 [JsonSerializable(typeof(UpdateInfo))]

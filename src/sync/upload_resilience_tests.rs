@@ -1,7 +1,7 @@
 //! Fault injection at the real outbox boundary; no APS account or cloud writes.
 
 use super::*;
-use crate::sync::tests::{fixture, row, Fixture};
+use crate::sync::tests::{client_override_signed_in, fixture, row, Fixture};
 use std::sync::{Arc, Barrier};
 
 fn queued_file(tag: &str) -> (Fixture, PathBuf, OutboxJob) {
@@ -137,7 +137,9 @@ fn resilience_upload_lease_excludes_concurrent_case_aliases_and_releases() {
 
 #[test]
 fn resilience_rejected_upload_lease_never_releases_the_current_owner() {
-    let f = fixture("resilience-rejected-lease");
+    let mut f = fixture("resilience-rejected-lease");
+    // The outbox only runs for signed-in projects: these jobs are ACC jobs.
+    client_override_signed_in(&mut f);
     let path = f.dir.join("owned.bin");
     let owner = UploadLease::take(&path).unwrap();
     for _ in 0..64 {
@@ -323,7 +325,8 @@ fn resilience_permanent_http_errors_fail_visibly_and_preserve_local_copy() {
 
 #[tokio::test]
 async fn resilience_corrupt_outbox_payload_fails_without_touching_local_bytes() {
-    let (f, path, job) = queued_file("resilience-corrupt-payload");
+    let (mut f, path, job) = queued_file("resilience-corrupt-payload");
+    client_override_signed_in(&mut f);
     f.ctx
         .store
         .retarget_job(job.id, "upload", "{interrupted JSON")

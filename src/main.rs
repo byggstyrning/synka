@@ -28,9 +28,11 @@ mod http;
 mod ipc;
 mod model;
 mod paths;
+mod remote;
 mod shell;
 mod shortcut;
 mod store;
+mod streambim_auth;
 mod sync;
 #[cfg(test)]
 mod test_support;
@@ -44,6 +46,7 @@ use paths::Paths;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use store::Store;
+use streambim_auth::StreamBimAccounts;
 use sync::Engine;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -118,11 +121,24 @@ fn run() -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&paths.db_file)?);
     let http = http::build_client();
     let auth = Arc::new(Auth::new(cfg.client_id(), http.clone(), &paths.state_dir));
-    let api = http::Api::new(http, auth.clone());
+    let api = http::Api::new(http.clone(), auth.clone());
+    // One account per StreamBIM server; each account has its own API client (streambim_auth).
+    let streambim = Arc::new(StreamBimAccounts::load(http.clone(), &paths.state_dir));
+    // Not configured (empty client id) until the user gives one; applying the settings at
+    // runtime comes in a later step.
+    let interaxo = Arc::new(Auth::interaxo(
+        cfg.interaxo_client(),
+        http.clone(),
+        &paths.state_dir,
+    ));
+    let interaxo_api = http::Api::new(http, interaxo.clone());
 
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
     let main_thread_id = unsafe { GetCurrentThreadId() };
-    let hub = Arc::new(ipc::IpcHub::new(paths.sync_root.clone()));
+    let hub = Arc::new(ipc::IpcHub::new(
+        paths.sync_root.clone(),
+        cfg.interaxo_enabled,
+    ));
     let ui = UiSender {
         tx: ui_tx,
         main_thread_id,
@@ -139,6 +155,9 @@ fn run() -> anyhow::Result<()> {
         store: store.clone(),
         auth,
         api,
+        streambim,
+        interaxo,
+        interaxo_api,
         ui,
     });
     shell::set_context(ctx.clone());

@@ -1,9 +1,11 @@
 # Synka
 
-Synka syncs **ACC Docs** (Autodesk Construction Cloud / Autodesk Forma) files to an ordinary
-folder in Explorer (`%USERPROFILE%\Synka\<hub>\<project>\Project Files`). A user who only reaches
-some folders sees each of them instead. Files download when you open them, and your saves go back
-to ACC as new versions. Synka can run alongside Autodesk Desktop Connector without touching it.
+Synka syncs construction documents from **ACC Docs** (Autodesk Construction Cloud / Autodesk
+Forma), **StreamBIM** and **Interaxo** to an ordinary folder in Explorer
+(`%USERPROFILE%\Synka\<hub>\<project>\<top folder>`). For ACC the top folder is `Project Files`
+(a user who only reaches some folders sees each of them instead); StreamBIM projects and Interaxo
+rooms have one top folder, `Dokument`. Files download when you open them, and your saves go back
+as new versions. Synka can run alongside Autodesk Desktop Connector without touching it.
 
 - **Light:** one Rust engine (tray icon, sync, Explorer integration); the window runs only while
   it is open. Idle polling writes nothing and logs nothing.
@@ -23,8 +25,10 @@ Swedish UI by default, English toggle.
 ## Use and data (read first)
 
 - Internal use by Byggstyrning staff only.
-- Synka never sends file content anywhere except between the PC and Autodesk (the APS endpoints
-  and Autodesk's file storage). Synka has no telemetry.
+- Synka never sends file content anywhere except between the PC and the platform the file
+  belongs to: Autodesk (the APS endpoints and Autodesk's file storage), StreamBIM (the signed-in
+  region's servers and the S3 storage they hand out upload links for) or Interaxo (its API hosts).
+  Synka has no telemetry.
 - The update check is off by default (`update_channel` is empty). Staff update from the internal
   OneDrive share.
 - Each ACC hub's account admin must approve the Client ID as a Custom Integration, including
@@ -33,6 +37,10 @@ Swedish UI by default, English toggle.
   only; enabling it requires written approval from Autodesk). Changes are found with the
   documented data/v1 folder listing.
 - Synka never binds Autodesk's named pipes and never emulates Autodesk Desktop Connector services.
+- StreamBIM sign-in uses the user's e-mail and password (plus an authenticator code when the
+  account has MFA). The password goes once to StreamBIM and is never stored or logged.
+- Interaxo needs the organisation's own registered client (bring your own Client ID); see
+  [Platforms](#platforms).
 
 ## Install (users)
 
@@ -51,14 +59,42 @@ double-click `Install.cmd`. See `packaging/delivery/README.txt`.
 | `src/sync/naming.rs` | How ACC names map to Windows names (one place). |
 | `src/cf/` | Cloud Files API: sync root, callbacks, placeholders. |
 | `src/shell/` | Packaged Explorer COM command/state implementations; native Cloud Files controls are active. |
-| `src/api/` | ACC/APS: Data Management, OSS transfers, optional desktop-sync feed (off). |
+| `src/remote/` | Provider dispatch: the one door from the engine to ACC, StreamBIM and Interaxo. |
+| `src/api/` | Provider clients: ACC/APS (`dm.rs`, `oss.rs`, optional desktop-sync feed, off), `streambim.rs`, `interaxo.rs`. |
+| `src/auth.rs`, `src/streambim_auth.rs` | Sign-in: OAuth + PKCE for ACC and Interaxo; StreamBIM password + MFA. |
 | `src/store.rs` | SQLite state (one file, WAL). |
 | `ui/` | The window `Synka.exe` (C#, WinUI 3) and the MSIX manifest. |
 | `packaging/` | MSIX build, signing, sideload zip, release scripts. |
 | `.github/workflows/` | CI (pull requests and main) and Release (one click). |
-| `docs/` | `IPC.md` (engine ⇄ window protocol), `ROADMAP.md` (state and next steps), `RESILIENCE.md` (test laboratory). |
-| `docs/specs/` | Clean-room behavioural specs: APS endpoints, Cloud Files, save patterns and the ignore list. |
+| `docs/` | `PROVIDERS.md` (platforms and the provider contract), `IPC.md` (engine ⇄ window protocol), `ROADMAP.md` (state and next steps), `RESILIENCE.md` (test laboratory). |
+| `docs/specs/` | Clean-room behavioural specs: APS, StreamBIM and Interaxo endpoints, Cloud Files, save patterns and the ignore list. |
 | `DESIGN.md` | Architecture and key decisions. |
+
+## Platforms
+
+Sign in on the **Konton** page: one ACC account, one Interaxo account, and one StreamBIM
+account per StreamBIM server (a region such as Europe or Japan, or a custom `https://` address).
+The page lists every account with its server, status and synced projects, with sign-out next to
+each. Projects of every signed-in account appear on the Projects page, grouped by hub. Architecture and limits:
+[docs/PROVIDERS.md](docs/PROVIDERS.md).
+
+| Platform | Sign-in | What syncs | Not supported |
+|---|---|---|---|
+| ACC | Autodesk browser sign-in (PKCE), built-in or own APS Client ID | everything in Docs | — |
+| StreamBIM | server (region or custom https address), e-mail, password, authenticator code if MFA is on; several servers at once | the project's document library (folders and documents, with revisions) | SSO-only accounts; files over 5 GB; locks |
+| Interaxo | Interaxo browser sign-in (PKCE) with the organisation's own Client ID | simple folders and files of each room you are a member of | creating folders, renaming and moving (the public API has none: such changes stay on this PC with a notice); registers, entries and links; locks |
+
+Interaxo is turned off by default for now: its section on the Konton page only says so, and its sign-in is refused. To turn it on, add `"interaxo_enabled": true` to `settings.json` in the app's LocalState folder (`%LOCALAPPDATA%\Packages\<PFN>\LocalState`), then restart the engine.
+
+### Set up Interaxo (bring your own Client ID)
+
+Interaxo has no self-service app registration. Ask Interaxo support for a **Native** (public)
+client with Authorization Code + PKCE and refresh tokens, access to the API audience
+`https://api.interaxo.com/v1/` with offline access, and the redirect URI
+`http://localhost:47864/` registered exactly (or another loopback URI you then enter in Synka).
+Enter the Client ID (and the client secret only if Interaxo insists on a confidential client)
+under **Konton → Interaxo → Avancerat**, save, and sign in. The secret is stored
+DPAPI-protected and never shown again.
 
 ## Build
 

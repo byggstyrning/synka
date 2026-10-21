@@ -226,7 +226,7 @@ public sealed partial class OverviewPage : Page
         // Routine progress is already in the transfer and queue cards. Showing its
         // changing one-liner here adds and removes a line in the hero every time a
         // quick transfer starts or finishes.
-        var text = status?.Text?.Trim() ?? string.Empty;
+        var text = StatusLine(status);
         var error = status?.Error;
         var echo = EchoTexts.Contains(text.TrimEnd('…', '.', ' '))
             || (!string.IsNullOrEmpty(error) && text.Contains(error, StringComparison.Ordinal));
@@ -234,7 +234,7 @@ public sealed partial class OverviewPage : Page
         SetText(StatusText, explanation ?? (routineSync || echo ? string.Empty : text));
         SetVisibility(StatusText, StatusText.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible);
 
-        SetText(AccountText, signedIn && status?.User is { } user ? AccountLabel(user) : string.Empty);
+        SetText(AccountText, AccountSummary(status));
         SetVisibility(AccountText, AccountText.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible);
 
         SetText(ErrorText, ErrorDisplay.FriendlyDetail(status?.Error));
@@ -248,7 +248,16 @@ public sealed partial class OverviewPage : Page
         SyncNowButton.IsEnabled = signedIn;
         StartEngineButton.Visibility = canStart ? Visibility.Visible : Visibility.Collapsed;
 
-        SignInCard.Visibility = connected && status is { SignedIn: false } ? Visibility.Visible : Visibility.Collapsed;
+        // Shown while nothing is signed in (ACC is then the account to sign in). Another
+        // provider signed in: the card stays hidden, and the Konton page has the rest.
+        var noAccount = connected && status is { SignedIn: false };
+        SignInCard.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
+        SignInSettingsButton.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
+        var settingsText = SignInSettingsText();
+        if (SignInSettingsButton.Content as string != settingsText)
+        {
+            SignInSettingsButton.Content = settingsText;
+        }
         if (signedIn)
         {
             SignInHint.Text = _signInHintDefault;
@@ -259,14 +268,63 @@ public sealed partial class OverviewPage : Page
         RefreshStorage(status);
     }
 
-    private static string AccountLabel(UserInfo user)
+    /// <summary>
+    /// The line on the sign-in card's button: the Konton providers the engine offers (settings.providers).
+    /// Without Interaxo it names ACC and StreamBIM only.
+    /// </summary>
+    private static string SignInSettingsText() => Engine.ProviderOffered(ProviderNames.Interaxo)
+        ? Lang.T("Logga in på StreamBIM eller Interaxo under Konton.", "Sign in to StreamBIM or Interaxo under Accounts.")
+        : Lang.T("Logga in på ACC eller StreamBIM under Konton.", "Sign in to ACC or StreamBIM under Accounts.");
+
+    /// <summary>The engine's one-liner while any sign-in waits for a browser. It is generic: StreamBIM has no browser.</summary>
+    private const string BrowserWaitText = "Väntar på inloggning i webbläsaren…";
+
+    /// <summary>
+    /// The engine's one-liner. When StreamBIM is the only sign-in pending, the browser wait is
+    /// not what it is doing: the hero says it signs in to StreamBIM instead.
+    /// </summary>
+    private static string StatusLine(StatusInfo? status)
     {
-        var name = user.Name?.Trim();
-        var email = user.Email?.Trim();
-        var who = string.IsNullOrEmpty(name)
-            ? email
-            : string.IsNullOrEmpty(email) ? name : $"{name} ({email})";
-        return string.IsNullOrEmpty(who) ? string.Empty : Lang.T($"Inloggad som {who}", $"Signed in as {who}");
+        var text = status?.Text?.Trim() ?? string.Empty;
+        if (text == BrowserWaitText
+            && Engine.StreamBimAccounts.Any(account => account.SigningIn)
+            && Engine.AccountFor(ProviderNames.Acc) is not { SigningIn: true }
+            && Engine.AccountFor(ProviderNames.Interaxo) is not { SigningIn: true })
+        {
+            return Lang.T("Loggar in på StreamBIM…", "Signing in to StreamBIM…");
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// Who is signed in. One account: "Inloggad som …". Several (ACC and StreamBIM, say): each
+    /// with its name, "ACC: … · StreamBIM Japan: …". Each StreamBIM server is its own account, named
+    /// as its hub is. An engine without per-provider accounts reports only `status.user`, and that one is shown.
+    /// </summary>
+    private static string AccountSummary(StatusInfo? status)
+    {
+        if (!Engine.IsConnected)
+        {
+            return string.Empty;
+        }
+
+        var accounts = Engine.Accounts.Where(account => account is { SignedIn: true }).ToList();
+        if (accounts.Count > 1)
+        {
+            return string.Join(" · ", accounts.Select(account =>
+            {
+                var label = ProviderNames.AccountLabel(account, Engine.StreamBimRegions);
+                var who = ProviderNames.Who(account.User);
+                return who.Length == 0 ? label : $"{label}: {who}";
+            }));
+        }
+
+        var user = accounts.Count == 1
+            ? accounts[0].User
+            : status is { SignedIn: true } ? status.User : null;
+        var single = ProviderNames.Who(user);
+        return single.Length == 0 ? string.Empty : Lang.T($"Inloggad som {single}", $"Signed in as {single}");
     }
 
     private enum Tone
@@ -491,8 +549,8 @@ public sealed partial class OverviewPage : Page
                 $"{Fmt.Count(failed)} misslyckades. Aktiviteten och loggen säger varför.",
                 $"{Fmt.Count(failed)} failed. The activity and the log say why.")
             : Lang.T(
-                "Ändringar du gör i synkmappen laddas upp till ACC.",
-                "Changes you make in the sync folder are uploaded to ACC.");
+                "Ändringar du gör i synkmappen laddas upp till molnet.",
+                "Changes you make in the sync folder are uploaded to the cloud.");
 
         SetText(QueueCard, header, description);
         QueueLogButton.Visibility = failed > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -636,6 +694,11 @@ public sealed partial class OverviewPage : Page
     private void OnChooseProjects(object sender, RoutedEventArgs e)
     {
         MainWindow.Instance?.NavigateTo(MainWindow.ProjectsTag);
+    }
+
+    private void OnOpenAccounts(object sender, RoutedEventArgs e)
+    {
+        MainWindow.Instance?.NavigateTo(MainWindow.AccountsTag);
     }
 
     /// <summary>A refused command goes to the window's message bar with the engine's reason.</summary>

@@ -212,17 +212,25 @@ impl Tray {
             | UiMsg::Update { .. }
             | UiMsg::Settings(_)
             | UiMsg::Activity(_)
+            | UiMsg::SignInProgress { .. }
+            | UiMsg::StreamBimRegions(_)
             | UiMsg::ApsClientIdValidation { .. } => {}
         }
     }
 
     fn apply_status(&mut self, s: &Status) {
-        self.signed_in = s.user.is_some();
+        let signed_in_accounts = s.accounts.iter().filter(|a| a.signed_in).count();
+        self.signed_in = signed_in_accounts > 0;
+        // The first signed-in account, and " +n" for the others.
         let user_label = s.user.as_ref().map(|u| {
-            if u.email.is_empty() {
+            let who = if u.email.is_empty() {
                 u.name.clone()
             } else {
                 u.email.clone()
+            };
+            match signed_in_accounts {
+                0 | 1 => who,
+                n => format!("{who} +{}", n - 1),
             }
         });
         let text = if s.text.trim().is_empty() {
@@ -458,6 +466,17 @@ fn search(dir: &Path, depth: u32) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_refusal_text_reaches_the_user_unchanged() {
+        // A provider's own "not offered" text is user-facing already: no HTTP or ACC rewording.
+        let raw = "Kunde inte synkronisera rapport.pdf: Interaxo stöds inte ännu";
+        let (title, body, severity, help) = friendly_notification("Synka", raw, Severity::Info);
+        assert_eq!(title, "Synka");
+        assert_eq!(body, raw);
+        assert_eq!(severity, Severity::Info);
+        assert!(!help);
+    }
 
     #[test]
     fn unsupported_acc_error_is_calm_and_links_to_help() {

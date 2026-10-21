@@ -1,6 +1,7 @@
 //! APS 3-legged OAuth: Authorization Code + PKCE (public client, no secret) over a loopback
 //! redirect. Refresh token persisted DPAPI-protected (CryptProtectData, current user) in
-//! `<state_dir>\token.bin`. Access token kept in memory only.
+//! `<state_dir>\token.bin`. Access token kept in memory only. The Interaxo account runs the
+//! same flow against its OIDC endpoints (`Auth::interaxo`, see `Spec`).
 //!
 //! Endpoints:
 //!   authorize: https://developer.api.autodesk.com/authentication/v2/authorize
@@ -63,6 +64,148 @@ const PUBLIC_APP_GUIDANCE: &str = "Välj apptypen Desktop, Mobile, Single-Page A
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 const PORT_BUSY_MSG: &str = "Kan inte öppna inloggningsport 47863 – porten används redan eller är blockerad. Stäng programmet som använder porten och försök igen. (Sign-in port 47863 is unavailable)";
 
+/// Default loopback redirect of the Interaxo client (what Interaxo support registers).
+pub const INTERAXO_DEFAULT_REDIRECT: &str = "http://localhost:47864/";
+
+// Interaxo's OIDC endpoints (Auth0 on a custom domain, docs/specs/interaxo-endpoints.md 2.2).
+const INTERAXO_AUTHORIZE_URL: &str = "https://login.collaboration-sso.com/authorize";
+const INTERAXO_TOKEN_URL: &str = "https://login.collaboration-sso.com/oauth/token";
+const INTERAXO_USERINFO_URL: &str = "https://login.collaboration-sso.com/userinfo";
+const INTERAXO_REVOKE_URL: &str = "https://login.collaboration-sso.com/oauth/revoke";
+const INTERAXO_SCOPES: &str = "openid profile email offline_access";
+const INTERAXO_AUDIENCE: &str = "https://api.interaxo.com/v1/";
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What one OAuth account signs in with: APS (Autodesk) or Interaxo (Auth0 OIDC).
+struct Spec {
+    /// Provider name in user-facing messages.
+    name: &'static str,
+    authorize: &'static str,
+    token: &'static str,
+    userinfo: &'static str,
+    /// RFC 7009 revocation endpoint, called on sign-out. None for APS.
+    revoke: Option<&'static str>,
+    scopes: &'static str,
+    /// Extra authorize parameters (Interaxo's API audience).
+    extra_authorize: &'static [(&'static str, &'static str)],
+    /// APS repeats `scope` on refresh; Interaxo does not.
+    scope_on_refresh: bool,
+}
+
+static APS_SPEC: Spec = Spec {
+    name: "Autodesk",
+    authorize: AUTHORIZE_URL,
+    token: TOKEN_URL,
+    userinfo: USERINFO_URL,
+    revoke: None,
+    scopes: SCOPES,
+    extra_authorize: &[],
+    scope_on_refresh: true,
+};
+
+static INTERAXO_SPEC: Spec = Spec {
+    name: "Interaxo",
+    authorize: INTERAXO_AUTHORIZE_URL,
+    token: INTERAXO_TOKEN_URL,
+    userinfo: INTERAXO_USERINFO_URL,
+    revoke: Some(INTERAXO_REVOKE_URL),
+    scopes: INTERAXO_SCOPES,
+    extra_authorize: &[("audience", INTERAXO_AUDIENCE)],
+    scope_on_refresh: false,
+};
+
+/// The authorize URL of a sign-in. `relogin` asks the provider to show its login form again.
+fn build_authorize_url(
+    spec: &Spec,
+    client_id: &str,
+    redirect: &str,
+    challenge: &str,
+    state: &str,
+    relogin: bool,
+) -> Result<url::Url> {
+    let mut authorize = url::Url::parse(spec.authorize).context("authorize-URL")?;
+    {
+        let mut q = authorize.query_pairs_mut();
+        q.append_pair("response_type", "code")
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect)
+            .append_pair("scope", spec.scopes)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", state);
+        for &(key, value) in spec.extra_authorize {
+            q.append_pair(key, value);
+        }
+        if relogin {
+            q.append_pair("prompt", "login");
+        }
+    }
+    Ok(authorize)
+}
+
+/// `application/x-www-form-urlencoded` body of a token or revocation request.
+fn form_body(pairs: &[(&str, &str)]) -> String {
+    let mut s = url::form_urlencoded::Serializer::new(String::new());
+    s.extend_pairs(pairs);
+    s.finish()
+}
+
+/// Interaxo OIDC client ("bring your own client id").
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct InteraxoClient {
+    pub client_id: String,
+    /// Only for a confidential client. Never printed (see the `Debug` impl).
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for InteraxoClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteraxoClient")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
+}
+
+/// Ok when `uri` is a loopback redirect Synka can listen on: `http://localhost:<port>/<path>`
+/// or `http://127.0.0.1:<port>/<path>` with an explicit port from 1 to 65535, and no user
+/// info, query or fragment. The Err text is shown to the user (Swedish).
+pub fn check_loopback_redirect(uri: &str) -> Result<(), String> {
+    const HOST: &str = "Omdirigerings-URI:n måste börja med http://localhost eller http://127.0.0.1 (redirect URI must be http://localhost or http://127.0.0.1)";
+    const PORT: &str = "Omdirigerings-URI:n måste ange en port från 1 till 65535, till exempel http://localhost:47864/ (redirect URI needs an explicit port)";
+    if uri.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(HOST.into());
+    }
+    let url = url::Url::parse(uri).map_err(|_| HOST.to_string())?;
+    if url.scheme() != "http" || !matches!(url.host_str(), Some("localhost" | "127.0.0.1")) {
+        return Err(HOST.into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Omdirigerings-URI:n får inte innehålla användarnamn eller lösenord (redirect URI must not contain user info)".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Omdirigerings-URI:n får inte innehålla frågesträng eller fragment (redirect URI must not contain a query or fragment)".into());
+    }
+    // `url` drops a port that equals the scheme default (":80"), so read the port from the text.
+    let authority = uri
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .unwrap_or_default();
+    let port = authority
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    match port.map(str::parse::<u16>) {
+        Some(Ok(port)) if port >= 1 => Ok(()),
+        _ => Err(PORT.into()),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct UserInfo {
     /// OIDC `sub` (Autodesk user id / oxygen id).
@@ -123,31 +266,56 @@ pub struct Auth {
     client_id: String,
     http: reqwest::Client,
     state_dir: PathBuf,
+    /// File names in `state_dir` (ACC: token.bin / user.json; other OAuth providers use their own).
+    token_file: &'static str,
+    user_file: &'static str,
+    /// The Interaxo client, for the Interaxo account only (None for ACC). Its client id
+    /// overrides `client_id`.
+    interaxo: RwLock<Option<InteraxoClient>>,
     token: Mutex<TokenState>,
     user: RwLock<Option<UserInfo>>,
     #[cfg(test)]
     test_access_token: Option<String>,
     #[cfg(test)]
     test_endpoints: Option<(String, String)>,
+    #[cfg(test)]
+    test_revoke: Option<String>,
 }
 
 impl Auth {
     /// `client_id` empty => `is_configured()` false; sign_in returns an error explaining the
     /// APS app must be configured.
     pub fn new(client_id: String, http: reqwest::Client, state_dir: &Path) -> Auth {
-        let user = std::fs::read(state_dir.join("user.json"))
+        Auth::with_files(client_id, http, state_dir, "token.bin", "user.json")
+    }
+
+    /// Like `new`, with the token and profile files named by the caller (one pair per OAuth
+    /// account). The endpoints and scopes are APS's; `Auth::interaxo` selects Interaxo's.
+    pub fn with_files(
+        client_id: String,
+        http: reqwest::Client,
+        state_dir: &Path,
+        token_file: &'static str,
+        user_file: &'static str,
+    ) -> Auth {
+        let user = std::fs::read(state_dir.join(user_file))
             .ok()
             .and_then(|b| serde_json::from_slice::<UserInfo>(&b).ok());
         Auth {
             client_id,
             http,
             state_dir: state_dir.to_path_buf(),
+            token_file,
+            user_file,
+            interaxo: RwLock::new(None),
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(user),
             #[cfg(test)]
             test_access_token: None,
             #[cfg(test)]
             test_endpoints: None,
+            #[cfg(test)]
+            test_revoke: None,
         }
     }
 
@@ -158,15 +326,58 @@ impl Auth {
             client_id: String::new(),
             http,
             state_dir: PathBuf::new(),
+            token_file: "token.bin",
+            user_file: "user.json",
+            interaxo: RwLock::new(None),
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(None),
             test_access_token: Some("synka-loopback-test-token".to_string()),
             test_endpoints: None,
+            test_revoke: None,
+        }
+    }
+
+    /// The Interaxo account: an `Auth` for Interaxo's OIDC client, with its own token and
+    /// profile files. An empty client id means not configured yet.
+    pub fn interaxo(client: InteraxoClient, http: reqwest::Client, state_dir: &Path) -> Auth {
+        let base = Auth::with_files(
+            client.client_id.clone(),
+            http,
+            state_dir,
+            "token-interaxo.bin",
+            "user-interaxo.json",
+        );
+        Auth {
+            interaxo: RwLock::new(Some(client)),
+            ..base
+        }
+    }
+
+    /// Replace the stored Interaxo client (the caller makes sure the account is signed out).
+    pub fn set_interaxo_client(&self, client: InteraxoClient) {
+        *self.interaxo.write().unwrap_or_else(|e| e.into_inner()) = Some(client);
+    }
+
+    /// The stored Interaxo client; None for the ACC account.
+    #[cfg(test)]
+    pub fn interaxo_client(&self) -> Option<InteraxoClient> {
+        self.interaxo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The client id in use: the stored Interaxo client's, else the constructor's.
+    fn current_client_id(&self) -> String {
+        let interaxo = self.interaxo.read().unwrap_or_else(|e| e.into_inner());
+        match interaxo.as_ref() {
+            Some(client) => client.client_id.clone(),
+            None => self.client_id.clone(),
         }
     }
 
     pub fn is_configured(&self) -> bool {
-        !self.client_id.trim().is_empty()
+        !self.current_client_id().trim().is_empty()
     }
 
     /// A complete local session needs credentials and a validated user profile.
@@ -203,12 +414,17 @@ impl Auth {
             client_id,
             http,
             state_dir: PathBuf::new(),
+            token_file: "token.bin",
+            user_file: "user.json",
+            interaxo: RwLock::new(None),
             token: Mutex::new(TokenState::default()),
             user: RwLock::new(None),
             #[cfg(test)]
             test_access_token: None,
             #[cfg(test)]
             test_endpoints: None,
+            #[cfg(test)]
+            test_revoke: None,
         };
         candidate.browser_sign_in(true).await?;
         Ok(())
@@ -216,12 +432,16 @@ impl Auth {
 
     async fn browser_sign_in(&self, validation_only: bool) -> Result<UserInfo> {
         if !self.is_configured() {
+            if self.is_interaxo() {
+                bail!("Ange Interaxo Client ID under Inställningar → Konton.");
+            }
             bail!(
                 "APS-appen är inte konfigurerad: client id saknas (APS app is not configured: \
                  missing client id). Sätt aps_client_id i settings.json."
             );
         }
-        // Signing in while already signed in is an explicit re-login: ask Autodesk to show
+        let (port, redirect, callback_path) = self.sign_in_redirect()?;
+        // Signing in while already signed in is an explicit re-login: ask the provider to show
         // the login form again instead of silently reusing the browser session.
         let relogin = !validation_only && self.is_signed_in();
 
@@ -230,32 +450,26 @@ impl Auth {
         let state = random_b64(16)?;
 
         // Bind BEFORE opening the browser so the redirect cannot arrive at nothing.
-        let listener = TcpListener::bind(("127.0.0.1", REDIRECT_PORT))
+        let listener = TcpListener::bind(("127.0.0.1", port))
             .await
-            .context(PORT_BUSY_MSG)?;
-        let redirect = redirect_uri(REDIRECT_PORT);
+            .context(self.port_busy_message(port, &redirect))?;
 
-        let mut authorize = url::Url::parse(AUTHORIZE_URL).context("authorize-URL")?;
-        {
-            let mut q = authorize.query_pairs_mut();
-            q.append_pair("response_type", "code")
-                .append_pair("client_id", &self.client_id)
-                .append_pair("redirect_uri", &redirect)
-                .append_pair("scope", SCOPES)
-                .append_pair("code_challenge", &challenge)
-                .append_pair("code_challenge_method", "S256")
-                .append_pair("state", &state);
-            if relogin {
-                q.append_pair("prompt", "login");
-            }
-        }
+        let client_id = self.current_client_id();
+        let authorize = build_authorize_url(
+            self.spec(),
+            &client_id,
+            &redirect,
+            &challenge,
+            &state,
+            relogin,
+        )?;
         open_browser(authorize.as_str())?;
         info!(redirect_uri = %redirect, timeout_secs = CALLBACK_TIMEOUT.as_secs(),
             "inloggning startad – väntar på webbläsaren");
 
         let (code, mut sock) = match tokio::time::timeout(
             CALLBACK_TIMEOUT,
-            accept_callback(&listener, &state),
+            accept_callback_at(&listener, &state, &callback_path),
         )
         .await
         {
@@ -294,13 +508,24 @@ impl Auth {
         }
     }
 
-    /// Forget tokens (delete token.bin) and the cached user.
+    /// Forget tokens (delete token.bin) and the cached user. Interaxo: the refresh token is
+    /// revoked first, best-effort (a failure does not keep the local session).
     pub async fn sign_out(&self) -> Result<()> {
-        {
+        let interaxo = self.is_interaxo();
+        let refresh = {
             let mut st = self.token.lock().await;
+            let refresh = if interaxo {
+                st.refresh.clone().or_else(|| self.load_refresh())
+            } else {
+                None
+            };
             st.access = None;
             st.expires_at = None;
             st.refresh = None;
+            refresh
+        };
+        if let (Some(url), Some(refresh)) = (self.revoke_endpoint(), refresh) {
+            self.revoke_best_effort(url, &refresh).await;
         }
         remove_if_exists(&self.token_path())?;
         remove_if_exists(&self.user_path())?;
@@ -330,14 +555,21 @@ impl Auth {
             None => bail!("Inte inloggad – logga in igen. (Not signed in)"),
         };
 
-        let result = self
-            .token_request(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", rt.as_str()),
-                ("client_id", self.client_id.as_str()),
-                ("scope", SCOPES),
-            ])
-            .await;
+        let client_id = self.current_client_id();
+        let secret = self.client_secret();
+        let spec = self.spec();
+        let mut pairs = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", rt.as_str()),
+            ("client_id", client_id.as_str()),
+        ];
+        if spec.scope_on_refresh {
+            pairs.push(("scope", spec.scopes));
+        }
+        if let Some(secret) = secret.as_deref() {
+            pairs.push(("client_secret", secret));
+        }
+        let result = self.token_request(&pairs).await;
         match result {
             Ok(tr) => {
                 if let Some(new_rt) = tr.refresh_token {
@@ -379,11 +611,11 @@ impl Auth {
     // ---- internals -------------------------------------------------------------------------
 
     fn token_path(&self) -> PathBuf {
-        self.state_dir.join("token.bin")
+        self.state_dir.join(self.token_file)
     }
 
     fn user_path(&self) -> PathBuf {
-        self.state_dir.join("user.json")
+        self.state_dir.join(self.user_file)
     }
 
     /// Read and decrypt the stored refresh token. An unreadable blob (e.g. another Windows
@@ -434,25 +666,38 @@ impl Auth {
         verifier: &str,
         redirect: &str,
     ) -> Result<VerifiedSignIn> {
+        let client_id = self.current_client_id();
+        let secret = self.client_secret();
+        let mut pairs = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect),
+            ("client_id", client_id.as_str()),
+            ("code_verifier", verifier),
+        ];
+        if let Some(secret) = secret.as_deref() {
+            pairs.push(("client_secret", secret));
+        }
         let tr = self
-            .token_request(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", redirect),
-                ("client_id", self.client_id.as_str()),
-                ("code_verifier", verifier),
-            ])
+            .token_request(&pairs)
             .await
-            .map_err(|e| e.into_anyhow().context(PUBLIC_APP_GUIDANCE))?;
+            .map_err(|e| e.into_anyhow().context(self.guidance(redirect)))?;
 
+        let spec = self.spec();
         if tr.access_token.trim().is_empty() {
-            bail!("Autodesk returnerade ingen access token (no access token returned)");
+            bail!(
+                "{} returnerade ingen access token (no access token returned)",
+                spec.name
+            );
         }
         tr.refresh_token
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
-                anyhow!("Autodesk returnerade ingen refresh token (no refresh token returned)")
+                anyhow!(
+                    "{} returnerade ingen refresh token (no refresh token returned)",
+                    spec.name
+                )
             })?;
         // A failed profile request must not leave a token-only session that prevents retry.
         let user = self.fetch_user(&tr.access_token).await?;
@@ -502,12 +747,19 @@ impl Auth {
         let u: UserinfoResponse = resp.json().await.context("userinfo-svar")?;
         if u.sub.trim().is_empty() {
             bail!(
-                "Autodesk returnerade ingen användaridentitet (userinfo response has no user id)"
+                "{} returnerade ingen användaridentitet (userinfo response has no user id)",
+                self.spec().name
             );
         }
+        // Interaxo profiles may have no display name: the e-mail address stands in for it.
+        let name = if self.is_interaxo() && u.name.trim().is_empty() {
+            u.email.clone()
+        } else {
+            u.name
+        };
         Ok(UserInfo {
             user_id: u.sub,
-            name: u.name,
+            name,
             email: u.email,
         })
     }
@@ -518,11 +770,7 @@ impl Auth {
         &self,
         pairs: &[(&str, &str)],
     ) -> std::result::Result<TokenResponse, TokenErr> {
-        let body = {
-            let mut s = url::form_urlencoded::Serializer::new(String::new());
-            s.extend_pairs(pairs);
-            s.finish()
-        };
+        let body = form_body(pairs);
         let resp = self
             .http
             .post(self.token_endpoint())
@@ -562,7 +810,7 @@ impl Auth {
         if let Some((token, _)) = &self.test_endpoints {
             return token;
         }
-        TOKEN_URL
+        self.spec().token
     }
 
     fn userinfo_endpoint(&self) -> &str {
@@ -570,7 +818,115 @@ impl Auth {
         if let Some((_, userinfo)) = &self.test_endpoints {
             return userinfo;
         }
-        USERINFO_URL
+        self.spec().userinfo
+    }
+
+    fn revoke_endpoint(&self) -> Option<&str> {
+        #[cfg(test)]
+        if let Some(url) = &self.test_revoke {
+            return Some(url.as_str());
+        }
+        self.spec().revoke
+    }
+
+    /// The endpoints and scopes of this account: Interaxo when it was built by `Auth::interaxo`.
+    fn spec(&self) -> &'static Spec {
+        if self.is_interaxo() {
+            &INTERAXO_SPEC
+        } else {
+            &APS_SPEC
+        }
+    }
+
+    fn is_interaxo(&self) -> bool {
+        self.interaxo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// The client secret in use (Interaxo, confidential clients only). Read at use time.
+    fn client_secret(&self) -> Option<String> {
+        self.interaxo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|client| client.client_secret.clone())
+            .filter(|secret| !secret.trim().is_empty())
+    }
+
+    /// Port, exact redirect URI and callback path of this account's loopback sign-in. APS: the
+    /// registered localhost address. Interaxo: the client's own redirect URI, checked before
+    /// any port is bound.
+    fn sign_in_redirect(&self) -> Result<(u16, String, String)> {
+        let client = self
+            .interaxo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(client) = client else {
+            return Ok((REDIRECT_PORT, redirect_uri(REDIRECT_PORT), "/".to_string()));
+        };
+        check_loopback_redirect(&client.redirect_uri).map_err(|e| anyhow!(e))?;
+        let url = url::Url::parse(&client.redirect_uri).context("omdirigerings-URI")?;
+        let port = url
+            .port_or_known_default()
+            .context("omdirigerings-URI:n saknar port")?;
+        Ok((port, client.redirect_uri, url.path().to_string()))
+    }
+
+    fn port_busy_message(&self, port: u16, redirect: &str) -> String {
+        if self.is_interaxo() {
+            format!(
+                "Kan inte öppna inloggningsport {port} – porten används redan eller är blockerad. \
+                 Stäng programmet som använder porten och försök igen. \
+                 Be Interaxo support om en Native-klient med Authorization Code + PKCE och refresh \
+                 token, och registrera exakt redirect-URI:n {redirect}. \
+                 (Sign-in port {port} is unavailable)"
+            )
+        } else {
+            PORT_BUSY_MSG.to_string()
+        }
+    }
+
+    /// Shown with a failed token exchange: what to ask the provider for.
+    fn guidance(&self, redirect: &str) -> String {
+        if self.is_interaxo() {
+            format!(
+                "Be Interaxo support om en Native-klient med Authorization Code + PKCE och refresh \
+                 token, och registrera exakt redirect-URI:n {redirect}. \
+                 (Ask Interaxo support for a native client with Authorization Code + PKCE and refresh tokens.)"
+            )
+        } else {
+            PUBLIC_APP_GUIDANCE.to_string()
+        }
+    }
+
+    /// Best-effort revocation of a refresh token (RFC 7009). Failures are only logged: the
+    /// local session is deleted either way.
+    async fn revoke_best_effort(&self, url: &str, refresh: &str) {
+        let client_id = self.current_client_id();
+        let secret = self.client_secret();
+        let mut pairs = vec![("client_id", client_id.as_str()), ("token", refresh)];
+        if let Some(secret) = secret.as_deref() {
+            pairs.push(("client_secret", secret));
+        }
+        let sent = self
+            .http
+            .post(url)
+            .timeout(REVOKE_TIMEOUT)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(form_body(&pairs))
+            .send()
+            .await;
+        match sent {
+            Ok(resp) if resp.status().is_success() => debug!("refresh-token återkallad"),
+            Ok(resp) => debug!("återkallningen avvisades: HTTP {}", resp.status()),
+            Err(e) => debug!("återkallningen misslyckades: {}", e.without_url()),
+        }
     }
 }
 
@@ -609,11 +965,21 @@ fn safe_oauth_error(error: &str) -> &str {
 
 // ---- loopback callback ----------------------------------------------------------------------
 
-/// Accept connections until a valid `/?code=..&state=..` arrives. Returns the code and the
-/// open socket so the caller can answer once the token exchange has finished.
+/// APS callback: `/?code=..&state=..` on the registered address.
+#[cfg(test)]
 async fn accept_callback(
     listener: &TcpListener,
     expected_state: &str,
+) -> Result<(String, TcpStream)> {
+    accept_callback_at(listener, expected_state, "/").await
+}
+
+/// Accept connections until a valid `<expected_path>?code=..&state=..` arrives. Returns the
+/// code and the open socket so the caller can answer once the token exchange has finished.
+async fn accept_callback_at(
+    listener: &TcpListener,
+    expected_state: &str,
+    expected_path: &str,
 ) -> Result<(String, TcpStream)> {
     loop {
         let (mut sock, _) = match listener.accept().await {
@@ -632,7 +998,7 @@ async fn accept_callback(
             respond(&mut sock, "400 Bad Request", "").await;
             continue;
         };
-        if url.path() != "/" {
+        if url.path() != expected_path {
             respond(&mut sock, "404 Not Found", "").await;
             continue;
         }
@@ -768,7 +1134,8 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
+/// Protect `data` for the current Windows user (DPAPI).
+pub(crate) fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
@@ -789,7 +1156,8 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
     Ok(take_blob(output))
 }
 
-fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
+/// Reverse of `dpapi_protect`; fails for a blob another Windows user protected.
+pub(crate) fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
@@ -1201,5 +1569,456 @@ mod tests {
         assert!(message.contains("oauth_error"));
         assert!(!message.contains("sensitive"));
         assert!(!auth.token_path().exists());
+    }
+}
+
+#[cfg(test)]
+mod interaxo_client_tests {
+    use super::*;
+
+    /// A private state directory, removed on drop.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            let path = std::env::temp_dir().join(format!(
+                "synka-interaxo-{tag}-{}-{}",
+                std::process::id(),
+                random_b64(8).unwrap()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Dir(path)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn http() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[test]
+    fn loopback_redirects_with_an_explicit_port_are_accepted() {
+        for uri in [
+            "http://localhost:47864/",
+            "http://127.0.0.1:1/",
+            "http://localhost:65535/callback/interaxo",
+            "http://localhost:80/",
+            "http://LOCALHOST:47864/",
+            INTERAXO_DEFAULT_REDIRECT,
+        ] {
+            assert_eq!(check_loopback_redirect(uri), Ok(()), "{uri}");
+        }
+    }
+
+    #[test]
+    fn redirects_outside_the_loopback_rules_are_rejected() {
+        for uri in [
+            "",
+            "https://localhost:47864/",
+            "http://example.com:47864/",
+            "http://localhost.example:47864/",
+            "http://[::1]:47864/",
+            "http://localhost/",
+            "http://localhost:/",
+            "http://localhost:0/",
+            "http://localhost:65536/",
+            "http://localhost:+80/",
+            "http://localhost:47864/?x=1",
+            "http://localhost:47864/#fragment",
+            "http://user@localhost:47864/",
+            "http://user:pw@localhost:47864/",
+            "http://localhost:47864/a b",
+            "http://localhost:47864/\n",
+            "localhost:47864",
+        ] {
+            assert!(
+                check_loopback_redirect(uri).is_err(),
+                "{uri:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn interaxo_account_is_configured_by_its_stored_client_id() {
+        let dir = Dir::new("configured");
+        let auth = Auth::interaxo(InteraxoClient::default(), http(), &dir.0);
+        assert!(!auth.is_configured());
+        assert!(auth.interaxo_client().is_some());
+
+        let client = InteraxoClient {
+            client_id: "my-client".into(),
+            client_secret: None,
+            redirect_uri: INTERAXO_DEFAULT_REDIRECT.into(),
+        };
+        auth.set_interaxo_client(client.clone());
+        assert!(auth.is_configured());
+        assert_eq!(auth.current_client_id(), "my-client");
+        assert_eq!(auth.interaxo_client(), Some(client));
+
+        auth.set_interaxo_client(InteraxoClient {
+            client_id: "  ".into(),
+            ..Default::default()
+        });
+        assert!(!auth.is_configured());
+    }
+
+    #[test]
+    fn acc_account_has_no_interaxo_client() {
+        let dir = Dir::new("acc");
+        let acc = Auth::new("aps-client".into(), http(), &dir.0);
+        assert!(acc.is_configured());
+        assert!(acc.interaxo_client().is_none());
+        assert!(!Auth::new(String::new(), http(), &dir.0).is_configured());
+    }
+
+    #[test]
+    fn interaxo_account_keeps_its_own_token_and_profile_files() {
+        let dir = Dir::new("files");
+        let auth = Auth::interaxo(InteraxoClient::default(), http(), &dir.0);
+        assert_eq!(auth.token_path(), dir.0.join("token-interaxo.bin"));
+        assert_eq!(auth.user_path(), dir.0.join("user-interaxo.json"));
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_client_secret() {
+        let client = InteraxoClient {
+            client_id: "id".into(),
+            client_secret: Some("very-secret-value".into()),
+            redirect_uri: INTERAXO_DEFAULT_REDIRECT.into(),
+        };
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("very-secret-value"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    use crate::test_support::{Fault, Request, Server};
+
+    fn client(client_id: &str, secret: Option<&str>, redirect: &str) -> InteraxoClient {
+        InteraxoClient {
+            client_id: client_id.into(),
+            client_secret: secret.map(str::to_string),
+            redirect_uri: redirect.into(),
+        }
+    }
+
+    fn json_reply(value: serde_json::Value) -> Fault {
+        Fault::reply(200, serde_json::to_vec(&value).unwrap())
+            .header("Content-Type", "application/json")
+    }
+
+    fn token_reply(refresh: &str) -> Fault {
+        json_reply(serde_json::json!({
+            "access_token": "loopback-access-only",
+            "refresh_token": refresh,
+            "expires_in": 3600
+        }))
+    }
+
+    /// The form fields of a request body.
+    fn form(request: &Request) -> HashMap<String, String> {
+        url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect()
+    }
+
+    /// Point an Interaxo account at a loopback server (token, userinfo and revoke).
+    fn point_at(auth: &mut Auth, server: &Server) {
+        auth.test_endpoints = Some((
+            format!("{}/token", server.origin),
+            format!("{}/userinfo", server.origin),
+        ));
+        auth.test_revoke = Some(format!("{}/revoke", server.origin));
+    }
+
+    async fn get(address: std::net::SocketAddr, target: &str) -> String {
+        let mut sock = TcpStream::connect(address).await.unwrap();
+        sock.write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut response))
+            .await
+            .expect("callback response deadline")
+            .unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[test]
+    fn interaxo_authorize_url_asks_for_the_api_audience_offline_access_and_pkce() {
+        let url = build_authorize_url(
+            &INTERAXO_SPEC,
+            "native-client",
+            INTERAXO_DEFAULT_REDIRECT,
+            "challenge-value",
+            "state-value",
+            false,
+        )
+        .unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("login.collaboration-sso.com"));
+        assert_eq!(url.path(), "/authorize");
+        let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        let get = |key: &str| q.get(key).map(String::as_str);
+        assert_eq!(get("response_type"), Some("code"));
+        assert_eq!(get("client_id"), Some("native-client"));
+        assert_eq!(get("redirect_uri"), Some(INTERAXO_DEFAULT_REDIRECT));
+        assert_eq!(get("scope"), Some("openid profile email offline_access"));
+        assert_eq!(get("audience"), Some("https://api.interaxo.com/v1/"));
+        assert_eq!(get("code_challenge"), Some("challenge-value"));
+        assert_eq!(get("code_challenge_method"), Some("S256"));
+        assert_eq!(get("state"), Some("state-value"));
+        assert_eq!(get("prompt"), None);
+
+        let again = build_authorize_url(
+            &INTERAXO_SPEC,
+            "native-client",
+            INTERAXO_DEFAULT_REDIRECT,
+            "c",
+            "s",
+            true,
+        )
+        .unwrap();
+        assert!(again
+            .query_pairs()
+            .any(|(k, v)| k == "prompt" && v == "login"));
+    }
+
+    #[test]
+    fn aps_authorize_url_keeps_its_parameters() {
+        let redirect = redirect_uri(REDIRECT_PORT);
+        let url = build_authorize_url(&APS_SPEC, "aps-client", &redirect, "c", "s", true).unwrap();
+        assert_eq!(url.host_str(), Some("developer.api.autodesk.com"));
+        let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some("http://localhost:47863/")
+        );
+        assert_eq!(q.get("scope").map(String::as_str), Some(SCOPES));
+        assert_eq!(q.get("prompt").map(String::as_str), Some("login"));
+        assert!(!q.contains_key("audience"));
+    }
+
+    #[test]
+    fn interaxo_listens_on_the_port_and_path_of_its_redirect_uri() {
+        let dir = Dir::new("listen");
+        let custom = Auth::interaxo(
+            client(
+                "native-client",
+                None,
+                "http://127.0.0.1:47999/oauth/callback",
+            ),
+            http(),
+            &dir.0,
+        );
+        assert_eq!(
+            custom.sign_in_redirect().unwrap(),
+            (
+                47999,
+                "http://127.0.0.1:47999/oauth/callback".to_string(),
+                "/oauth/callback".to_string()
+            )
+        );
+        let default = Auth::interaxo(
+            client("native-client", None, INTERAXO_DEFAULT_REDIRECT),
+            http(),
+            &dir.0,
+        );
+        assert_eq!(
+            default.sign_in_redirect().unwrap(),
+            (
+                47864,
+                INTERAXO_DEFAULT_REDIRECT.to_string(),
+                "/".to_string()
+            )
+        );
+        let acc = Auth::new("aps-client".into(), http(), &dir.0);
+        assert_eq!(
+            acc.sign_in_redirect().unwrap(),
+            (
+                REDIRECT_PORT,
+                "http://localhost:47863/".to_string(),
+                "/".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn interaxo_sign_in_asks_for_a_client_id_first() {
+        let dir = Dir::new("unconfigured");
+        let auth = Auth::interaxo(InteraxoClient::default(), http(), &dir.0);
+        let err = auth.sign_in().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Ange Interaxo Client ID under Inställningar → Konton."),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interaxo_sign_in_checks_the_redirect_before_it_opens_a_browser() {
+        let dir = Dir::new("badredirect");
+        let auth = Auth::interaxo(
+            client("native-client", None, "https://example.com/callback"),
+            http(),
+            &dir.0,
+        );
+        let err = auth.sign_in().await.unwrap_err();
+        assert!(err.to_string().contains("Omdirigerings-URI"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn interaxo_callback_is_accepted_on_its_own_path_only() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (code, mut sock) =
+                accept_callback_at(&listener, "current-state", "/callback").await?;
+            respond(&mut sock, "200 OK", "done").await;
+            Ok::<_, anyhow::Error>(code)
+        });
+        // A callback on the root path is not this client's redirect: it is ignored.
+        assert!(get(address, "/?code=stray&state=current-state")
+            .await
+            .starts_with("HTTP/1.1 404"));
+        assert!(!task.is_finished());
+        assert!(get(address, "/callback?code=wrong&state=other")
+            .await
+            .starts_with("HTTP/1.1 400"));
+        assert!(!task.is_finished());
+        assert!(get(address, "/callback?code=good&state=current-state")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(task.await.unwrap().unwrap(), "good");
+    }
+
+    #[tokio::test]
+    async fn interaxo_code_exchange_sends_the_secret_only_when_one_is_set() {
+        for secret in [None, Some("client-secret-value")] {
+            let server = Server::scripted(vec![
+                token_reply("interaxo-refresh"),
+                json_reply(serde_json::json!({
+                    "sub": "auth0|user-1", "name": "", "email": "anna@example.se"
+                })),
+            ])
+            .await;
+            let dir = Dir::new("exchange");
+            let mut auth = Auth::interaxo(
+                client("native-client", secret, INTERAXO_DEFAULT_REDIRECT),
+                http(),
+                &dir.0,
+            );
+            point_at(&mut auth, &server);
+
+            let user = auth
+                .complete_browser_sign_in(
+                    "the-code",
+                    "the-verifier",
+                    INTERAXO_DEFAULT_REDIRECT,
+                    true,
+                )
+                .await
+                .unwrap();
+            // A profile without a name shows the e-mail address instead.
+            assert_eq!(user.user_id, "auth0|user-1");
+            assert_eq!(user.name, "anna@example.se");
+            assert!(auth.user().is_none(), "validation keeps nothing");
+
+            let requests = server.requests();
+            assert_eq!(requests.len(), 2);
+            let body = form(&requests[0]);
+            let get = |key: &str| body.get(key).map(String::as_str);
+            assert_eq!(get("grant_type"), Some("authorization_code"));
+            assert_eq!(get("client_id"), Some("native-client"));
+            assert_eq!(get("code"), Some("the-code"));
+            assert_eq!(get("code_verifier"), Some("the-verifier"));
+            assert_eq!(get("redirect_uri"), Some(INTERAXO_DEFAULT_REDIRECT));
+            assert!(!body.contains_key("scope"));
+            assert_eq!(get("client_secret"), secret);
+            assert!(requests[0].header("authorization").is_none());
+            assert_eq!(requests[1].target, "/userinfo");
+            assert_eq!(
+                requests[1].header("authorization"),
+                Some("Bearer loopback-access-only")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interaxo_refresh_omits_scope_and_uses_the_client_current_at_refresh_time() {
+        let server = Server::scripted(vec![token_reply("rotated-refresh")]).await;
+        let dir = Dir::new("refresh");
+        let mut auth = Auth::interaxo(
+            client("client-a", None, INTERAXO_DEFAULT_REDIRECT),
+            http(),
+            &dir.0,
+        );
+        point_at(&mut auth, &server);
+        // The client changes before the refresh: the next refresh must use the new one.
+        auth.set_interaxo_client(client(
+            "client-b",
+            Some("secret-b"),
+            INTERAXO_DEFAULT_REDIRECT,
+        ));
+        auth.token.lock().await.refresh = Some("stored-refresh".into());
+
+        assert_eq!(auth.access_token().await.unwrap(), "loopback-access-only");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let body = form(&requests[0]);
+        let get = |key: &str| body.get(key).map(String::as_str);
+        assert_eq!(get("grant_type"), Some("refresh_token"));
+        assert_eq!(get("refresh_token"), Some("stored-refresh"));
+        assert_eq!(get("client_id"), Some("client-b"));
+        assert_eq!(get("client_secret"), Some("secret-b"));
+        assert!(!body.contains_key("scope"));
+        assert_eq!(
+            dpapi_unprotect(&std::fs::read(auth.token_path()).unwrap()).unwrap(),
+            b"rotated-refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn interaxo_sign_out_revokes_the_refresh_token_and_ignores_a_failure() {
+        let server = Server::scripted(vec![Fault::reply(500, "try later")]).await;
+        let dir = Dir::new("signout");
+        let mut auth = Auth::interaxo(
+            client("client-a", Some("secret-a"), INTERAXO_DEFAULT_REDIRECT),
+            http(),
+            &dir.0,
+        );
+        point_at(&mut auth, &server);
+        auth.token.lock().await.refresh = Some("refresh-to-revoke".into());
+        std::fs::write(
+            auth.token_path(),
+            dpapi_protect(b"refresh-to-revoke").unwrap(),
+        )
+        .unwrap();
+
+        auth.sign_out().await.unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].target, "/revoke");
+        let body = form(&requests[0]);
+        assert_eq!(body.get("client_id").map(String::as_str), Some("client-a"));
+        assert_eq!(
+            body.get("token").map(String::as_str),
+            Some("refresh-to-revoke")
+        );
+        assert_eq!(
+            body.get("client_secret").map(String::as_str),
+            Some("secret-a")
+        );
+        assert!(!auth.token_path().exists());
+        assert!(!auth.is_signed_in());
     }
 }

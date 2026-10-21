@@ -18,6 +18,46 @@ Everything marked **verified** was measured on this machine against the real ACC
 | Release channel | **Off by design** (legal review 2026-10). There is no public mirror. Staff update from the internal OneDrive share. The in-app check stays in code, off unless `update_channel` is set. |
 | Name | The product is **Synka** (package `Byggstyrning.Synka`). Earlier names: Better Desktop Connector (`Byggstyrning.BetterDesktopConnector`) and FastADC (`Byggstyrning.FastADC`). Those packages must be uninstalled first (Install.cmd offers it). The signing certificate is still `CN=FastADC` (TODO, see `packaging/README.md`). |
 
+## Multi-provider: StreamBIM and Interaxo (2026-10-20, not yet verified live)
+
+Architecture and contract: `docs/PROVIDERS.md`; protocol: `docs/IPC.md` "Providers and
+accounts"; API research with every gap: `docs/specs/streambim-endpoints.md`,
+`docs/specs/interaxo-endpoints.md`.
+
+| Area | State |
+|---|---|
+| Engine | One account per provider (ACC, StreamBIM, Interaxo). The sync root stays registered while any account is signed in (its id is kept in kv `sync_root_uid`; an existing ACC install keeps its id). Signing out of one provider pauses only its projects. Every API call goes through `src/remote/`. |
+| StreamBIM | One account per server: regions from `regions.json` (built-in fallback) or a custom https address; e-mail + password, TOTP MFA. Listing of populated folders, downloads via `downloadlink`, uploads via upload ticket → S3 PUT → document / document-revision. Folder create, rename, move and soft delete. No locks, no SSO-only accounts, no uploads over 5 GB. |
+| Interaxo | Bring-your-own OIDC client (Auth0, PKCE, optional secret, configurable loopback redirect). Communities on `api.interaxo.com` and `api.interaxo.se`, rooms as projects, simple folders and files. Download (pinned to the listed version), new files, new versions, delete. Folder create, rename and move stay local with a notice (no API). |
+| Window | A Konton page: every account with its server, status, synced projects and sign-out; sign-in dialogs (StreamBIM server + MFA code, browser sign-in for ACC and Interaxo); APS and Interaxo client settings under Avancerat. Projects show the provider per hub and can be filtered to one account. |
+| Tests | Loopback tests for both clients, multi-account engine and IPC tests, the IPC audit scenario and the resilience lab Quick profile. Nothing has run against a real StreamBIM or Interaxo tenant yet. |
+
+### Verify against real accounts (first thing for these providers)
+
+StreamBIM (one account with MFA, one without; one region other than `app`):
+1. Login and MFA: does `mfa/verify` return a `refreshToken`? (If not, MFA users re-enter a code
+   when the id token expires.) Does `refresh` accept a not-yet-expired id token? Wrong-code and
+   wrong-password status codes.
+2. Profile: shape of `/mgw/api/v2/user-profiles?filter[profile]=true` (name shown in Synka).
+3. Listing: `folders?filter[parent]=` and `documents?filter[folderId]=` return direct children
+   only; `meta.total` present; folder and document ids may collide (Synka prefixes documents
+   with `d`).
+4. Download link: which response variant; redirect to S3; whether a revision other than the
+   current one can be fetched.
+5. Upload: ticket `type` `attachments` accepted for documents; S3 PUT with a 5-minute presigned
+   URL for a large file; `POST documents` and `POST document-revisions` response bodies;
+   duplicate filenames in one folder.
+6. PATCH with the full object (rename, move, `is-deleted`); whether a deleted folder cascades.
+
+Interaxo (a test client from Interaxo support):
+1. Native client with PKCE and refresh tokens; consent screen on the loopback redirect; refresh
+   token rotation and lifetime; whether `/communities` on the "wrong" host answers 401, 403 or an
+   empty list.
+2. Paging: the real maximum `limit` on communities, rooms and children.
+3. Upload: multipart POST response (`version`, renamed name on a conflict); `versions?major=true`.
+4. Download with `?version=`; whether DELETE is soft or hard and whether it recurses.
+5. `lock_info` owner shape; the unofficial `ix.interaxo.*/{community}/{room}/documentLibrary/{id}` link.
+
 ## Fixed in the hardening pass
 
 - Safe saves (Office, AutoCAD, Revit) keep the version history: deletes wait 15 s, a new file

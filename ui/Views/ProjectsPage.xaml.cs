@@ -12,8 +12,16 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Navigation;
 
 namespace Synka.Views;
+
+/// <summary>
+/// The Projects page opened for one account only (Konton's "Visa projekt"): the hubs in
+/// <paramref name="HubIds"/> are shown and the rest hidden. <paramref name="Label"/> names
+/// the account in the bar that says so.
+/// </summary>
+public sealed record ProjectsFilter(IReadOnlyList<string> HubIds, string Label);
 
 public sealed partial class ProjectsPage : Page
 {
@@ -94,6 +102,9 @@ public sealed partial class ProjectsPage : Page
 
     private string _filter = string.Empty;
 
+    /// <summary>The account filter the page was opened with (Konton's "Visa projekt"). Null shows every hub.</summary>
+    private ProjectsFilter? _accountFilter;
+
     /// <summary>True while the page writes the engine's state into the switches, so Toggled is not taken for the user.</summary>
     private bool _mirroring;
 
@@ -121,6 +132,18 @@ public sealed partial class ProjectsPage : Page
     }
 
     private static EngineClient Engine => EngineClient.Instance;
+
+    /// <summary>The navigation's parameter: an account filter, or nothing for every hub.</summary>
+    protected override void OnNavigatedTo(NavigationEventArgs e)
+    {
+        base.OnNavigatedTo(e);
+        _accountFilter = e.Parameter as ProjectsFilter;
+        ShowAccountFilterBar();
+        if (IsLoaded)
+        {
+            Update();
+        }
+    }
 
     private static string Key(string hubId, string projectId) => hubId + "/" + projectId;
 
@@ -446,8 +469,8 @@ public sealed partial class ProjectsPage : Page
         body.Children.Add(new TextBlock
         {
             Text = Lang.T(
-                "Projektmappen byggs om från ACC. Filer laddas ner igen när du öppnar dem. Lokala ändringar som inte har synkats sparas först i mappen \"Synka - återställda filer\" bredvid synkmappen.",
-                "The project folder is rebuilt from ACC. Files are downloaded again when you open them. Local changes that have not been synced are first saved in the folder \"Synka - återställda filer\" next to the sync folder."),
+                "Projektmappen byggs om från molnet. Filer laddas ner igen när du öppnar dem. Lokala ändringar som inte har synkats sparas först i mappen \"Synka - återställda filer\" bredvid synkmappen.",
+                "The project folder is rebuilt from the cloud. Files are downloaded again when you open them. Local changes that have not been synced are first saved in the folder \"Synka - återställda filer\" next to the sync folder."),
             TextWrapping = TextWrapping.Wrap,
         });
 
@@ -456,7 +479,7 @@ public sealed partial class ProjectsPage : Page
             XamlRoot = root,
             // The dialog hangs in the popup root and does not inherit the theme choice.
             RequestedTheme = MainWindow.CurrentTheme,
-            Title = Lang.T("Bygg om projektet från ACC?", "Rebuild the project from ACC?"),
+            Title = Lang.T("Bygg om projektet från molnet?", "Rebuild the project from the cloud?"),
             Content = body,
             PrimaryButtonText = Lang.T("Bygg om", "Rebuild"),
             CloseButtonText = Lang.T("Avbryt", "Cancel"),
@@ -490,6 +513,41 @@ public sealed partial class ProjectsPage : Page
         {
             ShowError(ack.Error, Lang.T("Projektet gick inte att återställa.", "The project could not be reset."));
         }
+    }
+
+    // -------------------------------------------------------- account filter
+
+    /// <summary>The bar that says the page shows one account's hubs. Hidden when there is no account filter.</summary>
+    private void ShowAccountFilterBar()
+    {
+        if (_accountFilter is { } filter)
+        {
+            HubFilterBar.Message = Lang.T(
+                $"Visar projekt för {filter.Label}",
+                $"Showing projects for {filter.Label}");
+            HubFilterBar.IsOpen = true;
+        }
+        else
+        {
+            HubFilterBar.IsOpen = false;
+        }
+    }
+
+    /// <summary>Closing the bar or Visa alla drops the account filter: every hub shows again.</summary>
+    private void OnHubFilterClosed(InfoBar sender, InfoBarClosedEventArgs args) => ClearAccountFilter();
+
+    private void OnShowAllHubs(object sender, RoutedEventArgs args) => ClearAccountFilter();
+
+    private void ClearAccountFilter()
+    {
+        if (_accountFilter is null)
+        {
+            return;
+        }
+
+        _accountFilter = null;
+        ShowAccountFilterBar();
+        Update();
     }
 
     private void ShowError(string? message, string fallback)
@@ -566,6 +624,12 @@ public sealed partial class ProjectsPage : Page
                 continue;
             }
 
+            // With an account filter only that account's hubs are shown (Konton's "Visa projekt").
+            if (_accountFilter is { } accountFilter && !accountFilter.HubIds.Contains(hub.Id, StringComparer.Ordinal))
+            {
+                continue;
+            }
+
             var all =(hub.Projects ?? new List<ProjectInfo>()).Where(p => p is not null).ToList();
 
             // A hub that matches shows all its projects; otherwise only the matching ones.
@@ -582,7 +646,7 @@ public sealed partial class ProjectsPage : Page
         var layout = string.Join("\n", shown.Select(s => s.Hub.Id + ":" + string.Join(",", s.Visible.Select(p => p.Id))));
         if (layout != _layout)
         {
-            BuildLayout(shown, filter.Length > 0);
+            BuildLayout(shown, filter.Length > 0 || _accountFilter is not null);
             _layout = layout;
         }
 
@@ -594,7 +658,7 @@ public sealed partial class ProjectsPage : Page
                 if (_hubExpanders.TryGetValue(hub.Id, out var expander))
                 {
                     var synced = all.Count(p => p.Subscribed);
-                    expander.Header = hub.Name;
+                    expander.Header = HubTitle(hub);
                     expander.Description = Lang.T(
                         $"{synced} av {all.Count} projekt synkas",
                         $"{synced} of {all.Count} projects synced");
@@ -652,13 +716,13 @@ public sealed partial class ProjectsPage : Page
         {
             var expander = new SettingsExpander
             {
-                Header = hub.Name,
+                Header = HubTitle(hub),
                 HeaderIcon = new FontIcon { Glyph = "" },
                 IsExpanded = filtered
                     || (_expanded.TryGetValue(hub.Id, out var remembered) ? remembered : all.Any(p => p.Subscribed)),
                 Tag = hub.Id,
             };
-            AutomationProperties.SetName(expander, hub.Name);
+            AutomationProperties.SetName(expander, HubTitle(hub));
 
             foreach (var project in visible)
             {
@@ -771,10 +835,10 @@ public sealed partial class ProjectsPage : Page
 
         var reset = new MenuFlyoutItem
         {
-            Text = Lang.T("Bygg om från ACC …", "Rebuild from ACC …"),
+            Text = Lang.T("Bygg om från molnet …", "Rebuild from the cloud …"),
             Tag = "r|" + key,
         };
-        AutomationProperties.SetName(reset, Lang.T($"Återställ {project.Name} från ACC", $"Reset {project.Name} from ACC"));
+        AutomationProperties.SetName(reset, Lang.T($"Återställ {project.Name} från molnet", $"Reset {project.Name} from the cloud"));
         reset.Click += OnResetProject;
         var menu = new MenuFlyout();
         menu.Items.Add(openInMenu);
@@ -894,30 +958,65 @@ public sealed partial class ProjectsPage : Page
         }
         else if (!Engine.IsSignedIn)
         {
-            text = Lang.T("Logga in för att se dina ACC-projekt.", "Sign in to see your ACC projects.");
+            // Interaxo is named only while the engine offers it (settings.providers).
+            text = Engine.ProviderOffered(ProviderNames.Interaxo)
+                ? Lang.T(
+                    "Logga in på ACC, StreamBIM eller Interaxo under Konton.",
+                    "Sign in to ACC, StreamBIM or Interaxo under Accounts.")
+                : Lang.T(
+                    "Logga in på ACC eller StreamBIM under Konton.",
+                    "Sign in to ACC or StreamBIM under Accounts.");
             signIn = true;
         }
         else if (filtered)
         {
             text = Lang.T("Inget matchar filtret.", "Nothing matches the filter.");
         }
+        else if (_accountFilter is not null && !loading)
+        {
+            text = Lang.T(
+                $"Inga projekt hittades för {_accountFilter.Label}. Tryck på Uppdatera för att hämta dem från molnet.",
+                $"No projects found for {_accountFilter.Label}. Press Refresh to fetch them from the cloud.");
+        }
         else if (loading)
         {
-            text = Lang.T("Hämtar projekt från ACC …", "Fetching projects from ACC …");
+            text = Lang.T("Hämtar projekt från molnet …", "Fetching projects from the cloud …");
             spin = true;
         }
         else
         {
+            // Custom Integration is an ACC rule. StreamBIM and Interaxo need no such step.
             text = Lang.T(
-                $"Inga projekt hittades. {AppInfo.Name} måste vara tillagt som Custom Integration i ACC-kontot. Tryck sedan på Uppdatera.",
-                $"No projects found. {AppInfo.Name} has to be added as a Custom Integration in the ACC account. Then press Refresh.");
+                $"Inga projekt hittades. För ACC-projekt måste {AppInfo.Name} vara tillagt som Custom Integration i ACC-kontot. Tryck sedan på Uppdatera.",
+                $"No projects found. For ACC projects, {AppInfo.Name} has to be added as a Custom Integration in the ACC account. Then press Refresh.");
         }
 
         EmptyText.Text = text;
         EmptySpinner.IsActive = spin;
         EmptySpinner.Visibility = spin ? Visibility.Visible : Visibility.Collapsed;
         EmptySignInButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
+        EmptyAccountsButton.Visibility = signIn ? Visibility.Visible : Visibility.Collapsed;
         EmptyPanel.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>The hub's heading, with the provider in front: "ACC · Byggbolaget". A name that already starts with the provider is kept as it is.</summary>
+    private static string HubTitle(HubInfo hub)
+    {
+        var label = ProviderNames.Label(hub.Provider);
+        var name = hub.Name ?? string.Empty;
+        if (name.Length == 0)
+        {
+            return label;
+        }
+
+        var starts = name.StartsWith(label, StringComparison.OrdinalIgnoreCase)
+            && (name.Length == label.Length || !char.IsLetter(name[label.Length]));
+        return starts ? name : $"{label} · {name}";
+    }
+
+    private void OnOpenAccounts(object sender, RoutedEventArgs e)
+    {
+        MainWindow.Instance?.NavigateTo(MainWindow.AccountsTag);
     }
 
     /// <summary>

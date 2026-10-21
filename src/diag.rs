@@ -81,7 +81,13 @@ fn summary(ctx: &Ctx) -> serde_json::Value {
         "engine_version": env!("CARGO_PKG_VERSION"),
         "packaged": ctx.paths.packaged,
         "os": os_version(),
-        "signed_in": ctx.auth.is_signed_in(),
+        // Per provider, booleans only: no names, e-mail addresses or ids.
+        "signed_in": {
+            "acc": ctx.signed_in(crate::model::Provider::Acc),
+            "streambim": ctx.signed_in(crate::model::Provider::StreamBim),
+            "streambim_accounts": ctx.streambim.signed_in().len(),
+            "interaxo": ctx.signed_in(crate::model::Provider::Interaxo),
+        },
         "settings": settings_summary(&s),
         "projects": projects,
         "jobs": jobs,
@@ -98,6 +104,7 @@ fn settings_summary(config: &crate::config::Config) -> serde_json::Value {
         "auto_update": config.auto_update,
         "update_channel_configured": !config.update_channel.trim().is_empty(),
         "desktop_sync_feed": config.desktop_sync_feed,
+        "interaxo_enabled": config.interaxo_enabled,
         "custom_sync_root": config.sync_root.is_some(),
         "client_id_configured": config.client_id_configured(),
         "client_id_source": config.client_id_source(),

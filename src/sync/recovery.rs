@@ -19,7 +19,7 @@ impl Drop for RecoveryGuard {
         self.0.wake.notify_one();
         // Watcher events were deferred while paths changed. Reconcile their current
         // state instead of applying events naming the old tree to the rebuilt one.
-        if self.0.ctx.auth.is_signed_in() && !self.0.recovery_blocked() {
+        if self.0.ctx.any_signed_in() && !self.0.recovery_blocked() {
             self.0.on_local(vec![LocalChange::Rescan]);
         }
     }
@@ -39,6 +39,9 @@ impl Engine {
                     | TrayCmd::CheckUpdates
                     | TrayCmd::TestApsClientId { .. }
                     | TrayCmd::CancelApsClientIdTest { .. }
+                    // Sign-in steps touch no files: they may run during a rebuild or a move.
+                    | TrayCmd::SignInMfa { .. }
+                    | TrayCmd::CancelSignIn { .. }
                     | TrayCmd::FreeUpSpace { .. }
                     | TrayCmd::InstallUpdate
                     | TrayCmd::Quit
@@ -184,7 +187,12 @@ mod tests {
         let _own = engine.maintenance_guard();
         let old_command = engine.begin_command(&TrayCmd::RetryFailed).unwrap();
         let gate = engine.begin_recovery().unwrap();
-        assert!(engine.begin_command(&TrayCmd::SignOut).is_none());
+        assert!(engine
+            .begin_command(&TrayCmd::SignOut {
+                provider: None,
+                account: None
+            })
+            .is_none());
         assert!(engine.try_maintenance_guard().is_none());
         assert!(
             !engine

@@ -1,6 +1,11 @@
 //! settings.json in the state dir. Missing file or fields => defaults. Unknown fields kept
 //! out (serde default). Written only when the user changes something.
 
+use crate::auth::{
+    check_loopback_redirect, dpapi_protect, dpapi_unprotect, InteraxoClient,
+    INTERAXO_DEFAULT_REDIRECT,
+};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -40,6 +45,44 @@ pub fn check_setting(key: &str, value: &Value) -> Result<(), String> {
                 Err(format!("{key} måste vara true eller false"))
             }
         }
+        "interaxo_client_id" => {
+            let id = value
+                .as_str()
+                .ok_or_else(|| "interaxo_client_id måste vara en sträng".to_string())?
+                .trim();
+            if id.len() > 256 {
+                return Err("interaxo_client_id får vara högst 256 tecken".into());
+            }
+            if !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+            {
+                return Err(
+                    "interaxo_client_id får bara innehålla A–Z, a–z, 0–9, _, - och .".into(),
+                );
+            }
+            Ok(())
+        }
+        "interaxo_redirect_uri" => {
+            let uri = value
+                .as_str()
+                .ok_or_else(|| "interaxo_redirect_uri måste vara en sträng".to_string())?
+                .trim();
+            if uri.is_empty() {
+                Ok(())
+            } else {
+                check_loopback_redirect(uri)
+            }
+        }
+        "interaxo_client_secret" => {
+            let secret = value
+                .as_str()
+                .ok_or_else(|| "interaxo_client_secret måste vara en sträng".to_string())?;
+            if secret.len() > 1024 {
+                return Err("interaxo_client_secret får vara högst 1024 tecken".into());
+            }
+            Ok(())
+        }
         "max_downloads" => int(1, 8),
         "max_uploads" => int(1, 4),
         "poll_active_secs" => int(15, 300),
@@ -50,6 +93,10 @@ pub fn check_setting(key: &str, value: &Value) -> Result<(), String> {
         other => Err(format!("okänd inställning: {other}")),
     }
 }
+
+/// The refusal of every Interaxo sign-in and Interaxo setting while `interaxo_enabled` is false.
+/// The IPC layer sends it in the ack; the engine uses it for its own notices.
+pub const INTERAXO_OFF_TEXT: &str = "Interaxo-inloggning är avstängd i den här versionen.";
 
 /// Built-in APS app (Desktop/SPA type, Authorization Code + PKCE, no secret). The app is still
 /// named "Better Desktop Connector" in the APS developer portal; rename it to "Synka" there
@@ -82,6 +129,16 @@ pub struct Config {
     /// dm/v3 desktop-sync feed as change source. Must stay false unless Autodesk has approved
     /// its use in writing. When false the engine never calls any dm/v3 endpoint.
     pub desktop_sync_feed: bool,
+    /// ADMIN ONLY, settings.json only (not settable over IPC). Interaxo is off unless this is true:
+    /// the engine then offers, lists, polls and signs in only ACC and StreamBIM, refuses Interaxo
+    /// sign-in and Interaxo settings, and leaves an earlier Interaxo session file alone. Read at start.
+    pub interaxo_enabled: bool,
+    /// Interaxo OIDC client id ("bring your own client id"). None or blank: not configured.
+    pub interaxo_client_id: Option<String>,
+    /// Redirect URI registered for the Interaxo client. None or blank: `INTERAXO_DEFAULT_REDIRECT`.
+    pub interaxo_redirect_uri: Option<String>,
+    /// The Interaxo client secret: DPAPI-protected and base64-encoded (see `protect_secret`).
+    pub interaxo_client_secret_protected: Option<String>,
 }
 
 impl Default for Config {
@@ -97,8 +154,33 @@ impl Default for Config {
             update_channel: String::new(),
             auto_update: false,
             desktop_sync_feed: false,
+            interaxo_enabled: false,
+            interaxo_client_id: None,
+            interaxo_redirect_uri: None,
+            interaxo_client_secret_protected: None,
         }
     }
+}
+
+/// The trimmed text of a setting value, or None when it is blank.
+fn text_or_none(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Protect a client secret for settings.json: DPAPI (current Windows user), then base64.
+pub fn protect_secret(secret: &str) -> anyhow::Result<String> {
+    let blob = dpapi_protect(secret.as_bytes())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+}
+
+/// Reverse of `protect_secret`.
+fn unprotect_secret(encoded: &str) -> anyhow::Result<String> {
+    let blob = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    Ok(String::from_utf8(dpapi_unprotect(&blob)?)?)
 }
 
 impl Config {
@@ -182,6 +264,21 @@ impl Config {
                     self.log_level = s.to_string();
                 }
             }
+            "interaxo_client_id" => {
+                self.interaxo_client_id = text_or_none(value);
+            }
+            "interaxo_redirect_uri" => {
+                self.interaxo_redirect_uri = text_or_none(value);
+            }
+            "interaxo_client_secret" => {
+                self.interaxo_client_secret_protected = match text_or_none(value) {
+                    Some(secret) => Some(
+                        protect_secret(&secret)
+                            .map_err(|e| format!("kunde inte skydda klienthemligheten: {e}"))?,
+                    ),
+                    None => None,
+                };
+            }
             _ => {}
         }
         Ok(())
@@ -189,6 +286,43 @@ impl Config {
 
     pub fn client_id(&self) -> String {
         self.effective_client_id().0.to_string()
+    }
+
+    /// The Interaxo client as configured. The id is trimmed ("" when not configured), the
+    /// secret is decrypted (None when absent, or when the stored blob cannot be decrypted:
+    /// that is logged, not fatal), and the redirect is the default when blank.
+    pub fn interaxo_client(&self) -> InteraxoClient {
+        let client_id = self
+            .interaxo_client_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let client_secret = self
+            .interaxo_client_secret_protected
+            .as_deref()
+            .map(str::trim)
+            .filter(|blob| !blob.is_empty())
+            .and_then(|blob| match unprotect_secret(blob) {
+                Ok(secret) => Some(secret),
+                Err(e) => {
+                    tracing::warn!("interaxo_client_secret kan inte läsas, den ignoreras: {e:#}");
+                    None
+                }
+            })
+            .filter(|secret| !secret.is_empty());
+        let redirect_uri = self
+            .interaxo_redirect_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .unwrap_or(INTERAXO_DEFAULT_REDIRECT)
+            .to_string();
+        InteraxoClient {
+            client_id,
+            client_secret,
+            redirect_uri,
+        }
     }
 }
 
@@ -379,5 +513,203 @@ mod tests {
                 .unwrap()
                 .desktop_sync_feed
         );
+    }
+
+    #[test]
+    fn interaxo_is_off_by_default_and_is_not_an_ipc_setting() {
+        assert!(!Config::default().interaxo_enabled);
+        assert!(check_setting("interaxo_enabled", &json!(true)).is_err());
+        let mut config = Config::default();
+        assert!(config
+            .apply_setting("interaxo_enabled", &json!(true))
+            .is_err());
+        assert!(!config.interaxo_enabled);
+    }
+
+    #[test]
+    fn interaxo_enabled_loads_from_settings_json_and_is_off_without_it() {
+        assert!(
+            serde_json::from_str::<Config>(r#"{"interaxo_enabled":true}"#)
+                .unwrap()
+                .interaxo_enabled
+        );
+        assert!(
+            !serde_json::from_str::<Config>(r#"{"propagate_deletes":false}"#)
+                .unwrap()
+                .interaxo_enabled
+        );
+    }
+
+    #[test]
+    fn interaxo_client_id_setting_accepts_identifiers_and_blank_reset() {
+        for value in [
+            json!("test-client_ID.123"),
+            json!(" \ttest-client_ID.123\r\n"),
+            json!(""),
+            json!(" \t\r\n"),
+            json!("a".repeat(256)),
+        ] {
+            assert!(
+                check_setting("interaxo_client_id", &value).is_ok(),
+                "{value}"
+            );
+        }
+        for value in [
+            Value::Null,
+            json!(42),
+            json!("client id"),
+            json!("klient-å"),
+            json!("https://interaxo.example/client"),
+            json!("a".repeat(257)),
+        ] {
+            assert!(
+                check_setting("interaxo_client_id", &value).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn interaxo_redirect_setting_is_blank_or_a_loopback_redirect() {
+        for value in [
+            json!(""),
+            json!("  "),
+            json!("http://localhost:47864/"),
+            json!(" http://127.0.0.1:5000/interaxo "),
+        ] {
+            assert!(
+                check_setting("interaxo_redirect_uri", &value).is_ok(),
+                "{value}"
+            );
+        }
+        for value in [
+            Value::Null,
+            json!("https://localhost:47864/"),
+            json!("http://example.com:47864/"),
+            json!("http://localhost/"),
+        ] {
+            assert!(
+                check_setting("interaxo_redirect_uri", &value).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn interaxo_settings_apply_trimmed_values_and_blank_clears_them() {
+        let mut config = Config::default();
+        config
+            .apply_setting("interaxo_client_id", &json!("  ix-client  "))
+            .unwrap();
+        assert_eq!(config.interaxo_client_id.as_deref(), Some("ix-client"));
+        config
+            .apply_setting("interaxo_redirect_uri", &json!(" http://127.0.0.1:5000/x "))
+            .unwrap();
+        assert_eq!(
+            config.interaxo_redirect_uri.as_deref(),
+            Some("http://127.0.0.1:5000/x")
+        );
+        config
+            .apply_setting("interaxo_redirect_uri", &json!("  "))
+            .unwrap();
+        assert_eq!(config.interaxo_redirect_uri, None, "blank = default");
+        config
+            .apply_setting("interaxo_client_secret", &json!("sekret-value"))
+            .unwrap();
+        let blob = config.interaxo_client_secret_protected.clone().unwrap();
+        assert!(
+            !blob.contains("sekret-value"),
+            "stored protected, never in clear"
+        );
+        assert_eq!(
+            config.interaxo_client().client_secret.as_deref(),
+            Some("sekret-value")
+        );
+        config
+            .apply_setting("interaxo_client_secret", &json!(""))
+            .unwrap();
+        assert_eq!(config.interaxo_client_secret_protected, None);
+        config
+            .apply_setting("interaxo_client_id", &json!(""))
+            .unwrap();
+        assert_eq!(config.interaxo_client_id, None);
+    }
+
+    #[test]
+    fn interaxo_secret_setting_is_a_bounded_string() {
+        assert!(check_setting("interaxo_client_secret", &json!("")).is_ok());
+        assert!(check_setting("interaxo_client_secret", &json!("s".repeat(1024))).is_ok());
+        assert!(check_setting("interaxo_client_secret", &json!("s".repeat(1025))).is_err());
+        assert!(check_setting("interaxo_client_secret", &json!(true)).is_err());
+    }
+
+    #[test]
+    fn interaxo_client_defaults_and_trimming() {
+        let client = Config::default().interaxo_client();
+        assert_eq!(client.client_id, "");
+        assert_eq!(client.client_secret, None);
+        assert_eq!(client.redirect_uri, INTERAXO_DEFAULT_REDIRECT);
+
+        let config = Config {
+            interaxo_client_id: Some(" \tinteraxo-client\r\n".into()),
+            interaxo_redirect_uri: Some("  ".into()),
+            ..Config::default()
+        };
+        let client = config.interaxo_client();
+        assert_eq!(client.client_id, "interaxo-client");
+        assert_eq!(client.redirect_uri, INTERAXO_DEFAULT_REDIRECT);
+
+        let config = Config {
+            interaxo_redirect_uri: Some(" http://127.0.0.1:5000/interaxo ".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.interaxo_client().redirect_uri,
+            "http://127.0.0.1:5000/interaxo"
+        );
+    }
+
+    #[test]
+    fn interaxo_secret_round_trips_through_dpapi_and_is_not_stored_in_clear() {
+        let blob = protect_secret("interaxo-secret-value").unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&blob)
+            .unwrap();
+        assert!(!raw
+            .windows(b"interaxo-secret-value".len())
+            .any(|w| w == b"interaxo-secret-value"));
+
+        let config = Config {
+            interaxo_client_secret_protected: Some(blob),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.interaxo_client().client_secret.as_deref(),
+            Some("interaxo-secret-value")
+        );
+    }
+
+    #[test]
+    fn undecryptable_interaxo_secret_is_ignored() {
+        for stored in ["!!! not base64", "bm90IGEgZFBBUEkgYmxvYg=="] {
+            let config = Config {
+                interaxo_client_secret_protected: Some(stored.into()),
+                ..Config::default()
+            };
+            assert_eq!(config.interaxo_client().client_secret, None, "{stored}");
+        }
+    }
+
+    #[test]
+    fn interaxo_settings_are_optional_in_settings_json() {
+        let old: Config = serde_json::from_str(r#"{"propagate_deletes":false}"#).unwrap();
+        assert_eq!(old.interaxo_client_id, None);
+        assert_eq!(old.interaxo_redirect_uri, None);
+        assert_eq!(old.interaxo_client_secret_protected, None);
+        let new: Config = serde_json::from_str(
+            r#"{"interaxo_client_id":"abc","interaxo_redirect_uri":"http://localhost:47864/"}"#,
+        )
+        .unwrap();
+        assert_eq!(new.interaxo_client_id.as_deref(), Some("abc"));
     }
 }

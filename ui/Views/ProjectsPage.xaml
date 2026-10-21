@@ -43,7 +43,7 @@
                 <Button x:Name="RefreshButton"
                         Grid.Column="1"
                         Click="OnRefresh"
-                        AutomationProperties.Name="{loc:T Sv='Uppdatera projektlistan från ACC', En='Refresh the project list from ACC'}">
+                        AutomationProperties.Name="{loc:T Sv='Uppdatera projektlistan från molnet', En='Refresh the project list from the cloud'}">
                     <Button.KeyboardAccelerators>
                         <KeyboardAccelerator Key="F5" />
                     </Button.KeyboardAccelerators>
@@ -61,6 +61,20 @@
                     </StackPanel>
                 </Button>
             </Grid>
+
+            <!-- Shown when Konton links here: only that account's hubs. Closing the bar or Visa alla shows every hub. -->
+            <InfoBar x:Name="HubFilterBar"
+                     Severity="Informational"
+                     IsOpen="False"
+                     IsClosable="True"
+                     Closed="OnHubFilterClosed">
+                <InfoBar.ActionButton>
+                    <Button x:Name="HubFilterAllButton"
+                            Content="{loc:T Sv='Visa alla', En='Show all'}"
+                            AutomationProperties.Name="{loc:T Sv='Visa alla hubbar och projekt', En='Show all hubs and projects'}"
+                            Click="OnShowAllHubs" />
+                </InfoBar.ActionButton>
+            </InfoBar>
 
             <InfoBar x:Name="ErrorBar"
                      Severity="Error"
@@ -90,6 +104,12 @@
                         Style="{StaticResource AccentButtonStyle}"
                         Content="{loc:T Sv='Logga in med Autodesk', En='Sign in with Autodesk'}"
                         Click="OnSignIn" />
+                <!-- Signing in to StreamBIM or Interaxo happens on the Konton page. -->
+                <Button x:Name="EmptyAccountsButton"
+                        Visibility="Collapsed"
+                        HorizontalAlignment="Center"
+                        Content="{loc:T Sv='Öppna Konton', En='Open Accounts'}"
+                        Click="OnOpenAccounts" />
             </StackPanel>
 
             <!-- One SettingsExpander per hub is built in code. The cards are updated in

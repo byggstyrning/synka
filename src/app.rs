@@ -1,15 +1,21 @@
 //! Shared application context and the engine <-> UI messages.
 
+use crate::api::streambim::Region;
 use crate::auth::{Auth, UserInfo};
 use crate::config::Config;
 use crate::http::Api;
 use crate::ipc::IpcHub;
-use crate::model::{now_ms, HubInfo, ProjectInfo};
+use crate::model::{now_ms, HubInfo, Project, ProjectInfo, Provider};
 use crate::paths::Paths;
 use crate::store::Store;
-use serde::Serialize;
+use crate::streambim_auth::{sign_in_label, StreamBimAccounts};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// One sign-in attempt or pending wait: the provider, and for StreamBIM the key of its account.
+/// ACC and Interaxo have one account each, so their key has no account.
+pub type SignInKey = (Provider, Option<String>);
 
 pub struct Ctx {
     /// Startup snapshot (paths, client id, update channel). Runtime-changeable settings live in
@@ -18,8 +24,15 @@ pub struct Ctx {
     pub settings: RwLock<Config>,
     pub paths: Paths,
     pub store: Arc<Store>,
+    /// ACC account (APS OAuth).
     pub auth: Arc<Auth>,
     pub api: Api,
+    /// StreamBIM accounts, one per server (see `crate::streambim_auth`). Each account has its own
+    /// API client; StreamBIM requests go only through them.
+    pub streambim: Arc<StreamBimAccounts>,
+    /// Interaxo account: an `Auth` with the Interaxo OIDC spec (empty client id until configured).
+    pub interaxo: Arc<Auth>,
+    pub interaxo_api: Api,
     pub ui: UiSender,
 }
 
@@ -30,6 +43,89 @@ impl Ctx {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Interaxo is turned on: `interaxo_enabled` in settings.json, read at start (not an IPC setting).
+    pub fn interaxo_enabled(&self) -> bool {
+        self.cfg.interaxo_enabled
+    }
+
+    /// Whether the engine offers a provider: it signs in, lists, polls and publishes it. Only Interaxo
+    /// can be off (see `interaxo_enabled`). An Interaxo session file on disk is not deleted either way.
+    pub fn offers(&self, p: Provider) -> bool {
+        p != Provider::Interaxo || self.interaxo_enabled()
+    }
+
+    /// The offered providers, in account order (`settings.providers`).
+    pub fn offered_providers(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| self.offers(*p))
+            .collect()
+    }
+
+    /// True when that provider's account has a usable session. StreamBIM: any account. An Interaxo
+    /// session counts only while Interaxo is enabled.
+    pub fn signed_in(&self, p: Provider) -> bool {
+        match p {
+            Provider::Acc => self.auth.is_signed_in(),
+            Provider::StreamBim => self.streambim.any_signed_in(),
+            Provider::Interaxo => self.interaxo_enabled() && self.interaxo.is_signed_in(),
+        }
+    }
+
+    /// True when at least one provider is signed in.
+    pub fn any_signed_in(&self) -> bool {
+        Provider::ALL.into_iter().any(|p| self.signed_in(p))
+    }
+
+    /// The signed-in user of one provider, if any. StreamBIM: the first signed-in account's user.
+    pub fn user_for(&self, p: Provider) -> Option<UserInfo> {
+        match p {
+            Provider::Acc => self.auth.user(),
+            Provider::StreamBim => self
+                .streambim
+                .signed_in()
+                .first()
+                .and_then(|account| account.auth.user()),
+            Provider::Interaxo => self
+                .interaxo_enabled()
+                .then(|| self.interaxo.user())
+                .flatten(),
+        }
+    }
+
+    /// True when the provider can serve this project now. For StreamBIM that is the project's own
+    /// account, signed in; a project of another server (or of a signed-out account) is paused like
+    /// one of a signed-out provider.
+    pub fn project_connected(&self, p: &Project) -> bool {
+        match p.provider {
+            Provider::StreamBim => self
+                .streambim
+                .for_project(p)
+                .is_some_and(|account| account.auth.is_signed_in()),
+            other => self.signed_in(other),
+        }
+    }
+
+    /// True when the StreamBIM account of a hub is signed in (other providers: as `signed_in`).
+    pub fn hub_connected(&self, hub: &HubInfo) -> bool {
+        match hub.provider {
+            Provider::StreamBim => self
+                .streambim
+                .for_hub(hub)
+                .is_some_and(|account| account.auth.is_signed_in()),
+            other => self.signed_in(other),
+        }
+    }
+
+    /// What the user signs in to for this project, in the words of the sign-in messages: the
+    /// provider, or "StreamBIM (<host>)" for a StreamBIM project.
+    pub fn sign_in_target(&self, p: &Project) -> String {
+        match p.provider {
+            Provider::StreamBim => sign_in_label(p),
+            other => other.label().to_string(),
+        }
     }
 }
 
@@ -52,6 +148,87 @@ pub struct Status {
     /// File data on disk across projects (populated folders only). None until first counted.
     pub local_bytes: Option<u64>,
     pub engine_version: String,
+    /// One entry per provider, in the order acc, streambim, interaxo.
+    pub accounts: Vec<AccountStatus>,
+}
+
+/// One account as shown in `status.accounts`: ACC, Interaxo, or one StreamBIM account.
+#[derive(Debug, Clone)]
+pub struct AccountStatus {
+    pub provider: Provider,
+    /// The StreamBIM account key; None for ACC and Interaxo.
+    pub account: Option<String>,
+    pub label: &'static str,
+    /// The provider can sign in (ACC has a client id, Interaxo has `interaxo_client_id`).
+    pub configured: bool,
+    pub signed_in: bool,
+    pub signing_in: bool,
+    pub user: Option<UserInfo>,
+    /// StreamBIM: the server's host.
+    pub host: Option<String>,
+}
+
+impl AccountStatus {
+    /// The entry for ACC or Interaxo that is not signed in (used before the first status).
+    pub fn signed_out(provider: Provider) -> AccountStatus {
+        AccountStatus {
+            provider,
+            account: None,
+            label: provider.label(),
+            configured: false,
+            signed_in: false,
+            signing_in: false,
+            user: None,
+            host: None,
+        }
+    }
+}
+
+/// A secret text (StreamBIM password, MFA code). Debug never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    /// Only text is accepted, and the error never repeats the input (serde would echo it).
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Secret, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => Ok(Secret(s)),
+            _ => Err(serde::de::Error::custom("lösenord och kod måste vara text")),
+        }
+    }
+}
+
+/// The StreamBIM server a sign-in is for: a region subdomain, or a custom https address. Both are
+/// checked again by the engine (`streambim_auth::server_from_region` / `server_from_url`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamBimServer {
+    Region(String),
+    Url(String),
+}
+
+/// StreamBIM password sign-in input. The password is used once and never stored.
+#[derive(Clone)]
+pub struct StreamBimLogin {
+    pub server: StreamBimServer,
+    pub username: String,
+    pub password: Secret,
+}
+
+impl std::fmt::Debug for StreamBimLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamBimLogin")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .finish()
+    }
 }
 
 /// Deletes held for confirmation in one project; `count` weighs a folder by its contents.
@@ -106,6 +283,15 @@ pub struct SettingsView {
     pub aps_client_id: Option<String>,
     pub aps_client_id_override_supported: bool,
     pub aps_client_id_validation_supported: bool,
+    /// The providers the engine offers, in account order (Interaxo only while `interaxo_enabled`).
+    pub providers: Vec<&'static str>,
+    /// Saved Interaxo client id (trimmed), or None.
+    pub interaxo_client_id: Option<String>,
+    /// The redirect URI in use (saved, or the default).
+    pub interaxo_redirect_uri: String,
+    pub interaxo_redirect_uri_default: &'static str,
+    /// Whether a client secret is saved. The secret itself is never sent.
+    pub interaxo_client_secret_set: bool,
 }
 
 /// One entry of the activity feed. `kind` is one of the IPC.md kinds.
@@ -144,6 +330,16 @@ pub enum UiMsg {
     },
     Settings(SettingsView),
     Activity(ActivityItem),
+    /// Sign-in progress of one provider (of one StreamBIM account, when `account` is set):
+    /// browser | mfa_required | signed_in | failed | cancelled.
+    SignInProgress {
+        provider: Provider,
+        account: Option<String>,
+        state: &'static str,
+        error: Option<String>,
+    },
+    /// The StreamBIM regions (live list or the built-in fallback).
+    StreamBimRegions(Vec<Region>),
     /// Correlated outcome of a staged public-client PKCE test. No credentials are sent.
     ApsClientIdValidation {
         request_id: String,
@@ -165,8 +361,31 @@ impl UiMsg {
 /// Commands from the tray and the IPC server to the engine.
 #[derive(Debug, Clone)]
 pub enum TrayCmd {
-    SignIn,
-    SignOut,
+    /// Sign in to one provider. ACC and Interaxo open the browser; StreamBIM needs `streambim`.
+    SignIn {
+        provider: Provider,
+        streambim: Option<StreamBimLogin>,
+    },
+    /// The MFA code for a pending StreamBIM sign-in of the account `account`.
+    SignInMfa {
+        provider: Provider,
+        account: String,
+        code: Secret,
+    },
+    /// Cancel a pending sign-in (browser or MFA wait) of one provider. For StreamBIM, `account`
+    /// names one account; without it every pending StreamBIM sign-in is cancelled.
+    CancelSignIn {
+        provider: Provider,
+        account: Option<String>,
+    },
+    /// Sign out of one provider, or of every provider (`None`). `account` (StreamBIM only) signs
+    /// out that account alone.
+    SignOut {
+        provider: Option<Provider>,
+        account: Option<String>,
+    },
+    /// Load the StreamBIM region list and publish it as `streambim_regions`.
+    StreamBimRegions,
     TestApsClientId {
         client_id: String,
         request_id: String,

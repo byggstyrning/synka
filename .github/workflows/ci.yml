@@ -62,8 +62,10 @@ jobs:
         shell: pwsh
         run: ./tools/test-resilience.ps1 -Profile Quick -Seed 42
 
+      # Reports and packages are conveniences: a full artifact quota must not fail the build.
       - name: Resilience reports
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: resilience-quick
@@ -82,7 +84,9 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --locked
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload the engine
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
         with:
           name: synka-engine
           path: target/release/synka-engine.exe
@@ -102,11 +106,31 @@ jobs:
         with:
           persist-credentials: false
 
-      # The engine the job above built; build_msix.ps1 -SkipEngineBuild packs it.
-      - uses: actions/download-artifact@v8
+      # The engine the job above built; build_msix.ps1 -SkipEngineBuild packs it. When the
+      # artifact is missing (its upload is best-effort, e.g. a full artifact quota), the engine
+      # is built here from the same commit instead.
+      - name: Download the engine
+        id: engine_artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v8
         with:
           name: synka-engine
           path: target/release
+
+      - if: steps.engine_artifact.outcome != 'success'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - if: steps.engine_artifact.outcome != 'success'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: engine
+          save-if: false
+
+      - name: Build the engine (no artifact)
+        if: steps.engine_artifact.outcome != 'success'
+        run: cargo build --release --locked
 
       - name: Set up .NET
         id: dotnet
@@ -134,7 +158,9 @@ jobs:
           & ./packaging/build_msix.ps1 -SkipTests -SkipEngineBuild
           if ($LASTEXITCODE -ne 0) { throw "build_msix.ps1 failed (exit code $LASTEXITCODE)" }
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload the MSIX
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
         with:
           name: synka-msix-unsigned
           path: ui/AppPackages/**/Synka_*_x64.msix

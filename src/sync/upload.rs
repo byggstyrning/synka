@@ -17,8 +17,8 @@
 //! Upload flow: if the local copy was made from an older version than ACC has now
 //!   (base_version set and != remote_version) -> keep both (`sync::keep_both`): the local file
 //!   becomes "name (konflikt YYYY-MM-DD HHMM).ext" and is uploaded as a new file, the original
-//!   name gets the cloud version back. Else: dm::create_storage -> oss::upload_file ->
-//!   dm::create_version (existing; the ACC name is kept) or dm::create_item (new; a 409 "name
+//!   name gets the cloud version back. Else: remote::create_storage -> remote::upload_file ->
+//!   remote::create_version (existing; the ACC name is kept) or remote::create_item (new; a 409 "name
 //!   exists" preserves the local file as a separately uploaded conflict copy). Then store row: base_version =
 //!   remote_version = new number, LocalState::Clean; on disk the file becomes (or is re-pointed
 //!   as) an in-sync placeholder of the item, with watcher::suppress around it.
@@ -39,11 +39,12 @@ mod resilience_tests;
 #[path = "upload_metadata_tests.rs"]
 mod metadata_tests;
 
-use crate::api::{dm, oss};
+use crate::api::dm;
 use crate::app::{CtxRef, Severity, Transfer, UiMsg};
 use crate::cf::placeholder;
 use crate::http::ApiError;
 use crate::model::*;
+use crate::remote;
 use crate::store::OutboxJob;
 use crate::sync::{self, naming, sanitize_name, watcher};
 use anyhow::anyhow;
@@ -182,9 +183,24 @@ enum Step {
     Locked,
 }
 
-/// Run all due jobs (respecting concurrency). Returns the number processed.
+/// Run all due jobs with every provider connected (the engine calls `process_due_except`).
+#[cfg(test)]
 pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
-    let jobs = ctx.store.due_jobs(now_ms(), BATCH)?;
+    process_due_except(ctx, &HashSet::new()).await
+}
+
+/// `process_due` for an engine in which the providers in `offline` have no connection: their
+/// jobs wait without a request and without an attempt, and the other providers' jobs run.
+pub async fn process_due_except(
+    ctx: &CtxRef,
+    offline: &HashSet<Provider>,
+) -> anyhow::Result<usize> {
+    let jobs: Vec<OutboxJob> = ctx
+        .store
+        .due_jobs(now_ms(), BATCH)?
+        .into_iter()
+        .filter(|job| !waits_for_sign_in(ctx, job) && !waits_while_offline(ctx, job, offline))
+        .collect();
     if jobs.is_empty() {
         return Ok(0);
     }
@@ -210,6 +226,53 @@ pub async fn process_due(ctx: &CtxRef) -> anyhow::Result<usize> {
         }
     }
     Ok(processed)
+}
+
+/// The provider of a job's project (ACC when the project is gone).
+fn job_provider(ctx: &CtxRef, job: &OutboxJob) -> Provider {
+    ctx.store
+        .project(job.pid)
+        .ok()
+        .flatten()
+        .map(|p| p.provider)
+        .unwrap_or_default()
+}
+
+/// A job whose project cannot be served (its provider is signed out, or StreamBIM is signed in to
+/// another region) waits like offline work: it is postponed without a request and without spending
+/// an attempt. True when it waits.
+fn waits_for_sign_in(ctx: &CtxRef, job: &OutboxJob) -> bool {
+    let project = ctx.store.project(job.pid).ok().flatten();
+    let connected = match &project {
+        Some(p) => ctx.project_connected(p),
+        None => ctx.signed_in(Provider::Acc),
+    };
+    if connected {
+        return false;
+    }
+    let target = match &project {
+        Some(p) => ctx.sign_in_target(p),
+        None => Provider::Acc.label().to_string(),
+    };
+    let waiting = format!("Logga in på {target} för att synka.");
+    let _ = ctx
+        .store
+        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
+    true
+}
+
+/// A job of a provider without a connection waits like offline work (see `handle_failure`): no
+/// request, no attempt. The other providers' jobs are not affected. True when it waits.
+fn waits_while_offline(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
+    let provider = job_provider(ctx, job);
+    if !offline.contains(&provider) {
+        return false;
+    }
+    let waiting = format!("Ingen anslutning till {}.", provider.label());
+    let _ = ctx
+        .store
+        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
+    true
 }
 
 /// Returns true when the job reached a final state (done or failed), false when it was
@@ -298,6 +361,9 @@ fn is_transient(err: &anyhow::Error) -> bool {
     }
     match err.downcast_ref::<ApiError>() {
         Some(ApiError::Status { status, .. }) => *status == 408 || *status == 429 || *status >= 500,
+        // The provider does not offer this operation, or the engine's own message: the same
+        // request fails the same way.
+        Some(ApiError::Unsupported(_) | ApiError::Message(_)) => false,
         // Transport, auth and decode problems are retried.
         Some(_) => true,
         // Local I/O and "parent folder not synced yet" are retried.
@@ -310,6 +376,15 @@ fn is_offline(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ApiError>(),
         Some(ApiError::Transport(_) | ApiError::Auth(_))
+    )
+}
+
+/// The provider's API does not offer the operation (`ApiError::Unsupported`). Retrying cannot
+/// help, so the job is parked like a refused file type (`handle_failure`).
+fn unsupported_operation(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<ApiError>(),
+        Some(ApiError::Unsupported(_))
     )
 }
 
@@ -349,7 +424,7 @@ fn rejected_mime_type(err: &anyhow::Error) -> bool {
     })
 }
 
-fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error) {
+pub(crate) fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error) {
     let msg = format!("{err:#}");
     if is_offline(err) {
         // A pause, not a failure: offline for hours must not use up the job's attempts.
@@ -366,14 +441,17 @@ fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error) {
         );
         return;
     }
-    if job.kind == "upload" && unsupported_file_type(err) {
+    // Parked for good (dead = 3, local change kept, one notice): ACC refused the file type, or
+    // the provider does not offer the operation.
+    let refused_file_type = job.kind == "upload" && unsupported_file_type(err);
+    if refused_file_type || unsupported_operation(err) {
         if let Err(e) = ctx.store.job_unsupported(job.id, &msg) {
             tracing::warn!("outbox: job_unsupported {}: {e:#}", job.id);
         }
         if let Some(id) = row_id(ctx, job) {
             let _ = ctx.store.set_local_state(job.pid, &id, LocalState::Error);
         }
-        tracing::info!("outbox: unsupported file type for job {}: {msg}", job.id);
+        tracing::info!("outbox: unsupported job {} ({}): {msg}", job.id, job.kind);
         let project = ctx
             .store
             .project(job.pid)
@@ -796,7 +874,7 @@ fn bind_created_file(
     loc: &Located,
     stale: Option<Item>,
     created: Item,
-    storage: String,
+    storage: Option<String>,
     snapshot: &UploadedSnapshot<'_>,
 ) -> anyhow::Result<(Item, bool)> {
     let _guard = sync::local_lock();
@@ -829,7 +907,7 @@ fn bind_created_file(
         .store
         .item(loc.project.pid, &created.id)?
         .filter(|target| {
-            target.storage_urn.as_deref() != Some(storage.as_str())
+            target.storage_urn != storage
                 && target.remote_version.unwrap_or_default()
                     >= created.remote_version.unwrap_or_default()
         });
@@ -855,7 +933,7 @@ fn bind_created_file(
             ctime_ms(snapshot.meta)
         },
         mtime_ms: snapshot.mtime,
-        storage_urn: Some(storage),
+        storage_urn: storage,
         locked_by: None,
         local_state: LocalState::Clean,
         populated: false,
@@ -1033,9 +1111,12 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
 
     let mut existing = loc.existing.clone().filter(|e| e.kind == Kind::File);
     let saved_intent = CreateIntent::from_payload(&fields)?;
+    // Only ACC's listing can show that a saved intent's object is our committed version. Elsewhere
+    // the saved marker proves nothing, so a resumed intent always uploads again.
+    let intent_commits = remote::intent_proves_commit(p.provider);
     let (mut checked_tip, upload_info) =
         if let Some(remote) = existing.as_ref().filter(|item| !is_local_id(&item.id)) {
-            let (tip, info) = dm::get_item_upload_info(&ctx.api, p, &remote.id).await?;
+            let (tip, info) = remote::get_item_upload_info(ctx, p, &remote.id).await?;
             // Check even a resumed intent before it can create another version.
             info.ensure_writable()
                 .map_err(|error| perm(error.to_string()))?;
@@ -1043,7 +1124,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         } else {
             (None, None)
         };
-    if let (Some(intent), Some(remote)) = (&saved_intent, existing.as_mut()) {
+    if let (Some(intent), Some(remote), true) = (&saved_intent, existing.as_mut(), intent_commits) {
         if intent.version
             && !is_local_id(&remote.id)
             && remote.storage_urn.as_deref() != Some(intent.storage.as_str())
@@ -1059,7 +1140,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             }
         }
     }
-    if let (Some(intent), Some(remote)) = (&saved_intent, existing.as_ref()) {
+    if let (Some(intent), Some(remote), true) = (&saved_intent, existing.as_ref(), intent_commits) {
         if !is_local_id(&remote.id)
             && remote.remote_version.is_some()
             && remote.storage_urn.as_deref() == Some(intent.storage.as_str())
@@ -1111,7 +1192,6 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         }
     }
 
-    let api = &ctx.api;
     let tracked = Tracked::start(&loc.name, &p.name);
     let meta = std::fs::metadata(&path)?;
     let (mtime, size, storage, uploaded_usn) = if let Some(intent) = &saved_intent {
@@ -1122,10 +1202,10 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             intent.usn,
         )
     } else {
-        let storage = dm::create_storage(api, p, &loc.parent, &loc.name).await?;
+        let storage = remote::create_storage(ctx, p, &loc.parent, &loc.name).await?;
         let uploaded_usn = available_usn(&path);
-        oss::upload_file(
-            api,
+        remote::upload_file(
+            ctx,
             p,
             &storage,
             &path,
@@ -1151,7 +1231,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     // This POST carries no atomic tip precondition, so a narrower race still
     // remains between this GET and POST /versions.
     if let Some(ex) = existing.as_mut().filter(|e| !is_local_id(&e.id)) {
-        let (tip, info) = dm::get_item_upload_info(api, p, &ex.id).await?;
+        let (tip, info) = remote::get_item_upload_info(ctx, p, &ex.id).await?;
         info.ensure_writable()
             .map_err(|error| perm(error.to_string()))?;
         if ex.base_version.is_some() && ex.remote_version.is_some() && apply_remote_tip(ex, tip) {
@@ -1202,7 +1282,12 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             // may still wait for the file to close here).
             let acc_name =
                 sync::pending_remote_name(ctx, pid, &ex.id).unwrap_or_else(|| ex.name.clone());
-            let (ver, vurn) = match dm::create_version(api, p, &ex.id, &acc_name, &storage).await {
+            let version =
+                remote::create_version(ctx, p, &ex.id, &acc_name, &storage, &path, &|d, t| {
+                    tracked.progress(d, t)
+                })
+                .await;
+            let (ver, vurn) = match version {
                 Ok(version) => version,
                 Err(error) => {
                     let error: anyhow::Error = error.into();
@@ -1219,11 +1304,19 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
                     return Err(error);
                 }
             };
+            // ACC returns the version URN and we keep the OSS object we uploaded. The other
+            // providers return the storage handle of the version they committed, and have no
+            // version URN.
+            let (storage_urn, version_urn) = if p.provider == Provider::Acc {
+                (Some(storage), Some(vurn))
+            } else {
+                (Some(vurn), None)
+            };
             let row = Item {
                 remote_version: Some(ver),
                 base_version: Some(ver),
-                version_urn: Some(vurn),
-                storage_urn: Some(storage),
+                version_urn,
+                storage_urn,
                 size,
                 mtime_ms: mtime,
                 local_state: state,
@@ -1232,14 +1325,17 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
             (row, "new_version")
         }
         stale => {
-            let (created, kind) = match dm::create_item(api, p, &loc.parent, &loc.name, &storage)
-                .await
-            {
+            let created =
+                remote::create_item(ctx, p, &loc.parent, &loc.name, &storage, &path, &|d, t| {
+                    tracked.progress(d, t)
+                })
+                .await;
+            let (created, kind) = match created {
                 Ok(c) => (c, "upload"),
                 // A persisted OSS object is an exact marker for our own create whose
                 // response was lost. A different object remains a genuine collision.
                 Err(e) if e.status() == Some(409) => {
-                    let found = dm::folder_contents(api, p, &loc.parent)
+                    let found = remote::folder_contents(ctx, p, &loc.parent)
                         .await?
                         .into_iter()
                         .find(|r| {
@@ -1271,8 +1367,15 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
                 usn: uploaded_usn,
                 intent: saved_intent.as_ref(),
             };
+            // ACC binds the OSS object we uploaded. The other providers bind the handle their
+            // commit returned: the marker only named the attempt.
+            let committed = if p.provider == Provider::Acc {
+                Some(storage)
+            } else {
+                created.storage_urn.clone()
+            };
             let (row, changed) =
-                bind_created_file(ctx, job, &loc, stale, created, storage, &snapshot)?;
+                bind_created_file(ctx, job, &loc, stale, created, committed, &snapshot)?;
             if changed {
                 return Ok(Step::Locked);
             }
@@ -1411,10 +1514,10 @@ async fn mkdir(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     if is_local_id(&loc.parent) {
         return Err(anyhow!("parent folder is not created in ACC yet"));
     }
-    let created = match dm::create_folder(&ctx.api, p, &loc.parent, &loc.name).await {
+    let created = match remote::create_folder(ctx, p, &loc.parent, &loc.name).await {
         Ok(c) => c,
         // Created meanwhile (by someone else, or by an attempt whose answer was lost): use it.
-        Err(e) if e.status() == Some(409) => dm::folder_contents(&ctx.api, p, &loc.parent)
+        Err(e) if e.status() == Some(409) => remote::folder_contents(ctx, p, &loc.parent)
             .await?
             .into_iter()
             .find(|r| {
@@ -1493,16 +1596,16 @@ fn queue_unsynced_children(ctx: &CtxRef, pid: Pid, folder_id: &str, dir: &Path) 
     }
 }
 
-/// Rename a remote file (via its tip version) or folder.
+/// Rename a remote file or folder. ACC renames a file through its tip version, so a file
+/// without one cannot be renamed there yet. The other providers have no version URNs.
 async fn rename_remote(ctx: &CtxRef, p: &Project, it: &Item, new_name: &str) -> anyhow::Result<()> {
     if it.kind.is_dir() {
-        dm::patch_folder(&ctx.api, p, &it.id, Some(new_name), None).await?;
+        remote::patch_folder(ctx, p, &it.id, Some(new_name), None).await?;
     } else {
-        let vurn = it
-            .version_urn
-            .as_deref()
-            .ok_or_else(|| anyhow!("file {} has no remote version yet", it.name))?;
-        dm::rename_file(&ctx.api, p, vurn, new_name).await?;
+        if p.provider == Provider::Acc && it.version_urn.is_none() {
+            return Err(anyhow!("file {} has no remote version yet", it.name));
+        }
+        remote::rename_file(ctx, p, &it.id, it.version_urn.as_deref(), new_name).await?;
     }
     Ok(())
 }
@@ -1544,9 +1647,9 @@ async fn move_item(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         return Err(anyhow!("target folder is not created in ACC yet"));
     }
     if it.kind.is_dir() {
-        dm::patch_folder(&ctx.api, &p, &it.id, Some(&it.name), Some(&parent)).await?;
+        remote::patch_folder(ctx, &p, &it.id, Some(&it.name), Some(&parent)).await?;
     } else {
-        dm::move_file(&ctx.api, &p, &it.id, &parent).await?;
+        remote::move_file(ctx, &p, &it.id, &parent).await?;
         rename_remote(ctx, &p, &it, &it.name).await?;
     }
     Ok(Step::Done)
@@ -1609,9 +1712,9 @@ async fn delete(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         .is_some_and(|pa| pa.local_state == LocalState::Deleted);
     if !parent_deleted {
         if is_dir {
-            dm::delete_folder(&ctx.api, &p, id).await?;
+            remote::delete_folder(ctx, &p, id).await?;
         } else {
-            dm::delete_file(&ctx.api, &p, id).await?;
+            remote::delete_file(ctx, &p, id).await?;
         }
     }
     // Gone remotely and locally: forget the row (and, for folders, everything under it).
@@ -1952,6 +2055,9 @@ mod tests {
         assert!(is_transient(&st(429)));
         assert!(is_transient(&st(503)));
         assert!(!is_transient(&st(409)));
+        assert!(!is_transient(&anyhow::Error::from(ApiError::Unsupported(
+            "stöds inte".into()
+        ))));
         assert!(!is_transient(&st(403)));
         assert!(!is_transient(&perm("bad")));
         assert!(!is_transient(
@@ -1980,6 +2086,33 @@ mod tests {
         ));
         assert!(is_transient(&anyhow!(
             "CfGetPlaceholderInfo sharing violation"
+        )));
+    }
+
+    #[test]
+    fn provider_refusals_park_the_job_without_retry() {
+        // A provider without the operation: permanent, never a network pause, and the parked
+        // text is the provider's own message, verbatim.
+        let refused = anyhow::Error::from(ApiError::Unsupported("Interaxo stöds inte ännu".into()));
+        assert!(unsupported_operation(&refused));
+        assert!(!is_transient(&refused));
+        assert!(!is_offline(&refused));
+        assert_eq!(format!("{refused:#}"), "Interaxo stöds inte ännu");
+
+        // The engine's own messages are permanent as well, but are not provider refusals.
+        let message = anyhow::Error::from(ApiError::Message("ingen ACC-mapp".into()));
+        assert!(!unsupported_operation(&message));
+        assert!(!is_transient(&message));
+        assert!(!is_offline(&message));
+        assert_eq!(format!("{message:#}"), "ingen ACC-mapp");
+
+        let forbidden = anyhow::Error::from(ApiError::Status {
+            status: 403,
+            body: String::new(),
+        });
+        assert!(!unsupported_operation(&forbidden));
+        assert!(!unsupported_operation(&anyhow!(
+            "parent folder is not created in ACC yet"
         )));
     }
 
@@ -2190,7 +2323,7 @@ mod tests {
             &loc,
             Some(local.clone()),
             created,
-            storage.into(),
+            Some(storage.into()),
             &snapshot,
         )
         .unwrap();
@@ -2284,7 +2417,7 @@ mod tests {
             &loc,
             Some(local.clone()),
             created,
-            "our-storage".into(),
+            Some("our-storage".into()),
             &snapshot,
         )
         .unwrap();
@@ -2302,6 +2435,86 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].item.as_deref(), Some("LIN-rapid"));
         assert!(payload(&jobs[0]).unwrap().get("intent_storage").is_none());
+    }
+
+    #[test]
+    fn non_acc_create_binds_its_own_row_the_poll_already_inserted() {
+        // Interaxo/StreamBIM: a poll listed our committed file under its ID before the create's
+        // reply was bound. The committed handle identifies it; the attempt marker never does.
+        let f = crate::sync::tests::fixture("non-acc-bind-own-poll");
+        let path = f.dir.join("ritning.pdf");
+        std::fs::write(&path, b"our bytes").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mut local = crate::sync::tests::row(
+            &f.p,
+            "local-ritning",
+            Some("co.ROOT"),
+            "ritning.pdf",
+            Kind::File,
+        );
+        local.remote_version = None;
+        local.base_version = None;
+        local.local_state = LocalState::New;
+        f.ctx.store.upsert_item(&local).unwrap();
+        let job_id = f
+            .ctx
+            .store
+            .enqueue(
+                f.p.pid,
+                "upload",
+                Some(&local.id),
+                &serde_json::json!({ "path": path }).to_string(),
+            )
+            .unwrap();
+        let job = f
+            .ctx
+            .store
+            .due_jobs(i64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .unwrap();
+        let committed = "interaxo:I-900:1.0";
+        let mut created =
+            crate::sync::tests::row(&f.p, "I-900", Some("co.ROOT"), "ritning.pdf", Kind::File);
+        created.remote_version = Some(1000);
+        created.base_version = Some(1000);
+        created.storage_urn = Some(committed.into());
+        f.ctx.store.upsert_item(&created).unwrap();
+        let loc = Located {
+            project: f.p.clone(),
+            existing: Some(local.clone()),
+            parent: "co.ROOT".into(),
+            name: "ritning.pdf".into(),
+        };
+        let snapshot = UploadedSnapshot {
+            path: &path,
+            meta: &meta,
+            mtime: mtime_ms(&meta),
+            size: meta.len() as i64,
+            usn: available_usn(&path),
+            intent: None,
+        };
+        let (bound, changed) = bind_created_file(
+            &f.ctx,
+            &job,
+            &loc,
+            Some(local.clone()),
+            created,
+            Some(committed.into()),
+            &snapshot,
+        )
+        .unwrap();
+        assert!(
+            !changed,
+            "our own commit is not a colleague's newer version"
+        );
+        assert_eq!(bound.id, "I-900");
+        assert_eq!(bound.remote_version, Some(1000));
+        assert_eq!(bound.base_version, Some(1000));
+        assert_eq!(bound.storage_urn.as_deref(), Some(committed));
+        assert_eq!(bound.version_urn, None);
+        assert!(f.ctx.store.item(f.p.pid, &local.id).unwrap().is_none());
     }
 
     #[test]
@@ -2368,7 +2581,7 @@ mod tests {
             &loc,
             Some(local.clone()),
             created,
-            "our-storage".into(),
+            Some("our-storage".into()),
             &snapshot,
         )
         .unwrap();

@@ -1,6 +1,8 @@
 # Synka — design
 
-Synka syncs ACC Docs files to a local folder (Cloud Files API). It can run alongside Autodesk
+Synka syncs ACC Docs, StreamBIM and Interaxo files to a local folder (Cloud Files API). Each
+platform is a *provider* behind one dispatch module (`src/remote/`); see `docs/PROVIDERS.md` for
+the provider contract, ids, versions and what each API cannot do. It can run alongside Autodesk
 Desktop Connector. It is shipped as a sideloaded MSIX tray app, deployed the same way as
 [Koordinatverktyget](https://github.com/byggstyrning/Koordinatverktyget).
 
