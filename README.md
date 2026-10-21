@@ -29,8 +29,8 @@ Swedish UI by default, English toggle.
   belongs to: Autodesk (the APS endpoints and Autodesk's file storage), StreamBIM (the signed-in
   region's servers and the S3 storage they hand out upload links for) or Interaxo (its API hosts).
   Synka has no telemetry.
-- The update check is off by default (`update_channel` is empty). Staff update from the internal
-  OneDrive share.
+- The update check is off by default (`update_channel` is empty). Staff install and update through
+  BoomerHubb (private release channel `VilhelmH-git/Synka-releases`), or from the internal OneDrive share.
 - Each ACC hub's account admin must approve the Client ID as a Custom Integration, including
   client-owned hubs.
 - The undocumented dm/v3 desktop-sync feed is off by default (`desktop_sync_feed`, settings.json

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Cuts a Synka release from this machine: tests, bumps the version,
     tags, signs locally, and publishes the signed package and delivery zip.
@@ -19,9 +19,15 @@
          (build_msix.ps1 checks
          the engine is inside the package and the manifest carries the version)
       5. make_delivery.ps1 -SkipBuild        the sideload zip
-      6. Create or resume a draft release on THIS repository; upload missing
+      6. The release gate (claude-kit tools\release-scan\scan_package.py) over the
+         zip and the signed package; a finding stops with nothing published.
+      7. Create or resume a draft release on THIS repository; upload missing
          assets, verify their bytes, then publish it.
-      7. share_release.ps1: the zip into the shared OneDrive folder, after GitHub.
+      8. The same, signed, on the release channel VilhelmH-git/Synka-releases
+         (private), which BoomerHubb reads through its GitHub App, then point
+         the BoomerHubb catalog's "synka" entry at it (claude-kit
+         tools\catalog\set_entry.py). The catalog step never sinks a release.
+      9. share_release.ps1: the zip into the shared OneDrive folder, after GitHub.
 
     THE SIGNING KEY. The engine and MSIX use the existing CN=FastADC private key
     matching packaging\FastADC.cer; build_msix.ps1 never creates a new key.
@@ -84,6 +90,17 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root "dist"
 $publisher = "CN=FastADC"
+# The release channel BoomerHubb installs from. Private, like every releases
+# repository in the catalog: BoomerHubb reads it through the GitHub App
+# "Byggstyrning Releases", which must be installed on it.
+$channel = "VilhelmH-git/Synka-releases"
+$catalogId = "synka"
+# The release gate and the catalog script live in the private claude-kit, cloned
+# beside this repository. CLAUDE_KIT overrides the place.
+$kit = if ($env:CLAUDE_KIT) { $env:CLAUDE_KIT } else { Join-Path (Split-Path $root -Parent) "claude-kit" }
+$gate = Join-Path $kit "tools\release-scan\scan_package.py"
+$setEntry = Join-Path $kit "tools\catalog\set_entry.py"
+$python = (Get-Command python -ErrorAction SilentlyContinue).Source
 $versionScript = Join-Path $PSScriptRoot "version.ps1"
 $cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
 if (-not $cargo) { $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe" }
@@ -294,9 +311,17 @@ if (-not (Test-Path $cargo)) {
 # when this machine signs. In a dry run a missing key is reported rather than fatal.
 $signer = $null
 $keyProblem = $null
-$signer = Get-ChildItem Cert:\CurrentUser\My |
-    Where-Object { $_.Subject -eq $publisher -and $_.HasPrivateKey } |
-    Sort-Object NotAfter -Descending | Select-Object -First 1
+# The key whose certificate is committed, when this machine has it: a machine can
+# hold more than one CN=FastADC key, and the newest is not necessarily the release key.
+$committedPrint = $null
+$releaseCertificatePath = Join-Path $PSScriptRoot "FastADC.cer"
+if (Test-Path $releaseCertificatePath) {
+    $committedPrint = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $releaseCertificatePath).Thumbprint
+}
+$candidates = @(Get-ChildItem Cert:\CurrentUser\My |
+    Where-Object { $_.Subject -eq $publisher -and $_.HasPrivateKey })
+$signer = $candidates | Where-Object { $_.Thumbprint -eq $committedPrint } | Select-Object -First 1
+if (-not $signer) { $signer = $candidates | Sort-Object NotAfter -Descending | Select-Object -First 1 }
 if (-not $signer) {
     $keyProblem = "No signing key: CurrentUser\My holds no $publisher certificate with a private key. build_msix.ps1 -Sign requires the existing key matching packaging\FastADC.cer and never creates a replacement. Import the .pfx from the machine that cut the previous release: Import-PfxCertificate -FilePath <file>.pfx -CertStoreLocation Cert:\CurrentUser\My"
 }
@@ -326,9 +351,29 @@ else {
 }
 if ($keyProblem -and -not $DryRun) { throw $keyProblem }
 
-# RELEASE GATE HOOK. The publish step must not run unchecked when a scanner exists:
-# scan the zip and signed package here, before the first gh call, and stop with
-# nothing published on a finding. Nothing is wired in yet. Add it here, not later.
+# The release gate and the release channel, checked before a version number is
+# spent. The gate itself runs over the built files, before the first gh call that
+# publishes anything.
+$gateProblem = $null
+if (-not (Test-Path $gate)) {
+    $gateProblem = "The release gate is not at $gate. Nothing is published unchecked: clone claude-kit beside this repository, or set CLAUDE_KIT."
+}
+elseif (-not $python) {
+    $gateProblem = "python is not on PATH; the release gate and the catalog step need it."
+}
+$channelProblem = $null
+try {
+    $channelState = (Invoke-Gh @("repo", "view", $channel, "--json", "visibility,viewerPermission")) -join "`n" | ConvertFrom-Json
+    if ($channelState.viewerPermission -notin @("ADMIN", "MAINTAIN", "WRITE")) {
+        $channelProblem = "gh cannot write to the release channel $channel (permission $($channelState.viewerPermission))."
+    }
+}
+catch {
+    $channelProblem = "The release channel $channel cannot be reached with gh: $($_.Exception.Message)"
+}
+foreach ($problem in @($gateProblem, $channelProblem)) {
+    if ($problem -and -not $DryRun) { throw $problem }
+}
 
 # ------------------------------------------------------------ 2. the version
 
@@ -383,8 +428,15 @@ if ($DryRun) {
     if ($keyProblem) { Write-Host "   FAILED before that: $keyProblem" -ForegroundColor Yellow }
     else { Write-Host "   signed it with $($signer.Thumbprint) (valid to $($signer.NotAfter.ToString('yyyy-MM-dd'))) via build_msix.ps1 -Sign" }
     Write-Host "   packed dist\Synka-$next-sidladdning.zip with make_delivery.ps1 -SkipBuild"
+    if ($gateProblem) { Write-Host "   FAILED before publishing: $gateProblem" -ForegroundColor Yellow }
+    else { Write-Host "   ran the release gate over the zip and the signed package: $gate" }
     $withNotes = if ($Notes) { " and the notes in $Notes" } else { "" }
     Write-Host "   published $tag on this repository with the zip and the signed package$withNotes"
+    if ($channelProblem) { Write-Host "   FAILED at the channel: $channelProblem" -ForegroundColor Yellow }
+    else {
+        Write-Host "   published $tag on $channel ($($channelState.visibility)) with the zip, the signed package and the certificate"
+        Write-Host "   pointed the BoomerHubb catalog entry '$catalogId' at it ($setEntry)"
+    }
     if ($NoShare) { Write-Host "   not copied into the shared folder (-NoShare)" }
     else { Write-Host "   copied the zip into the shared OneDrive folder Synka (share_release.ps1)" }
     exit 0
@@ -511,6 +563,16 @@ try {
 }
 finally { $archive.Dispose() }
 
+# ------------------------------------------------------------ the release gate
+
+Invoke-Step "Release gate" {
+    $env:PYTHONIOENCODING = "utf-8"
+    & $python $gate $zip.FullName $signedItem.FullName | ForEach-Object { Write-Host "   $_" }
+    if ($LASTEXITCODE -ne 0) {
+        throw "The release gate stopped the release (see above). Nothing was published. Fix the cause, then -OnlyPublish."
+    }
+}
+
 # ------------------------------------------------------------ 7. GitHub
 
 $standard = @"
@@ -520,7 +582,7 @@ $standard = @"
 
 The ``.msix`` beside it is signed with the included ``FastADC.cer`` certificate.
 
-New versions are also shared through the internal OneDrive folder ``Synka``; there is no public update channel and no in-app update check.
+Colleagues install and update Synka through BoomerHubb. New versions are also shared through the internal OneDrive folder ``Synka``; there is no public download and no in-app update check.
 
 **Varumärken / Trademarks** - Autodesk, Autodesk Construction Cloud, Autodesk Docs, Autodesk Forma och Revit är registrerade varumärken eller varumärken som tillhör Autodesk, Inc. och/eller dess dotter- eller närstående bolag. Synka är en fristående produkt från Byggstyrning och är inte ansluten till, godkänd av eller sponsrad av Autodesk.
 
@@ -536,13 +598,38 @@ try {
     $url = Invoke-Step "Publishing or resuming $tag on $privateRepo" {
         Publish-Release $privateRepo $tag "Synka $next" $notesFile $assets -VerifyTag
     }
+    # The release channel: the same signed files. Its tag is made on the channel's
+    # own default branch; no source is involved. Publish-Release resumes a partial
+    # release there too, so -OnlyPublish finishes a failed mirror.
+    $channelUrl = Invoke-Step "Publishing or resuming $tag on $channel" {
+        Publish-Release $channel $tag "Synka $next" $notesFile $assets -Latest
+    }
 }
 finally {
     Remove-Item $notesFile -ErrorAction SilentlyContinue
 }
 
+# ------------------------------------------------------------ the BoomerHubb catalog
+
+# BoomerHubb installs and updates the team's apps from VilhelmH-git/catalog. Point
+# the "synka" entry at the release just published on the channel. Never sinks the
+# release: it stands, and the command to run again is printed.
+$catalogArgs = @($setEntry, "--id", $catalogId, "--repo", $channel, "--tag", $tag, "--cert-thumbprint", $signer.Thumbprint)
+Write-Host ""
+Write-Host "== The BoomerHubb catalog ==" -ForegroundColor Cyan
+$previous = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& $python @catalogArgs 2>&1 | ForEach-Object { Write-Host "   $_" }
+$catalogOk = $LASTEXITCODE -eq 0
+$ErrorActionPreference = $previous
+if (-not $catalogOk) {
+    Write-Host "   The catalog was not updated - BoomerHubb keeps offering the previous version." -ForegroundColor Yellow
+    Write-Host "   When fixed: python $($catalogArgs -join ' ')" -ForegroundColor Yellow
+}
+
 Write-Host "$tag is published." -ForegroundColor Green
 Write-Host "  $url"
+Write-Host "  $channelUrl  (BoomerHubb's channel)"
 Write-Host ("  {0}  {1:N1} MB" -f $zip.Name, ($zip.Length / 1MB))
 Write-Host ("  {0}  {1:N1} MB  (signed; verified on GitHub)" -f $signed.Name, ($signed.Length / 1MB))
 

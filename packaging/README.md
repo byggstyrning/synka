@@ -1,7 +1,8 @@
 # Synka packaging
 
 Synka ships as a sideloaded, self-signed MSIX, plus a zip that a recipient double-clicks. It is
-internal only: there is no public download and no public update channel. The package has two
+internal only: there is no public download and no public update channel. Colleagues install and
+update it through BoomerHubb, from the private release channel `VilhelmH-git/Synka-releases`. The package has two
 processes:
 
 | Process | What | Lifetime |
@@ -23,7 +24,7 @@ is laid out next to it and installed first.
 | `assert-package-engine.ps1` | Checks the embedded engine's signing certificate and timestamp; the build also compares its SHA-256 with `target\release\synka-engine.exe`. Delivery and resumed releases use the same checks. |
 | `version.ps1` | Reads the version, or bumps it in `Cargo.toml` and `Cargo.lock` (`-Bump patch`). The one place that writes it, locally and in CI. |
 | `share_release.ps1` | Copies the sideload zip into the shared OneDrive folder `Synka` (or `-TargetFolder`). Keeps the newest 5 versions and `Synka-latest.zip`. |
-| `new_release.ps1` | Current local release route: serial tests, version bump, tag, locally timestamped signing, ZIP, private release, and optional OneDrive copy. |
+| `new_release.ps1` | Current local release route: serial tests, version bump, tag, locally timestamped signing, ZIP, release gate, private release, the same release on `VilhelmH-git/Synka-releases`, the BoomerHubb catalog entry, and optional OneDrive copy. |
 | `make_icons.py` | Draws the Synka icon. `--assets` regenerates both ICOs (engine and window) plus every MSIX tile, splash and title-bar PNG in `ui\Assets`. |
 | `FastADC.cer` | The public certificate, `CN=FastADC`. Not secret. Recipients trust it; CI refuses to sign with any other key. |
 | `delivery\` | Handwritten recipient files: `Install.cmd`, `Install.ps1`, `README.txt` (Swedish). Checked out with CRLF (`.gitattributes`). |
@@ -98,9 +99,16 @@ It refuses an equal or older installed version; increase `Cargo.toml`'s version
 before using it to deploy another build. The user's `LocalState` stays in place.
 The recipient's `Install.cmd` skips an already installed equal version.
 
-## Signing certificate (TODO)
+## Signing certificate
 
-> **TODO(owner): replace the signing certificate.** The package Publisher and the signing
+Since 2026-10-21 releases are signed with the key `CN=FastADC` `F1085485D4950C413AFE6A6C1E1F9F63A16D54FE`
+(valid to 2031-10-20), committed as `packaging\FastADC.cer`. It replaced the earlier `CN=FastADC`
+key `03F6B767F3CFC690AB55333AAE6093AC0C8CF233`. The Publisher is unchanged, so the package
+identity is the same; a machine needs the new certificate trusted (`Install.cmd`, or BoomerHubb)
+before it accepts a package signed with it, and a build with the old `.cer` embedded will not
+accept an update signed with the new key.
+
+> **Later, if wanted: a certificate with another name.** The package Publisher and the signing
 > certificate stay `CN=FastADC` for now. Create a new trusted certificate (for example
 > `CN=Byggstyrning`), distribute it to every recipient, then change the Publisher in
 > `ui/Package.appxmanifest`, `PACKAGE_PUBLISHER` / `SIGNING_CERT_DER` in the updater,
@@ -186,7 +194,12 @@ database are not part of the package; see the migration steps in `docs/ROADMAP.m
 Pushing a tag does **not** start `release.yml`; that workflow is dispatch-only.
 The signing key stays on this machine. `new_release.ps1` signs and timestamps the
 engine and MSIX locally, then publishes the same signed package, certificate and ZIP
-on the private source repository. There is no public mirror.
+on the private source repository and on the private release channel
+`VilhelmH-git/Synka-releases`, then points the `synka` entry of the BoomerHubb catalog
+(`VilhelmH-git/catalog`) at it. There is no public mirror. The release gate and the catalog step
+are in claude-kit (`toolselease-scan`, `tools\catalog`), cloned beside this repository or named
+by `CLAUDE_KIT`; the script stops before the version bump when either is missing, or when `gh`
+cannot write to the channel.
 
 1. Commit the finished source on `main`, push it and wait for CI to pass. Run the
    serial tests and Clippy locally if changes landed after that CI run.
@@ -302,13 +315,13 @@ version number, and the same version cannot be installed twice.
 - A release from a developer machine needs `git`, `gh` and `cargo`, and without
   the Release workflow also a signing key. None of that is installed by these
   scripts. A release from GitHub Actions needs only the signing secrets above.
-- The release gate (scanning the packages before publishing) is not wired in yet.
+- The release gate runs in `new_release.ps1` only; the GitHub Actions route has none yet.
   `new_release.ps1` has a marked hook for it; in CI it belongs in the publish job,
   before the first `gh release` call.
 - The existing `v0.1.0` package has no timestamp. `build_msix.ps1` now requests
   and verifies an RFC 3161 timestamp while signing future releases; if the
   timestamp service is unavailable the build stops. Plan the new certificate
-  before the current one expires on 2027-10-16: see the TODO above, commit it as
+  before the current one expires on 2031-10-20: see the TODO above, commit it as
   `packaging\FastADC.cer`, use the matching local signing key (and replace the
   workflow secrets if that route is enabled), and have every recipient run
   `Install.cmd` once more to trust it. Existing installs pin the old key.
