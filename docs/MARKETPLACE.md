@@ -11,9 +11,23 @@ Until Synka is published there, admins add it under **Custom integrations** inst
 | APS app | Done. Developer Hub *Byggstyrning*, app renamed from "Better Desktop Connector" to **Synka**; Client ID unchanged (`tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`, `config::DEFAULT_CLIENT_ID`); Desktop/Mobile/SPA, PKCE, callback `http://localhost:47863/` |
 | Publisher profile | Done. Publisher Corner (https://apps.autodesk.com/en/MyUploads): Jonatan Jacobsson, byggstyrning.se, support `info@byggstyrning.se`; My Page: company *Byggstyrning* |
 | Publisher Agreement | Accepted 3 November 2026 (version of 3 May 2026) |
-| Privacy policy | Text in `docs/PRIVACY.md`; must be published at a public URL on byggstyrning.se |
-| Listing | Draft saved, App ID `1478764073777710332` (English, Win64, free), status *Info incomplete*. Filled in: name, short and long description, usage, install/uninstall, support, additional info, known issues, version 0.3.5, icon, Learn More URL |
-| Still missing before **Submit** | App file (the sideload zip), privacy policy URL, at least 4 screenshots, then step 2 (price Free, product compatibility, Forge Client ID) |
+| Privacy policy | `docs/PRIVACY.md`, published at https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md once merged to main; the About page links to it from 0.3.6 |
+| Listing | Draft saved, App ID `1478764073777710332` (English, Win64, free), status *Info incomplete*. Filled in: name, short and long description, usage, install/uninstall, support, additional info, known issues, privacy policy URL, version 0.3.6, icon, Learn More URL |
+| Still missing before **Submit** | App file `Synka-0.3.6.zip` (signed build), at least 4 screenshots, then step 2 (price Free, product compatibility, Forge Client ID) |
+
+### Building the Marketplace zip
+
+The build must be signed with the release key (`CN=FastADC`, thumbprint
+`F1085485D4950C413AFE6A6C1E1F9F63A16D54FE`, see `packaging/README.md`), so it runs on the release
+machine or on a machine where that key has been restored:
+
+    powershell -NoProfile -File packaging\build_msix.ps1 -Sign
+    powershell -NoProfile -File packaging\make_delivery.ps1 -SkipBuild
+    Copy-Item dist\Synka-0.3.6-sidladdning.zip dist\Synka-0.3.6.zip
+
+The Marketplace gets the same content as the sideload zip, named without `-sidladdning`.
+Upload it in the listing with **Choose File** (max 600 MB), or share it from cloud storage
+under **File link**.
 
 Autodesk's review checklist (shown in the form): description and usage instructions of at least
 1500 characters each, at least 4 screenshots, company URL and privacy policy URL, a binary app
