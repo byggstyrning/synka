@@ -13,9 +13,9 @@ Until Synka is published there, admins add it under **Custom integrations** inst
 | Publisher Agreement | Accepted 3 November 2026 (version of 3 May 2026) |
 | Privacy policy | `docs/PRIVACY.md`, published at https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md; the About page links to it from 0.3.6 |
 | Release | [v0.3.6](https://github.com/byggstyrning/synka/releases/tag/v0.3.6), a pre-release with `Synka-0.3.6.zip` (top folder `Synka-0.3.6/`, installed with `Install.cmd`). Signed with the **earlier** `CN=FastADC` key `03F6B767F3CFC690AB55333AAE6093AC0C8CF233` (valid to 2027-10-16), because the current release key was not available; the zip carries that certificate. The release gate and the BoomerHubb channel did not run |
-| Listing, step 1 | Draft saved, App ID `1478764073777710332` (English, Win64, free), status *Info incomplete*. Filled in: name, short and long description, usage, install/uninstall, support, additional info, known issues, privacy policy URL, app file as File link `https://github.com/byggstyrning/synka/releases/download/v0.3.6/Synka-0.3.6.zip`, version 0.3.6, icon, Learn More URL |
-| Listing, step 2 | Not saved: the form saves step 2 only with the workflow video. Values to enter: price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration) |
-| Still missing before **Submit** | At least 4 screenshots; the workflow video (1-3 min: setup, Autodesk sign-in, sync; recorded with the Client ID above) with its UTC time stamp |
+| Listing, step 1 | Saved, App ID `1478764073777710332` (English, Win64, free). Filled in: name, short and long description (1,758 characters of text), usage, install/uninstall, support, additional info, known issues, privacy policy URL, app file as File link `https://github.com/byggstyrning/synka/releases/download/v0.3.6/Synka-0.3.6.zip`, version 0.3.6, icon, 6 screenshots and the video below, Learn More URL |
+| Listing, step 2 | Saved: price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration); workflow video https://www.youtube.com/watch?v=mmGS4ut3zKE (unlisted, 4:13), time stamp 2026-11-03 09:00:38 UTC (the Autodesk sign-in in Synka's log) |
+| Still blocking **Submit** | The draft still shows *Info incomplete* and Submit stays disabled; the portal does not say why. Untested guesses: the app file given as a link instead of uploaded, or the default company logo on My Page |
 
 ### Building the Marketplace zip
 
@@ -40,6 +40,10 @@ pinned certificate is unchanged.
 Autodesk's review checklist (shown in the form): description and usage instructions of at least
 1500 characters each, at least 4 screenshots, company URL and privacy policy URL, a binary app
 file, a three-part version number, no unhandled exceptions, and uninstall removes all files.
+
+The step 2 time stamp field takes **local** time as `MM/DD/YYYY HH:mm:ss` and converts it to UTC
+when saved; text in any other format is replaced by the current time and the save fails with
+"Missing Video Stamp".
 
 ## Publishing checklist
 
