@@ -43,6 +43,9 @@
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE72E;" />
                 </tk:SettingsCard.HeaderIcon>
+                <!-- The Marketplace Publisher Agreement (§5.1) requires a link to the policy inside the app. -->
+                <HyperlinkButton Content="{loc:T Sv='Integritetspolicy', En='Privacy policy'}"
+                                 NavigateUri="https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md" />
             </tk:SettingsCard>
 
             <!-- Trademark notice (legal review). The text is fixed wording; keep it verbatim. -->
