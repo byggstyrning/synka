@@ -66,7 +66,7 @@ double-click `Install.cmd`. See `packaging/delivery/README.txt`.
 | `ui/` | The window `Synka.exe` (C#, WinUI 3) and the MSIX manifest. |
 | `packaging/` | MSIX build, signing, sideload zip, release scripts. |
 | `.github/workflows/` | CI (pull requests and main) and Release (one click). |
-| `docs/` | `PROVIDERS.md` (platforms and the provider contract), `IPC.md` (engine ⇄ window protocol), `ROADMAP.md` (state and next steps), `RESILIENCE.md` (test laboratory). |
+| `docs/` | `PROVIDERS.md` (platforms and the provider contract), `IPC.md` (engine ⇄ window protocol), `ROADMAP.md` (state and next steps), `RESILIENCE.md` (test laboratory), `PRIVACY.md` (privacy policy), `MARKETPLACE.md` (ACC App gallery publishing and admin setup). |
 | `docs/specs/` | Clean-room behavioural specs: APS, StreamBIM and Interaxo endpoints, Cloud Files, save patterns and the ignore list. |
 | `DESIGN.md` | Architecture and key decisions. |
 
