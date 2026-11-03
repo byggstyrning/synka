@@ -13,23 +13,25 @@ Until Synka is published there, admins add it under **Custom integrations** inst
 | Publisher Agreement | Accepted 3 November 2026 (version of 3 May 2026) |
 | Privacy policy | `docs/PRIVACY.md`, published at https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md; the About page links to it from 0.3.6 |
 | Release | [v0.3.6](https://github.com/byggstyrning/synka/releases/tag/v0.3.6), a pre-release with `Synka-0.3.6.zip` (top folder `Synka-0.3.6/`, installed with `Install.cmd`). Signed with the **earlier** `CN=FastADC` key `03F6B767F3CFC690AB55333AAE6093AC0C8CF233` (valid to 2027-10-16), because the current release key was not available; the zip carries that certificate. The release gate and the BoomerHubb channel did not run |
-| Listing, step 1 | Saved, App ID `1478764073777710332` (English, Win64, free). Filled in: name, short and long description (1,758 characters of text), usage, install/uninstall, support, additional info, known issues, privacy policy URL, app file as File link `https://github.com/byggstyrning/synka/releases/download/v0.3.6/Synka-0.3.6.zip`, version 0.3.6, icon, 6 screenshots and the video below, Learn More URL |
-| Listing, step 2 | Saved: price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration); workflow video https://www.youtube.com/watch?v=mmGS4ut3zKE (unlisted, 4:13), time stamp 2026-11-03 09:00:38 UTC (the Autodesk sign-in in Synka's log) |
-| Still blocking **Submit** | The draft still shows *Info incomplete* and Submit stays disabled; the portal does not say why. Untested guesses: the app file given as a link instead of uploaded, or the default company logo on My Page |
+| Listing type | **Browser-based App**, App ID `3397524952584336133` (English, free). A browser-based listing has no app file: the Marketplace links to our download page and the ACC App gallery only grants access to the Client ID. Desktop sync tools in the gallery (odrive, Graitec FILE SYNC, CDE Sync) are listed the same way |
+| Listing, step 1 | Saved. Name, short and long description (1,758 characters of text), privacy policy URL, version 0.3.6, Web Service Url `https://github.com/byggstyrning/synka/releases`, icon, 5 captioned screenshots (Overview, Projects, Explorer, Settings, About), the video below, usage instructions (with installing and uninstalling, since this type has no install field), support, additional info, known issues, Learn More URL |
+| Listing, step 2 | Saved: login type **Sign in with Autodesk account**; price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration); workflow video https://www.youtube.com/watch?v=mmGS4ut3zKE (unlisted, 4:13), time stamp 2026-11-03 09:00:38 UTC (the Autodesk sign-in in Synka's log) |
+| Status | *Ready to submit*; **Submit** not pressed yet |
+| Earlier draft | App ID `1478764073777710332` (Desktop-based, Win64) stays at *Info incomplete* because a desktop listing needs an uploaded app file that Autodesk repackages. It is superseded by the browser-based listing and can be deleted |
 
-### Building the Marketplace zip
+### Building the download zip
 
-Normally the build is signed with the release key (`CN=FastADC`, thumbprint
-`F1085485D4950C413AFE6A6C1E1F9F63A16D54FE`, see `packaging/README.md`), on the release machine
-or on a machine where that key has been restored:
+The listing points at the GitHub releases page, so a new version needs no Marketplace upload,
+only a new version number and description in the listing. Normally the build is signed with the
+release key (`CN=FastADC`, thumbprint `F1085485D4950C413AFE6A6C1E1F9F63A16D54FE`, see
+`packaging/README.md`), on the release machine or on a machine where that key has been restored:
 
     powershell -NoProfile -File packaging\build_msix.ps1 -Sign
     powershell -NoProfile -File packaging\make_delivery.ps1 -SkipBuild
 
-The Marketplace gets the same content as the sideload zip, named `Synka-<version>.zip` with the
-top folder `Synka-<version>/` instead of `-sidladdning`. Upload it to the release
-(`gh release upload v<version> dist\Synka-<version>.zip --clobber`) so the listing's File link
-points at it.
+The public download has the same content as the sideload zip, named `Synka-<version>.zip` with
+the top folder `Synka-<version>/` instead of `-sidladdning`. Upload it to the release
+(`gh release upload v<version> dist\Synka-<version>.zip --clobber`).
 
 v0.3.6 was built on a machine without the release key: `packaging\FastADC.cer` was replaced, in
 the working tree only, by the public certificate of the earlier key, so `build_msix.ps1 -Sign
@@ -61,7 +63,8 @@ when saved; text in any other format is replaced by the current time and the sav
    applies unless we supply our own (§4.3).
 5. Fill in the listing:
    - Title: Synka
-   - Type: desktop app for Windows; compatible with Autodesk Construction Cloud / Forma (Docs)
+   - Type: Browser-based App (Synka itself is a Windows desktop app downloaded from GitHub);
+     compatible with Autodesk Construction Cloud / Forma (Docs)
    - APS Client ID: `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`
    - Price: free
    - Short description: Sync ACC Docs projects to an ordinary folder in Windows Explorer.
@@ -71,8 +74,8 @@ when saved; text in any other format is replaced by the current time and the sav
    - Support: info@byggstyrning.se; privacy policy URL from step 2
    - Help page: the Client ID, the app name and the admin steps below (BIM 360 publisher
      guideline "HTML help page")
-6. Upload the product as one ZIP (the sideload zip from `packaging/make_delivery.ps1`). Autodesk
-   reviews it (up to two weeks), then builds the final package for us to approve.
+6. Submit the browser-based listing. Autodesk reviews it (up to two weeks); once published, Synka
+   appears in the ACC App gallery.
 
 Before submitting, check against the Marketplace product guidelines and the Forma / BIM 360
 publisher guidelines: only documented production APS APIs (the dm/v3 feed stays off), 3-legged
