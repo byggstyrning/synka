@@ -12,10 +12,12 @@ Until Synka is published there, admins add it under **Custom integrations** inst
 | Publisher profile | Done. Publisher Corner (https://apps.autodesk.com/en/MyUploads): Jonatan Jacobsson, byggstyrning.se, support `info@byggstyrning.se`; My Page: company *Byggstyrning* |
 | Publisher Agreement | Accepted 3 November 2026 (version of 3 May 2026) |
 | Privacy policy | `docs/PRIVACY.md`, published at https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md once merged to main; the About page links to it from 0.3.6 |
-| Listing | Draft saved, App ID `1478764073777710332` (English, Win64, free), status *Info incomplete*. Filled in: name, short and long description, usage, install/uninstall, support, additional info, known issues, privacy policy URL, version 0.3.6, icon, Learn More URL |
-| Still missing before **Submit** | App file `Synka-0.3.6.zip` (signed build), at least 4 screenshots, then step 2 (price Free, product compatibility, Forge Client ID) |
+| Release | [v0.3.6](https://github.com/byggstyrning/synka/releases/tag/v0.3.6), a pre-release with `Synka-0.3.6.zip`. **Unsigned** (the release key was not available), so it cannot be installed; v0.3.5 stays the latest signed release |
+| Listing, step 1 | Draft saved, App ID `1478764073777710332` (English, Win64, free), status *Info incomplete*. Filled in: name, short and long description, usage, install/uninstall, support, additional info, known issues, privacy policy URL, app file as File link `https://github.com/byggstyrning/synka/releases/download/v0.3.6/Synka-0.3.6.zip`, version 0.3.6, icon, Learn More URL |
+| Listing, step 2 | Not saved: the form saves step 2 only with the workflow video. Values to enter: price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration) |
+| Still missing before **Submit** | A signed build in place of the unsigned zip; at least 4 screenshots; the workflow video (1-3 min: setup, Autodesk sign-in, sync; recorded with the Client ID above) with its UTC time stamp |
 
-### Building the Marketplace zip
+### Building the signed Marketplace zip
 
 The build must be signed with the release key (`CN=FastADC`, thumbprint
 `F1085485D4950C413AFE6A6C1E1F9F63A16D54FE`, see `packaging/README.md`), so it runs on the release
@@ -26,8 +28,8 @@ machine or on a machine where that key has been restored:
     Copy-Item dist\Synka-0.3.6-sidladdning.zip dist\Synka-0.3.6.zip
 
 The Marketplace gets the same content as the sideload zip, named without `-sidladdning`.
-Upload it in the listing with **Choose File** (max 600 MB), or share it from cloud storage
-under **File link**.
+Replace the unsigned asset on the v0.3.6 release with it (`gh release upload v0.3.6
+dist\Synka-0.3.6.zip --clobber`) so the listing's File link stays the same.
 
 Autodesk's review checklist (shown in the form): description and usage instructions of at least
 1500 characters each, at least 4 screenshots, company URL and privacy policy URL, a binary app
