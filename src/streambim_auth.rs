@@ -1161,16 +1161,21 @@ impl StreamBimAccounts {
     /// The accounts whose profiles are in `state_dir`. A single-account install is migrated first.
     pub fn load(http: reqwest::Client, state_dir: &Path) -> StreamBimAccounts {
         migrate_legacy(state_dir);
-        let accounts = StreamBimAccounts {
-            http,
-            state_dir: state_dir.to_path_buf(),
-            accounts: RwLock::new(BTreeMap::new()),
-        };
+        let accounts = StreamBimAccounts::none(http, state_dir);
         for key in keys_on_disk(state_dir) {
             let account = accounts.make(&key, &base_for_key(&key));
             accounts.write().insert(key, account);
         }
         accounts
+    }
+
+    /// No accounts, and nothing read from or written to `state_dir`: the ACC-only build.
+    pub fn none(http: reqwest::Client, state_dir: &Path) -> StreamBimAccounts {
+        StreamBimAccounts {
+            http,
+            state_dir: state_dir.to_path_buf(),
+            accounts: RwLock::new(BTreeMap::new()),
+        }
     }
 
     /// The account with this key, if it exists (signed in or not).

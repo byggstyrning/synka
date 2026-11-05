@@ -79,6 +79,7 @@ fn summary(ctx: &Ctx) -> serde_json::Value {
         .collect();
     json!({
         "engine_version": env!("CARGO_PKG_VERSION"),
+        "acc_only": ctx.cfg.acc_only,
         "packaged": ctx.paths.packaged,
         "os": os_version(),
         // Per provider, booleans only: no names, e-mail addresses or ids.

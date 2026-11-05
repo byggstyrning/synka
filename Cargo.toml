@@ -9,6 +9,11 @@ publish = false
 name = "synka-engine"
 path = "src/main.rs"
 
+[features]
+# The ACC-only build (docs/MARKETPLACE.md): ACC is the one provider; StreamBIM and Interaxo are
+# never offered, signed in, listed or polled. Off by default; the default build has all three.
+acc-only = []
+
 [dependencies]
 anyhow = "1"
 thiserror = "2"

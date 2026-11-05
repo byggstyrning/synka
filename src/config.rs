@@ -5,6 +5,7 @@ use crate::auth::{
     check_loopback_redirect, dpapi_protect, dpapi_unprotect, InteraxoClient,
     INTERAXO_DEFAULT_REDIRECT,
 };
+use crate::model::Provider;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -98,9 +99,25 @@ pub fn check_setting(key: &str, value: &Value) -> Result<(), String> {
 /// The IPC layer sends it in the ack; the engine uses it for its own notices.
 pub const INTERAXO_OFF_TEXT: &str = "Interaxo-inloggning är avstängd i den här versionen.";
 
-/// Built-in APS app (Desktop/SPA type, Authorization Code + PKCE, no secret). The app is still
-/// named "Better Desktop Connector" in the APS developer portal; rename it to "Synka" there
-/// (owner action). A public client id is not a secret.
+/// The refusal of every StreamBIM sign-in in the ACC-only build.
+pub const STREAMBIM_OFF_TEXT: &str = "StreamBIM ingår inte i den här versionen av Synka.";
+
+/// The ACC-only build (`cargo build --features acc-only`, docs/MARKETPLACE.md). The engine copies
+/// it into `Config::acc_only` at start; everything else reads that field, so tests cover both builds.
+pub const ACC_ONLY: bool = cfg!(feature = "acc-only");
+
+/// The refusal for a provider the engine does not offer.
+pub fn off_text(provider: Provider) -> &'static str {
+    match provider {
+        Provider::StreamBim => STREAMBIM_OFF_TEXT,
+        Provider::Interaxo => INTERAXO_OFF_TEXT,
+        // Every build offers ACC; the wording is there for completeness only.
+        Provider::Acc => "ACC ingår inte i den här versionen av Synka.",
+    }
+}
+
+/// Built-in APS app (Desktop/SPA type, Authorization Code + PKCE, no secret), named "Synka" in
+/// the APS developer portal. A public client id is not a secret.
 pub const DEFAULT_CLIENT_ID: &str = "tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +138,7 @@ pub struct Config {
     /// Log level filter, e.g. "info" or "synka_engine=debug".
     pub log_level: String,
     /// Optional GitHub release channel "owner/repo". Empty (default): the engine never checks for
-    /// updates; staff update from the internal OneDrive share.
+    /// updates; a new version is installed from its zip (`packaging/README.md`).
     pub update_channel: String,
     /// Install updates by themselves when nothing is syncing. Only applies with an update_channel.
     pub auto_update: bool,
@@ -139,6 +156,10 @@ pub struct Config {
     pub interaxo_redirect_uri: Option<String>,
     /// The Interaxo client secret: DPAPI-protected and base64-encoded (see `protect_secret`).
     pub interaxo_client_secret_protected: Option<String>,
+    /// The ACC-only build: set at start from `ACC_ONLY`, never read from or written to settings.json.
+    /// ACC is then the one provider, whatever `interaxo_enabled` says.
+    #[serde(skip)]
+    pub acc_only: bool,
 }
 
 impl Default for Config {
@@ -158,6 +179,7 @@ impl Default for Config {
             interaxo_client_id: None,
             interaxo_redirect_uri: None,
             interaxo_client_secret_protected: None,
+            acc_only: false,
         }
     }
 }
@@ -286,6 +308,19 @@ impl Config {
 
     pub fn client_id(&self) -> String {
         self.effective_client_id().0.to_string()
+    }
+
+    /// The providers this build contains, in account order: ACC alone in the ACC-only build.
+    pub fn built_providers(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| *p == Provider::Acc || !self.acc_only)
+            .collect()
+    }
+
+    /// Interaxo is on: `interaxo_enabled`, and never in the ACC-only build.
+    pub fn interaxo_on(&self) -> bool {
+        self.interaxo_enabled && !self.acc_only
     }
 
     /// The Interaxo client as configured. The id is trimmed ("" when not configured), the
@@ -538,6 +573,32 @@ mod tests {
                 .unwrap()
                 .interaxo_enabled
         );
+    }
+
+    #[test]
+    fn the_default_build_has_every_provider() {
+        let config = Config::default();
+        assert!(!config.acc_only);
+        assert_eq!(config.built_providers(), Provider::ALL.to_vec());
+        assert!(!config.interaxo_on());
+        let on: Config = serde_json::from_str(r#"{"interaxo_enabled":true}"#).unwrap();
+        assert!(on.interaxo_on());
+    }
+
+    #[test]
+    fn the_acc_only_build_has_acc_alone_whatever_settings_json_says() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"interaxo_enabled":true,"acc_only":false}"#).unwrap();
+        config.acc_only = true;
+        assert_eq!(config.built_providers(), vec![Provider::Acc]);
+        assert!(!config.interaxo_on());
+        // The build is never written to settings.json, nor read from it.
+        let saved = serde_json::to_value(&config).unwrap();
+        assert!(saved.get("acc_only").is_none());
+        let read: Config = serde_json::from_str(r#"{"acc_only":true}"#).unwrap();
+        assert!(!read.acc_only);
+        assert_eq!(off_text(Provider::StreamBim), STREAMBIM_OFF_TEXT);
+        assert_eq!(off_text(Provider::Interaxo), INTERAXO_OFF_TEXT);
     }
 
     #[test]

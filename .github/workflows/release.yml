@@ -9,9 +9,9 @@
 #   build    (windows)  checks out the tag; tag == Cargo.toml version; cargo test;
 #            cargo build --release; build_msix.ps1 signs with SIGNING_PFX_BASE64;
 #            the signature is verified; make_delivery.ps1 packs the sideload zip
-#   publish  (ubuntu)  GitHub release on this (private) repository with the zip, the
-#            signed msix and FastADC.cer. There is no public mirror: staff get the zip
-#            from the OneDrive share (packaging/share_release.ps1).
+#   publish  (ubuntu)  GitHub release on this (public) repository with the zip, the
+#            signed msix and FastADC.cer. The OneDrive copy for Byggstyrning's staff is
+#            a separate step (packaging/share_release.ps1).
 
 # A tag pushed with GITHUB_TOKEN starts no workflow: build and publish run here,
 # as jobs of the dispatch run.
@@ -424,7 +424,7 @@ jobs:
             sed "s/@VERSION@/$VERSION/g" <<'EOF'
           ## Installera
 
-          Ladda ner `Synka-@VERSION@-sidladdning.zip`, packa upp HELA zip-filen och dubbelklicka på `Install.cmd`. Windows frågar efter administratörsrätt en gång per dator, för certifikatet. Nya versioner delas också via den interna OneDrive-mappen Synka. Har datorn Better Desktop Connector installerad tar Install.cmd bort den först (se README.txt).
+          Ladda ner `Synka-@VERSION@-sidladdning.zip`, packa upp HELA zip-filen och dubbelklicka på `Install.cmd`. Windows frågar efter administratörsrätt en gång per dator, för certifikatet. Synka söker inte efter uppdateringar själv: en ny version installeras på samma sätt. Har datorn appen under ett äldre paketnamn tar Install.cmd bort det först (se README.txt).
 
           Krav: Windows 10 version 2004 (build 19041) eller senare, x64.
 

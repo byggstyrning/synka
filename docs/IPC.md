@@ -62,7 +62,7 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 |---|---|
 | `status` | `signed_in` bool, `user` `{name,email}` or null, `state` one of `signed_out`,`synced`,`syncing`,`waiting`,`attention`,`offline`,`error`, `text` (Swedish one-liner), `error` string or null, `pending_jobs`, `failed_jobs`, `transfers` `[{name, project, direction:"down"\|"up", done, total}]` (bytes), `sync_root` (abs path), `held_deletes` `[{project_id, project, count}]` (delete bursts waiting for `confirm_deletes`; a folder counts its contents), `local_bytes` (bytes of file data on disk across projects, null until first counted), `engine_version`, `accounts` `[{provider, account, label, configured, signed_in, signing_in, user:{name,email}\|null, host}]` (`acc` first, then one entry per StreamBIM account that is signed in or signing in, sorted by key, then `interaxo`; `account` is the StreamBIM account key, null for the others) |
 | `projects` | `loading` bool, `hubs` `[{id, name, provider, projects:[{id, name, subscribed, local_path}]}]` (sorted by name) |
-| `settings` | `propagate_deletes`, `max_downloads`, `max_uploads`, `poll_active_secs`, `log_level`, `start_at_login`, `auto_update`, `sync_root`, `client_id_configured`, `aps_client_id` (string or null), `aps_client_id_override_supported` (bool), `aps_client_id_validation_supported` (bool), `update_channel_configured` (bool; false = no update channel, the window hides update controls), `providers` (`["acc","streambim","interaxo"]`), `interaxo_client_id` (string or null), `interaxo_redirect_uri` (effective), `interaxo_redirect_uri_default`, `interaxo_client_secret_set` (bool) |
+| `settings` | `propagate_deletes`, `max_downloads`, `max_uploads`, `poll_active_secs`, `log_level`, `start_at_login`, `auto_update`, `sync_root`, `client_id_configured`, `aps_client_id` (string or null), `aps_client_id_override_supported` (bool), `aps_client_id_validation_supported` (bool), `update_channel_configured` (bool; false = no update channel, the window hides update controls), `providers` (`["acc","streambim","interaxo"]`: offered now), `build_providers` (`["acc","streambim","interaxo"]`, or `["acc"]` in the ACC-only build: the window shows nothing of a provider outside it), `interaxo_client_id` (string or null), `interaxo_redirect_uri` (effective), `interaxo_redirect_uri_default`, `interaxo_client_secret_set` (bool) |
 | `sign_in_progress` | `provider`, `account` (StreamBIM key or null), `state` (`browser`\|`mfa_required`\|`signed_in`\|`failed`\|`cancelled`), `error` (Swedish text or null) |
 | `streambim_regions` | `regions` `[{subdomain, title, is_default}]` |
 | `aps_client_id_validation` | `request_id`, `state` (`testing`\|`saved`\|`failed`\|`cancelled`), `error` (safe text or null). Recent per-request outcomes replay on hello/reconnect |
@@ -113,6 +113,12 @@ See `docs/PROVIDERS.md`. Clarifications:
   the ack with "Interaxo-inloggning är avstängd i den här versionen.", and Interaxo is not listed,
   polled or subscribed. An Interaxo session file from earlier is kept and ignored.
   `cancel_sign_in` and `sign_out` for `interaxo` still work.
+- **The ACC-only build** (`cargo build --features acc-only`, `docs/MARKETPLACE.md`) offers ACC
+  alone, whatever `settings.json` says: `settings.providers` and `settings.build_providers` are
+  `["acc"]`, `status.accounts` has the ACC entry only, and `sign_in` and `sign_in_mfa` for
+  `streambim` and `streambim_regions` are refused in the ack with "StreamBIM ingår inte i den här
+  versionen av Synka." (Interaxo as above). No StreamBIM session is read from disk, and nothing
+  is fetched from StreamBIM or Interaxo.
 - **`projects`.** `hubs[].provider` is `acc`, `streambim` or `interaxo`. Hub ids and project ids
   are unique across providers (`docs/PROVIDERS.md`). A signed-out provider's subscribed projects
   stay listed (from the store, with `subscribed` true) so they can be unsubscribed; subscribing

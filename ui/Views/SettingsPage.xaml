@@ -17,7 +17,7 @@
 
             <!-- The accounts, their servers and the client settings are on the Konton page. -->
             <tk:SettingsCard Header="{loc:T Sv='Konton', En='Accounts'}"
-                             Description="{loc:T Sv='Inloggningar, StreamBIM-servrar och klientinställningar finns på sidan Konton.', En='Sign-ins, StreamBIM servers and client settings are on the Accounts page.'}">
+                             Description="{loc:T Sv='Inloggningar och klientinställningar finns på sidan Konton.', En='Sign-ins and client settings are on the Accounts page.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE716;" />
                 </tk:SettingsCard.HeaderIcon>
@@ -211,7 +211,7 @@
             <!-- Shown instead of the update controls when there is no update channel. -->
             <tk:SettingsCard x:Name="UpdateInfoCard"
                              Header="{loc:T Sv='Uppdateringar', En='Updates'}"
-                             Description="{loc:T Sv='Nya versioner av Synka delas via den interna OneDrive-mappen. Packa upp den nya zip-filen och kör Install.cmd; dina inställningar behålls.', En='New versions of Synka are shared through the internal OneDrive folder. Unpack the new zip and run Install.cmd; your settings are kept.'}">
+                             Description="{loc:T Sv='Synka söker inte efter uppdateringar själv. Installera en ny version från dess zip-fil: packa upp den och kör Install.cmd; dina inställningar behålls.', En='Synka does not check for updates by itself. Install a new version from its zip file: unpack it and run Install.cmd; your settings are kept.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE777;" />
                 </tk:SettingsCard.HeaderIcon>
