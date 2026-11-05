@@ -20,7 +20,8 @@
       0. Clean ui\AppPackages and dist\ (dist\store\ is kept).
       1. cargo test                       (skipped with -SkipTests)
       2. cargo build --release            -> target\release\synka-engine.exe
-                                          (skipped with -SkipEngineBuild)
+                                          (skipped with -SkipEngineBuild;
+                                           --features acc-only with -AccOnly)
          -Sign: sign and timestamp the engine with the existing release certificate
       3. dotnet build of ui\Synka.csproj, Release x64, GenerateAppxPackageOnBuild
       4. Find the .msix and the x64 framework, verify the package contents
@@ -59,6 +60,12 @@
     builds it in its own step or job). Stops when it is missing. A signed build
     still signs and timestamps that engine before packing it into the MSIX.
 
+.PARAMETER AccOnly
+    Build the ACC-only engine (cargo feature acc-only, docs/MARKETPLACE.md): ACC is the
+    one provider, and the window shows no StreamBIM or Interaxo sign-in. Without it the
+    package has all three providers, as before. Refused with -SkipEngineBuild, which
+    cannot tell how the engine in target\release was built.
+
 .PARAMETER PfxPath
     Sign with the key in this .pfx file instead of the certificate store. Implies
     -Sign, and never creates a key. The certificate must be issued to
@@ -81,6 +88,7 @@
     powershell -NoProfile -File packaging\build_msix.ps1 -SkipTests
     powershell -NoProfile -File packaging\build_msix.ps1 -SkipTests -Sign
     powershell -NoProfile -File packaging\build_msix.ps1 -SkipTests -Sign -Install
+    powershell -NoProfile -File packaging\build_msix.ps1 -Sign -AccOnly
     & .\packaging\build_msix.ps1 -SkipTests -PfxPath C:\keys\FastADC.pfx -PfxPassword (Read-Host -AsSecureString)
 #>
 [CmdletBinding()]
@@ -89,6 +97,7 @@ param(
     [switch]$Install,
     [switch]$SkipTests,
     [switch]$SkipEngineBuild,
+    [switch]$AccOnly,
     [string]$PfxPath,
     [SecureString]$PfxPassword,
     [string]$PublisherCN = "CN=FastADC",
@@ -107,6 +116,9 @@ $packageName = "Byggstyrning.Synka"
 . (Join-Path $PSScriptRoot "assert-package-engine.ps1")
 
 if ($PfxPath) { $Sign = $true }
+if ($AccOnly -and $SkipEngineBuild) {
+    throw "-AccOnly builds the engine itself; it cannot be combined with -SkipEngineBuild."
+}
 if ($Install -and -not $Sign) { throw "-Install needs -Sign: Windows refuses an unsigned package." }
 
 function Invoke-Native {
@@ -299,7 +311,9 @@ try {
         Write-Host "== 2. Engine: the one already in target\release (-SkipEngineBuild) ==" -ForegroundColor DarkGray
     }
     else {
-        Write-Host "== 2. Building the engine (cargo build --release) ==" -ForegroundColor Cyan
+        $buildArgs = @("build", "--release")
+        if ($AccOnly) { $buildArgs += @("--features", "acc-only") }
+        Write-Host "== 2. Building the engine (cargo $($buildArgs -join ' ')) ==" -ForegroundColor Cyan
         # Panic locations carry source paths, and the dependencies' paths start with
         # the builder's profile (C:\Users\<name>\.cargo\registry\...). The release gate
         # refuses a user name in a package, so the profile is written as "~".
@@ -307,7 +321,7 @@ try {
         $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
         $remap = "--remap-path-prefix=$($env:USERPROFILE)=~"
         $env:CARGO_ENCODED_RUSTFLAGS = if ($previousFlags) { "$previousFlags$([char]0x1f)$remap" } else { $remap }
-        try { Invoke-Native $cargo @("build", "--release") "cargo build --release" }
+        try { Invoke-Native $cargo $buildArgs "cargo $($buildArgs -join ' ')" }
         finally { $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags }
     }
 }

@@ -18,7 +18,7 @@
     med samma nummer lämnas orörd så att LocalState aldrig behöver kopieras medan
     synkmotorn kan skriva i sin SQLite-databas.
 
-    Äldre paket (Better Desktop Connector, FastADC) tas bort efter en fråga.
+    Appen under en tidigare paketidentitet tas bort efter en fråga.
 #>
 [CmdletBinding()]
 param(
@@ -112,12 +112,12 @@ $runtime = Get-ChildItem (Join-Path $here "Dependencies") -Recurse -Filter "Micr
     Select-Object -First 1
 if (-not $runtime) { Stop-With "Ramverket hittades inte under Dependencies\. Packade du upp HELA zip-filen?" }
 
-# Better Desktop Connector (and the older FastADC build) is the same app under an old
-# package identity. It cannot be upgraded in place; it must be removed first.
+# The earlier package identities of this same app. Such a package cannot be upgraded in
+# place; it must be removed first.
 $legacyNames = @("Byggstyrning.BetterDesktopConnector", "Byggstyrning.FastADC")
 $legacy = @($legacyNames | ForEach-Object { Get-AppxPackage -Name $_ -ErrorAction SilentlyContinue })
 if ($legacy.Count -gt 0) {
-    Say "  En äldre version av appen är installerad ($(@($legacy.Name) -join ', '))." Yellow
+    Say "  En tidigare version av appen är installerad, under en äldre paketidentitet." Yellow
     Say "  Synka ersätter den och måste ta bort den först. Kontrollera innan dess att den gamla" DarkGray
     Say "  appen visar 'Synkad' utan väntande ändringar: det som inte har synkats laddas inte upp" DarkGray
     Say "  av Synka. Gamla filer finns kvar i %USERPROFILE%\BDC; Synka använder %USERPROFILE%\Synka." DarkGray
@@ -125,7 +125,7 @@ if ($legacy.Count -gt 0) {
     $answer = Read-Host "  Ta bort den äldre appen nu? (j/n)"
     if ($answer -notmatch '^(j|ja|y|yes)$') { Stop-With "Ingenting ändrades. Kör Install.cmd igen när du vill byta till Synka." }
     foreach ($old in $legacy) {
-        try { Remove-AppxPackage -Package $old.PackageFullName -ErrorAction Stop; Say "        borttagen: $($old.Name)" Green }
+        try { Remove-AppxPackage -Package $old.PackageFullName -ErrorAction Stop; Say "        den tidigare versionen är borttagen" Green }
         catch { Stop-With "Den äldre appen kunde inte tas bort: $($_.Exception.Message)" }
     }
 }

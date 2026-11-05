@@ -248,6 +248,9 @@ public sealed partial class AccountsPage : Page
 
     private void RefreshStreamBimSection(bool connected)
     {
+        // The ACC-only build has no StreamBIM: no section at all.
+        Show(StreamBimSection, _engine.ProviderInBuild(ProviderNames.StreamBim));
+
         var shown = connected
             ? _engine.StreamBimAccounts
                 .Where(account => (account.SignedIn || account.SigningIn) && !string.IsNullOrEmpty(account.Account))
@@ -264,10 +267,13 @@ public sealed partial class AccountsPage : Page
 
     /// <summary>
     /// Interaxo while the engine leaves it out of settings.providers (turned off for now): the name and one
-    /// muted line. No sign-in, no account card, no client settings, and no failure bar.
+    /// muted line. No sign-in, no account card, no client settings, and no failure bar. The ACC-only
+    /// build has no Interaxo: no section at all.
     /// </summary>
     private void RefreshInteraxoSection(bool connected)
     {
+        Show(InteraxoSection, _engine.ProviderInBuild(ProviderNames.Interaxo));
+
         var offered = _engine.ProviderOffered(ProviderNames.Interaxo);
         Show(InteraxoCaption, offered);
         Show(InteraxoOffText, !offered);

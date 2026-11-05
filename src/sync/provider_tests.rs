@@ -2,7 +2,9 @@
 //! polls and jobs, and the folder and rename rules of a provider without folder creation
 //! (Interaxo, `remote::caps`).
 
-use super::tests::{client_override_signed_in, fixture, fixture_interaxo_off, row, Fixture};
+use super::tests::{
+    client_override_signed_in, fixture, fixture_acc_only, fixture_interaxo_off, row, Fixture,
+};
 use super::*;
 use crate::app::Secret;
 use crate::config::protect_secret;
@@ -356,6 +358,90 @@ async fn a_disabled_interaxo_is_signed_out_for_the_list_polls_and_jobs() {
         f.ctx.paths.state_dir.join("token-interaxo.bin").exists(),
         "the session file is kept"
     );
+}
+
+#[test]
+fn the_acc_only_build_offers_and_reports_acc_alone() {
+    let f = fixture_acc_only("acc-only-view");
+    let engine = Engine::new(f.ctx.clone());
+    engine.publish_settings();
+    let view = f
+        ._rx
+        .try_iter()
+        .find_map(|m| match m {
+            UiMsg::Settings(view) => Some(view),
+            _ => None,
+        })
+        .expect("a settings event");
+    assert_eq!(view.providers, vec!["acc"]);
+    assert_eq!(view.build_providers, vec!["acc"]);
+    engine.publish_now();
+    let status = last_status(&f);
+    assert_eq!(
+        status
+            .accounts
+            .iter()
+            .map(|account| account.provider)
+            .collect::<Vec<_>>(),
+        vec![Provider::Acc]
+    );
+
+    // The default build reports all three as built, whatever is offered.
+    let full = fixture_interaxo_off("acc-only-full-view");
+    let engine = Engine::new(full.ctx.clone());
+    engine.publish_settings();
+    let view = full
+        ._rx
+        .try_iter()
+        .find_map(|m| match m {
+            UiMsg::Settings(view) => Some(view),
+            _ => None,
+        })
+        .expect("a settings event");
+    assert_eq!(view.build_providers, vec!["acc", "streambim", "interaxo"]);
+}
+
+#[tokio::test]
+async fn the_acc_only_build_ignores_streambim_and_interaxo_sessions_and_refuses_sign_in() {
+    let mut f = fixture_acc_only("acc-only-gating");
+    // Sessions from a default build stay on disk and are ignored, not deleted.
+    streambim_signed_in(&mut f, "app");
+    interaxo_signed_in(&mut f);
+    for provider in [Provider::StreamBim, Provider::Interaxo] {
+        assert!(!f.ctx.offers(provider));
+        assert!(!f.ctx.signed_in(provider), "{provider:?}");
+        assert!(f.ctx.user_for(provider).is_none(), "{provider:?}");
+        let p = other_provider_project(&f, provider);
+        assert!(!f.ctx.project_connected(&p), "{provider:?}");
+    }
+    assert!(!f.ctx.any_signed_in());
+
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let (tx, _) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignIn {
+                provider: Provider::Interaxo,
+                streambim: None,
+            },
+            &mut live,
+            &tx,
+        )
+        .await;
+    assert!(live.sign_ins.is_empty(), "no browser attempt started");
+    assert_eq!(notices(&f, INTERAXO_OFF), 1);
+
+    engine
+        .on_cmd(TrayCmd::StreamBimRegions, &mut live, &tx)
+        .await;
+    assert!(
+        f._rx
+            .try_iter()
+            .all(|m| !matches!(m, UiMsg::StreamBimRegions(_))),
+        "no region list is fetched"
+    );
+    assert!(f.ctx.paths.state_dir.join("token-interaxo.bin").exists());
 }
 
 #[tokio::test]

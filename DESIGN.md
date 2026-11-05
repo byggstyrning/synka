@@ -115,8 +115,9 @@ packaging/       AppxManifest, build_msix.ps1, new_release.ps1, make_delivery.ps
 9. **MSIX**: full-trust packaged desktop app, `windows.startupTask` (start at sign-in),
    self-signed `CN=FastADC` for sideload (certificate name kept; see `packaging/README.md`).
    Release flow copied from Koordinatverktyget (bump → tag → build → sign → zip with Install.cmd
-   + .cer → private release → internal OneDrive share). **No public mirror.** The in-app updater
-   is off unless `update_channel` is set; staff update via the OneDrive share.
+   + .cer → GitHub release on this public repository; Byggstyrning's staff also get it through
+   BoomerHubb and the OneDrive share). The in-app updater is off unless `update_channel` is set.
+   The ACC-only build (`--features acc-only`, `docs/MARKETPLACE.md`) offers ACC alone.
    TODO(owner): a new trusted signing certificate, see `packaging/README.md`.
 10. **No emulation of Autodesk local services.** Synka never binds a named pipe whose name
     contains `Autodesk` or `DesktopConnector` (`ipc::check_pipe_name`). Revit-link emulation

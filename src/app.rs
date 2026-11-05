@@ -45,15 +45,21 @@ impl Ctx {
             .clone()
     }
 
-    /// Interaxo is turned on: `interaxo_enabled` in settings.json, read at start (not an IPC setting).
+    /// Interaxo is turned on: `interaxo_enabled` in settings.json, read at start (not an IPC setting),
+    /// and never in the ACC-only build.
     pub fn interaxo_enabled(&self) -> bool {
-        self.cfg.interaxo_enabled
+        self.cfg.interaxo_on()
     }
 
-    /// Whether the engine offers a provider: it signs in, lists, polls and publishes it. Only Interaxo
-    /// can be off (see `interaxo_enabled`). An Interaxo session file on disk is not deleted either way.
+    /// Whether the engine offers a provider: it signs in, lists, polls and publishes it. ACC always;
+    /// StreamBIM unless this is the ACC-only build (`Config::acc_only`); Interaxo while
+    /// `interaxo_enabled`. A session file of a provider that is not offered is not deleted.
     pub fn offers(&self, p: Provider) -> bool {
-        p != Provider::Interaxo || self.interaxo_enabled()
+        match p {
+            Provider::Acc => true,
+            Provider::StreamBim => !self.cfg.acc_only,
+            Provider::Interaxo => self.interaxo_enabled(),
+        }
     }
 
     /// The offered providers, in account order (`settings.providers`).
@@ -64,14 +70,15 @@ impl Ctx {
             .collect()
     }
 
-    /// True when that provider's account has a usable session. StreamBIM: any account. An Interaxo
-    /// session counts only while Interaxo is enabled.
+    /// True when that provider's account has a usable session. StreamBIM: any account. A session
+    /// counts only while the engine offers its provider.
     pub fn signed_in(&self, p: Provider) -> bool {
-        match p {
-            Provider::Acc => self.auth.is_signed_in(),
-            Provider::StreamBim => self.streambim.any_signed_in(),
-            Provider::Interaxo => self.interaxo_enabled() && self.interaxo.is_signed_in(),
-        }
+        self.offers(p)
+            && match p {
+                Provider::Acc => self.auth.is_signed_in(),
+                Provider::StreamBim => self.streambim.any_signed_in(),
+                Provider::Interaxo => self.interaxo.is_signed_in(),
+            }
     }
 
     /// True when at least one provider is signed in.
@@ -81,6 +88,9 @@ impl Ctx {
 
     /// The signed-in user of one provider, if any. StreamBIM: the first signed-in account's user.
     pub fn user_for(&self, p: Provider) -> Option<UserInfo> {
+        if !self.offers(p) {
+            return None;
+        }
         match p {
             Provider::Acc => self.auth.user(),
             Provider::StreamBim => self
@@ -88,10 +98,7 @@ impl Ctx {
                 .signed_in()
                 .first()
                 .and_then(|account| account.auth.user()),
-            Provider::Interaxo => self
-                .interaxo_enabled()
-                .then(|| self.interaxo.user())
-                .flatten(),
+            Provider::Interaxo => self.interaxo.user(),
         }
     }
 
@@ -100,10 +107,13 @@ impl Ctx {
     /// one of a signed-out provider.
     pub fn project_connected(&self, p: &Project) -> bool {
         match p.provider {
-            Provider::StreamBim => self
-                .streambim
-                .for_project(p)
-                .is_some_and(|account| account.auth.is_signed_in()),
+            Provider::StreamBim => {
+                self.offers(Provider::StreamBim)
+                    && self
+                        .streambim
+                        .for_project(p)
+                        .is_some_and(|account| account.auth.is_signed_in())
+            }
             other => self.signed_in(other),
         }
     }
@@ -111,10 +121,13 @@ impl Ctx {
     /// True when the StreamBIM account of a hub is signed in (other providers: as `signed_in`).
     pub fn hub_connected(&self, hub: &HubInfo) -> bool {
         match hub.provider {
-            Provider::StreamBim => self
-                .streambim
-                .for_hub(hub)
-                .is_some_and(|account| account.auth.is_signed_in()),
+            Provider::StreamBim => {
+                self.offers(Provider::StreamBim)
+                    && self
+                        .streambim
+                        .for_hub(hub)
+                        .is_some_and(|account| account.auth.is_signed_in())
+            }
             other => self.signed_in(other),
         }
     }
@@ -285,6 +298,9 @@ pub struct SettingsView {
     pub aps_client_id_validation_supported: bool,
     /// The providers the engine offers, in account order (Interaxo only while `interaxo_enabled`).
     pub providers: Vec<&'static str>,
+    /// The providers this build contains, in account order: `["acc"]` in the ACC-only build. The
+    /// window shows nothing of a provider outside it.
+    pub build_providers: Vec<&'static str>,
     /// Saved Interaxo client id (trimmed), or None.
     pub interaxo_client_id: Option<String>,
     /// The redirect URI in use (saved, or the default).

@@ -293,6 +293,37 @@ public sealed class EngineClient : INotifyPropertyChanged
     }
 
     /// <summary>
+    /// The providers the engine offers, in account order (`settings.providers`). An engine that
+    /// does not send the list (older) offers every provider.
+    /// </summary>
+    public IReadOnlyList<string> OfferedProviders => _settings?.Providers ?? AllProviders;
+
+    private static readonly string[] AllProviders = { "acc", "streambim", "interaxo" };
+
+    /// <summary>
+    /// True when the engine's build contains this provider (`settings.build_providers`). The ACC-only
+    /// build contains ACC alone, and the window then shows nothing of the others. Before the first
+    /// settings, and from an engine that does not send the list (older), every provider is in the build.
+    /// </summary>
+    public bool ProviderInBuild(string provider)
+    {
+        var built = _settings?.BuildProviders;
+        if (built is null)
+        {
+            return true;
+        }
+
+        foreach (var name in built)
+        {
+            if (string.Equals(name, provider, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// The StreamBIM accounts the engine reports (one per server that is signed in or signing
     /// in), in the engine's order. Empty before the first status and from an older engine.
     /// </summary>

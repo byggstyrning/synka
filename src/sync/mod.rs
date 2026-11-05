@@ -2566,13 +2566,8 @@ impl Engine {
         };
         match cmd {
             // The IPC layer refuses this in the ack already; the engine refuses it too.
-            TrayCmd::SignIn {
-                provider: Provider::Interaxo,
-                ..
-            } if !self.ctx.interaxo_enabled() => {
-                self.ctx
-                    .ui
-                    .send(UiMsg::notify(Severity::Warning, INTERAXO_OFF_TEXT));
+            TrayCmd::SignIn { provider, .. } if !self.ctx.offers(provider) => {
+                self.refuse_command(&cmd, crate::config::off_text(provider));
             }
             TrayCmd::SignIn {
                 provider,
@@ -2664,6 +2659,8 @@ impl Engine {
                 self.publish();
             }
             TrayCmd::SignOut { provider, account } => self.sign_out(provider, account, live).await,
+            // Refused by the IPC layer in the ACC-only build; nothing is fetched from StreamBIM there.
+            TrayCmd::StreamBimRegions if !self.ctx.offers(Provider::StreamBim) => {}
             TrayCmd::StreamBimRegions => {
                 let client = self.ctx.api.client().clone();
                 let ui = self.ctx.ui.clone();
@@ -3763,18 +3760,22 @@ impl Engine {
                 .flatten(),
             host: None,
         });
-        let mut keys: std::collections::BTreeSet<String> = self
-            .ctx
-            .streambim
-            .signed_in()
-            .into_iter()
-            .map(|account| account.key)
-            .collect();
-        keys.extend(signing.iter().filter_map(|(provider, key)| {
-            (*provider == Provider::StreamBim)
-                .then(|| key.clone())
-                .flatten()
-        }));
+        // No StreamBIM entry in the ACC-only build.
+        let mut keys = std::collections::BTreeSet::<String>::new();
+        if self.ctx.offers(Provider::StreamBim) {
+            keys.extend(
+                self.ctx
+                    .streambim
+                    .signed_in()
+                    .into_iter()
+                    .map(|account| account.key),
+            );
+            keys.extend(signing.iter().filter_map(|(provider, key)| {
+                (*provider == Provider::StreamBim)
+                    .then(|| key.clone())
+                    .flatten()
+            }));
+        }
         for key in keys {
             let account = self.ctx.streambim.get(&key);
             let signed_in = account
@@ -3847,6 +3848,13 @@ impl Engine {
             providers: self
                 .ctx
                 .offered_providers()
+                .into_iter()
+                .map(Provider::as_str)
+                .collect(),
+            build_providers: self
+                .ctx
+                .cfg
+                .built_providers()
                 .into_iter()
                 .map(Provider::as_str)
                 .collect(),
@@ -9811,6 +9819,21 @@ pub(crate) mod tests {
     /// The fixture as a fresh install has it: Interaxo off (`interaxo_enabled` false).
     pub(crate) fn fixture_interaxo_off(tag: &str) -> Fixture {
         fixture_with(tag, false)
+    }
+
+    /// The fixture of the ACC-only build (`Config::acc_only`), with `interaxo_enabled` true in its
+    /// settings.json to show that the build wins.
+    pub(crate) fn fixture_acc_only(tag: &str) -> Fixture {
+        let mut f = fixture_with(tag, true);
+        let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+        ctx.cfg.acc_only = true;
+        ctx.settings.get_mut().unwrap().acc_only = true;
+        ctx.ui.hub = Arc::new(crate::ipc::IpcHub::offering(
+            ctx.paths.sync_root.clone(),
+            false,
+            false,
+        ));
+        f
     }
 
     fn fixture_with(tag: &str, interaxo_enabled: bool) -> Fixture {

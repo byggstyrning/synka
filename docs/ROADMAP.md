@@ -15,8 +15,9 @@ Everything marked **verified** was measured on this machine against the real ACC
 | WinUI window (`ui\`) | Reviewed against the contract; C# type-checks against the real reference assemblies; the XAML is compiled only in CI. |
 | Explorer integration | **Verified on the live sync root**: native Cloud Files availability/status and right-click *Behåll alltid på denna enhet* / *Frigör utrymme*. Custom COM verbs, columns and status flyout are built but not attached to the shipped Cloud Files extension. |
 | Packaging and release | CI on pull requests and main (`.github/workflows/ci.yml`); one-click release (`release.yml`, Actions → Release → Run workflow). Needs the secrets in `packaging/README.md`. |
-| Release channel | **Off by design** (legal review 2026-10). There is no public mirror. Staff update from the internal OneDrive share. The in-app check stays in code, off unless `update_channel` is set. |
-| Name | The product is **Synka** (package `Byggstyrning.Synka`). Earlier names: Better Desktop Connector (`Byggstyrning.BetterDesktopConnector`) and FastADC (`Byggstyrning.FastADC`). Those packages must be uninstalled first (Install.cmd offers it). The signing certificate is still `CN=FastADC` (TODO, see `packaging/README.md`). |
+| Release channel | Releases are published on this repository's GitHub releases (the repository is public). The Design and Make Marketplace listing is pending review (`docs/MARKETPLACE.md`). Byggstyrning's staff also update through BoomerHubb and the OneDrive share. The in-app check stays in code, off unless `update_channel` is set. |
+| Builds | The default build syncs ACC, StreamBIM and Interaxo; the ACC-only build (`--features acc-only`, `build_msix.ps1 -AccOnly`) syncs ACC alone (`docs/MARKETPLACE.md`). |
+| Name | The product is **Synka** (package `Byggstyrning.Synka`). Earlier builds of the app used other package identities (listed in `packaging/delivery/Install.ps1`); such a package must be uninstalled first (Install.cmd offers it). The signing certificate is still `CN=FastADC` (TODO, see `packaging/README.md`). |
 
 ## Multi-provider: StreamBIM and Interaxo (2026-10-20, not yet verified live)
 
@@ -118,7 +119,7 @@ Interaxo (a test client from Interaxo support):
 ## Verify on a real Windows 11 machine (first thing next session)
 
 1. CI is green (engine tests, clippy `-D warnings`, MSIX build). Then install the CI artifact.
-2. Uninstall `Byggstyrning.FastADC` (and `Byggstyrning.BetterDesktopConnector`, if present);
+2. Uninstall any package of the app under an earlier package identity (Install.cmd offers it);
    install; sign in; subscribe *Köpmannen*; browse, open, edit, save from Word, AutoCAD and
    Revit: each save is a **new version**, not a new file.
 3. Conflict: edit a file locally while someone uploads a new version → both files exist.
@@ -189,7 +190,7 @@ Interaxo (a test client from Interaxo support):
 
 ## Release checklist (before the next release)
 
-1. `git` remote exists (`byggstyrning/synka`, private; the old `byggstyrning/better-desktop-connector` is archived). Done.
+1. `git` remote exists (`byggstyrning/synka`, public; the repository of an earlier package identity is archived). Done.
 2. Export the `CN=FastADC` certificate with its private key to a `.pfx` kept outside git and
    OneDrive, and store it as the repository secrets `SIGNING_PFX_BASE64` and
    `SIGNING_PFX_PASSWORD`. Steps in `packaging/README.md`.
@@ -197,12 +198,12 @@ Interaxo (a test client from Interaxo support):
    the MSIX builds on a GitHub runner.
 4. Actions -> Release -> Run workflow, with Swedish release notes in `notes`.
    (`packaging\new_release.ps1 -DryRun` still works locally and hands over to the workflow.)
-5. Share the signed zip on the internal OneDrive share (`packaging\share_release.ps1`).
+5. Copy the signed zip to the OneDrive share for Byggstyrning's staff (`packaging\share_release.ps1`).
 6. Add the release rule to `.claude\CLAUDE.md` the same way Koordinatverktyget does.
 
-## Migration to Synka
+## Migration from an earlier package identity
 
-For a PC that had the earlier names installed (Better Desktop Connector, FastADC):
+For a PC that has the app installed under an earlier package identity:
 
 1. Check that the old app shows synced with nothing pending.
 2. Run the new `Install.cmd`. It asks to remove the old package first, then installs Synka.
@@ -219,4 +220,5 @@ The steps match `packaging/delivery/README.txt`.
 - Sideload MSIX, same deployment model as Koordinatverktyget. Not the Store.
 - Swedish UI by default, English toggle.
 - Autodesk Desktop Connector is not used or required at runtime. Synka can run alongside it.
-- No public release channel. Internal sharing only.
+- Releases are public: this repository's GitHub releases and, once approved, the Design and Make
+  Marketplace. The in-app update channel stays off by default.

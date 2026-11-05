@@ -16,7 +16,7 @@ as new versions. Synka can run alongside Autodesk Desktop Connector without touc
   keep both copies; a mass delete waits for your confirmation; a reset never throws away
   unsynced work (it is saved to `%USERPROFILE%\Synka - återställda filer` first).
 - **Starts at sign-in:** the engine starts at sign-in and Windows restarts it after a crash.
-  New versions are shared internally; there is no online update check.
+  There is no online update check unless your organisation turns one on.
 - **Easy to start over:** in Settings, rebuild every project or move the sync folder to another
   drive (a move is a full rebuild, with the same rescue of unsynced work).
 
@@ -24,13 +24,20 @@ Swedish UI by default, English toggle.
 
 ## Use and data (read first)
 
-- Internal use by Byggstyrning staff only.
-- Synka never sends file content anywhere except between the PC and the platform the file
-  belongs to: Autodesk (the APS endpoints and Autodesk's file storage), StreamBIM (the signed-in
-  region's servers and the S3 storage they hand out upload links for) or Interaxo (its API hosts).
-  Synka has no telemetry.
-- The update check is off by default (`update_channel` is empty). Staff install and update through
-  BoomerHubb (private release channel `VilhelmH-git/Synka-releases`), or from the internal OneDrive share.
+- Synka is for people who work in ACC, StreamBIM or Interaxo projects on a Windows 10 or 11 PC.
+  It is an independent product of Byggstyrning (see [Trademarks](#trademarks)).
+  The ACC-only build (`--features acc-only`, see [docs/MARKETPLACE.md](docs/MARKETPLACE.md))
+  syncs ACC alone.
+- Synka sends your files and account data only between this PC and the platform they belong to:
+  Autodesk (the APS endpoints, its sign-in and Autodesk's file storage), StreamBIM (the servers
+  of the region you sign in to, the region list and the S3 storage they hand out links for) or
+  Interaxo (its sign-in service and API hosts). The ACC-only build contacts Autodesk alone.
+  Synka has no telemetry. Privacy policy: [docs/PRIVACY.md](docs/PRIVACY.md).
+- The update check is off by default (`update_channel` is empty). Releases are published on this
+  repository's [GitHub releases](https://github.com/byggstyrning/synka/releases) and, once the
+  listing is approved, on Autodesk's Design and Make Marketplace. Byggstyrning's own staff can
+  also install and update through BoomerHubb (release channel `VilhelmH-git/Synka-releases`) or
+  from the company's OneDrive share.
 - Each ACC hub's account admin must approve the Client ID as a Custom Integration, including
   client-owned hubs.
 - The undocumented dm/v3 desktop-sync feed is off by default (`desktop_sync_feed`, settings.json
@@ -44,7 +51,8 @@ Swedish UI by default, English toggle.
 
 ## Install (users)
 
-Download `Synka-<version>-sidladdning.zip` from the internal share, unpack all of it and
+Download `Synka-<version>-sidladdning.zip` from the
+[GitHub releases](https://github.com/byggstyrning/synka/releases), unpack all of it and
 double-click `Install.cmd`. See `packaging/delivery/README.txt`.
 
 ## Repository
@@ -86,6 +94,9 @@ each. Projects of every signed-in account appear on the Projects page, grouped b
 
 Interaxo is turned off by default for now: its section on the Konton page only says so, and its sign-in is refused. To turn it on, add `"interaxo_enabled": true` to `settings.json` in the app's LocalState folder (`%LOCALAPPDATA%\Packages\<PFN>\LocalState`), then restart the engine.
 
+The ACC-only build has neither StreamBIM nor Interaxo: the Konton page shows ACC alone, and
+`interaxo_enabled` has no effect there.
+
 ### Set up Interaxo (bring your own Client ID)
 
 Interaxo has no self-service app registration. Ask Interaxo support for a **Native** (public)
@@ -102,8 +113,10 @@ On Windows with Rust (stable, MSVC) and the .NET 8 SDK:
 
     cargo test
     cargo build --release
+    cargo build --release --features acc-only                                   # the ACC-only engine
     powershell -NoProfile -File packaging\build_msix.ps1 -SkipTests            # unsigned MSIX
     powershell -NoProfile -File packaging\build_msix.ps1 -SkipTests -Sign -Install
+    powershell -NoProfile -File packaging\build_msix.ps1 -Sign -AccOnly        # the ACC-only package
 
 Details, signing and the certificate: `packaging/README.md`.
 
@@ -185,9 +198,9 @@ is covered by the `#[ignore]` tests on Windows and by CI.
 ## Release
 
 Actions → **Release** → *Run workflow* (choose patch/minor/major, write the notes). The workflow
-bumps the version, tags, tests, builds and signs, then publishes the release to the private
-repository. The signed package is then shared internally (OneDrive, `share_release.ps1`). Setup
-(secrets, signing): `packaging/README.md`, section "Release from GitHub Actions".
+bumps the version, tags, tests, builds and signs, then publishes the release on this
+repository. A copy for Byggstyrning's staff goes to the OneDrive share (`share_release.ps1`).
+Setup (secrets, signing): `packaging/README.md`, section "Release from GitHub Actions".
 
 The version has one source: `[package] version` in `Cargo.toml`.
 
