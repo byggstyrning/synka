@@ -113,7 +113,11 @@ Interaxo (a test client from Interaxo support):
   - #9 (part) `.url/.lnk/.wsh` ignored, COM¹–³/LPT¹–³/CONIN$/CONOUT$ reserved;
   - rescue folders get a `LÄS MIG.txt`.
   Still open from it: #10 (USN-guarded "mark in sync"), a "not synced" reason column, a
-  non-destructive "Reparera" step before "Bygg om", sign-out through the same rescue.
+  non-destructive "Reparera" step before "Bygg om", sign-out through the same rescue (in part:
+  Windows turns populated placeholder folders into plain ones when the sync root is unregistered,
+  so at the next connect a project whose folder is plain is rebuilt with the rescue before the
+  reconcile pass, plain hub folders become placeholders again, and folders no synced project has
+  are set aside and removed with their files saved).
 
 ## Verify on a real Windows 11 machine (first thing next session)
 

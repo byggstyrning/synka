@@ -164,6 +164,55 @@ fn resilience_connected_reset_preserves_dirty_bytes_with_plain_and_placeholder_t
     }
 }
 
+#[test]
+#[ignore = "registers and connects a unique private Cloud Files root; run alone with --ignored --test-threads=1"]
+fn resilience_reverted_project_and_hub_folders_become_synka_folders_again() {
+    // Windows reverts populated placeholder folders to plain ones when a sync root is
+    // unregistered (a sign-out of everything, an uninstall). The fixture's plain tree is that.
+    let f = fixture("private-reverted");
+    let registration = connect_fixture(f.ctx.clone(), "reverted");
+    let hub = f.pdir.parent().unwrap().to_path_buf();
+    std::fs::write(f.dir.join("stale-copy.ifc"), b"reverted local copy").unwrap();
+    assert!(plain_dir(&hub) && plain_dir(&f.pdir));
+
+    let mut results = rebuild_reverted(&f.ctx);
+    assert_eq!(results.len(), 1);
+    let (name, result) = results.pop().unwrap();
+    let set = result.unwrap_or_else(|error| panic!("rebuild {name}: {error:#}"));
+    let info = |path: &Path| {
+        ph::placeholder_info(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{} is not a placeholder", path.display()))
+    };
+    assert_eq!(
+        ph::decode_identity(&info(&hub).identity),
+        Some((Kind::Hub, 0, f.p.hub_id.clone()))
+    );
+    assert!(info(&hub).in_sync, "the hub folder shows a pending state");
+    assert_eq!(
+        ph::decode_identity(&info(&f.pdir).identity),
+        Some((Kind::ProjectRoot, f.p.pid, f.p.root_id().to_string()))
+    );
+    assert!(rebuild_reverted(&f.ctx).is_empty(), "rebuilt twice");
+
+    let aside = set.aside.clone().expect("the plain tree set aside");
+    let (saved, destination) = finish_with(&f.ctx, &aside, &set.name, &leftover_intro(&set.name));
+    assert_eq!(saved, 1);
+    assert_eq!(
+        std::fs::read(
+            destination
+                .unwrap()
+                .join("Project Files")
+                .join("stale-copy.ifc")
+        )
+        .unwrap(),
+        b"reverted local copy"
+    );
+    assert!(!aside.exists(), "the set-aside copy is still there");
+    drop(set);
+    drop(registration);
+}
+
 fn held_directory(path: &Path, share_delete: bool) -> std::fs::File {
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,

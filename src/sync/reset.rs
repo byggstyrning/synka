@@ -14,6 +14,10 @@
 //!
 //! While this runs, cfapi delete/rename notifications for these paths are ours and change
 //! nothing in ACC, and listings requested under the set-aside copy are answered empty.
+//!
+//! Subscribe, unsubscribe and the startup sweep use the same set-aside for a folder Synka cannot
+//! use or remove as its own (plain folders left by an earlier install, say):
+//! `set_aside_project_dir` or `set_aside_orphan`, then `finish_with` and `leftover_intro`.
 
 use super::*;
 use std::os::windows::ffi::OsStrExt;
@@ -232,6 +236,51 @@ pub(super) fn begin(ctx: &Ctx, p: &Project, folder: Option<&Path>) -> Result<Set
         guard.narrow(aside);
     }
     Ok(SetAside { name, aside, guard })
+}
+
+/// Phase 1 for a project folder that is not Synka's to use or delete: subscribe found a folder at
+/// the project's path that is not its placeholder, or unsubscribe could not remove all of it. The
+/// whole folder is set aside (hidden, next to it) so the path is free and `finish_with` can save
+/// its files. None when there is no folder.
+pub(super) fn set_aside_project_dir(ctx: &Ctx, p: &Project) -> Result<Option<SetAside>> {
+    let dir = project_dir(&ctx.paths.sync_root, p);
+    set_aside_dir(&dir, &p.name, vec![p.pid], |dir| {
+        open_files(ctx, p, dir, None, 5)
+    })
+}
+
+/// `set_aside_project_dir` for a hub or project folder that no enabled project has (the startup
+/// sweep). Its name is the folder's own.
+pub(super) fn set_aside_orphan(dir: &Path) -> Result<Option<SetAside>> {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    set_aside_dir(dir, &name, Vec::new(), |_| Vec::new())
+}
+
+/// Renames `dir` aside (hidden, next to it) under the reset guard. `open` names the open files
+/// when the rename is refused.
+fn set_aside_dir(
+    dir: &Path,
+    name: &str,
+    pids: Vec<Pid>,
+    open: impl FnOnce(&Path) -> Vec<String>,
+) -> Result<Option<SetAside>> {
+    let _lock = local_lock();
+    if !exists(dir) {
+        return Ok(None);
+    }
+    let mut guard = Guard::new(vec![(dir.to_path_buf(), false)], pids);
+    let aside = move_aside(dir, name, &mut guard)
+        .map_err(|error| rename_failure(dir, &error, &open(dir)))?;
+    let _ = set_hidden(&aside);
+    guard.narrow(&aside);
+    Ok(Some(SetAside {
+        name: name.to_string(),
+        aside: Some(aside),
+        guard,
+    }))
 }
 
 /// Rename only. Never replace an existing entry and never copy/delete on failure.
@@ -511,6 +560,16 @@ pub(super) fn set_hidden_state(path: &Path, hidden: bool) -> std::io::Result<()>
 /// Phase 2 (background, no lock): save what was not in sync, then delete the set-aside copy.
 /// Returns (files saved, where).
 pub(super) fn finish(ctx: &Ctx, aside: &Path, name: &str) -> (usize, Option<PathBuf>) {
+    finish_with(ctx, aside, name, &rebuilt_intro(name))
+}
+
+/// `finish` with `intro` at the top of the saved files' LÄS MIG.txt.
+pub(super) fn finish_with(
+    ctx: &Ctx,
+    aside: &Path,
+    name: &str,
+    intro: &str,
+) -> (usize, Option<PathBuf>) {
     let dest = match rescue_destination(ctx, name) {
         Ok(dest) => dest,
         Err(e) => {
@@ -538,7 +597,7 @@ pub(super) fn finish(ctx: &Ctx, aside: &Path, name: &str) -> (usize, Option<Path
                     d.display(),
                     aside.display()
                 );
-                write_readme(&dest, &rebuilt_intro(name), &list);
+                write_readme(&dest, intro, &list);
                 return (saved, Some(dest));
             }
         };
@@ -551,7 +610,7 @@ pub(super) fn finish(ctx: &Ctx, aside: &Path, name: &str) -> (usize, Option<Path
                         d.display(),
                         aside.display()
                     );
-                    write_readme(&dest, &rebuilt_intro(name), &list);
+                    write_readme(&dest, intro, &list);
                     return (saved, Some(dest));
                 }
             };
@@ -594,16 +653,20 @@ pub(super) fn finish(ctx: &Ctx, aside: &Path, name: &str) -> (usize, Option<Path
                         path.display(),
                         aside.display()
                     );
-                    write_readme(&dest, &rebuilt_intro(name), &list);
+                    write_readme(&dest, intro, &list);
                     return (saved, Some(dest));
                 }
             }
         }
     }
     if saved > 0 {
-        write_readme(&dest, &rebuilt_intro(name), &list);
+        write_readme(&dest, intro, &list);
     } else {
         let _ = std::fs::remove_dir(&dest);
+        // Nothing saved: no empty rescue folder next to the sync root either.
+        if let Some(root) = dest.parent() {
+            let _ = std::fs::remove_dir(root);
+        }
     }
     for attempt in 0..3 {
         match std::fs::remove_dir_all(aside) {
@@ -661,6 +724,17 @@ fn rebuilt_intro(name: &str) -> String {
         "{name} byggdes om från ACC {}.\r\n\r\nDe här filerna hade ändringar som inte hunnit synkas till ACC, så de sparades här \
          i stället för att försvinna. Kopiera tillbaka det du vill behålla till synkmappen, så laddas det upp. \
          Revit-molnmodeller ska synkas via Revit; kopiera inte tillbaka dem för uppladdning med Synka.",
+        chrono::Local::now().format("%Y-%m-%d %H:%M")
+    )
+}
+
+/// Intro for files saved from a folder set aside by `set_aside_project_dir` or `set_aside_orphan`.
+pub(super) fn leftover_intro(name: &str) -> String {
+    format!(
+        "Mappen {name} i synkmappen innehöll filer som inte var synkade, till exempel kvar från en \
+         tidigare installation av Synka eller en utloggning. Mappen togs bort ur synkmappen {} och filerna \
+         sparades här i stället för att försvinna. Kopiera tillbaka det du vill behålla till ett synkat \
+         projekt, så laddas det upp.",
         chrono::Local::now().format("%Y-%m-%d %H:%M")
     )
 }
