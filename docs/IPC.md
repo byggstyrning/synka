@@ -40,7 +40,7 @@ engine answers `{"type":"ack","id":<id>,"ok":true}` or `{"type":"ack","id":<id>,
 | `open_folder` | `path?` (absolute; default sync root) | opens Explorer |
 | `open_log` | | opens the log folder |
 | `refresh_projects` | | reloads hubs/projects from every signed-in provider → `projects` event |
-| `set_project` | `hub_id`, `project_id`, `subscribe` (bool) | subscribe/unsubscribe → `projects` + `status` |
+| `set_project` | `hub_id`, `project_id`, `subscribe` (bool) | subscribe/unsubscribe → `projects` + `status`. A folder at the project's path that is not its placeholder (left by an earlier install, say), or what unsubscribe cannot remove, is set aside and removed; files in it are first saved to `Synka - återställda filer` (→ `notify`). If it cannot be set aside (a file inside is open), subscribing is refused and unsubscribing still ends with a warning `notify` |
 | `set_setting` | `key`, `value` | keys: `propagate_deletes` (bool), `max_downloads` (1–8), `max_uploads` (1–4), `poll_active_secs` (15–300), `log_level` ("info"/"debug"), `start_at_login` (bool, StartupTask), `auto_update` (bool), `aps_client_id` (string, blank clears the optional override), `interaxo_client_id` (string, blank clears), `interaxo_redirect_uri` (string, blank = default), `interaxo_client_secret` (string, blank clears; never echoed); `desktop_sync_feed` is not settable (settings.json only) → `settings` |
 | `test_aps_client_id` | `client_id` (nonblank public ID), `request_id` (UUID string) | validates fresh public PKCE sign-in before saving → `aps_client_id_validation`; saved changed ID restarts the engine |
 | `cancel_aps_client_id_test` | `request_id` (UUID string) | cancels that test; the correlated terminal event decides a completion/cancellation race |
