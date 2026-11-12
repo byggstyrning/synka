@@ -584,7 +584,7 @@ $standard = @"
 
 The ``.msix`` beside it is signed with the included ``FastADC.cer`` certificate.
 
-Colleagues install and update Synka through BoomerHubb. New versions are also shared through the internal OneDrive folder ``Synka``; there is no public download and no in-app update check.
+Synka does not check for updates by itself: install a new version from its zip the same way. Byggstyrning's staff can also install and update through BoomerHubb.
 
 **Varumärken / Trademarks** - Autodesk, Autodesk Construction Cloud, Autodesk Docs, Autodesk Forma och Revit är registrerade varumärken eller varumärken som tillhör Autodesk, Inc. och/eller dess dotter- eller närstående bolag. Synka är en fristående produkt från Byggstyrning och är inte ansluten till, godkänd av eller sponsrad av Autodesk.
 

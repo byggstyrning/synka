@@ -12,8 +12,10 @@
             <TextBlock Text="{loc:T Sv='Om Synka', En='About Synka'}"
                        Style="{StaticResource TitleTextBlockStyle}" />
 
-            <!-- The app name is not translated: it is the name in the Start menu. -->
-            <tk:SettingsCard Header="Synka"
+            <!-- The app name is not translated: it is the name in the Start menu. The description names
+                 the platforms of the default build; the ACC-only build replaces it in code. -->
+            <tk:SettingsCard x:Name="AppCard"
+                             Header="Synka"
                              Description="{loc:T Sv='Synkar dokument från Autodesk Construction Cloud (ACC), StreamBIM och Interaxo till Utforskaren. Kan köras bredvid Autodesk Desktop Connector.', En='Syncs documents from Autodesk Construction Cloud (ACC), StreamBIM and Interaxo to Explorer. Can run alongside Autodesk Desktop Connector.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE8B7;" />
@@ -38,8 +40,11 @@
                 </tk:SettingsCard.HeaderIcon>
             </tk:SettingsCard>
 
-            <tk:SettingsCard Header="{loc:T Sv='Integritet', En='Privacy'}"
-                             Description="{loc:T Sv='Synka skickar filinnehåll bara mellan den här datorn och den plattform filen tillhör: Autodesk (APS och Autodesks fillagring), StreamBIM (den inloggade regionens servrar och S3-lagringen de ger uppladdningslänkar till) eller Interaxo (dess API-servrar). Ingen telemetri. Nya versioner delas internt.', En='Synka sends file content only between this PC and the platform the file belongs to: Autodesk (the APS endpoints and file storage), StreamBIM (the servers of the signed-in region and the S3 storage they hand out upload links for) or Interaxo (its API hosts). No telemetry. New versions are shared internally.'}">
+            <!-- The same platforms and flows as README.md "Use and data" and docs/PRIVACY.md (checked by
+                 tests/public_texts.rs). The ACC-only build replaces the text in code. -->
+            <tk:SettingsCard x:Name="PrivacyCard"
+                             Header="{loc:T Sv='Integritet', En='Privacy'}"
+                             Description="{loc:T Sv='Synka skickar dina filer och kontouppgifter bara mellan den här datorn och den plattform de tillhör: Autodesk (APS-tjänsterna, inloggningen och Autodesks fillagring), StreamBIM (servrarna i den region du loggar in på, regionlistan och S3-lagringen de ger länkar till) eller Interaxo (inloggningstjänsten och API-servrarna). Ingen telemetri. Synka söker inte efter uppdateringar om inte din organisation har slagit på det.', En='Synka sends your files and account data only between this PC and the platform they belong to: Autodesk (the APS endpoints, its sign-in and Autodesk file storage), StreamBIM (the servers of the region you sign in to, the region list and the S3 storage they hand out links for) or Interaxo (its sign-in service and API hosts). No telemetry. Synka does not check for updates unless your organisation has turned that on.'}">
                 <tk:SettingsCard.HeaderIcon>
                     <FontIcon Glyph="&#xE72E;" />
                 </tk:SettingsCard.HeaderIcon>

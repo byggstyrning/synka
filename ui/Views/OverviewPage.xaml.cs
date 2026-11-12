@@ -252,7 +252,9 @@ public sealed partial class OverviewPage : Page
         // provider signed in: the card stays hidden, and the Konton page has the rest.
         var noAccount = connected && status is { SignedIn: false };
         SignInCard.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
-        SignInSettingsButton.Visibility = noAccount ? Visibility.Visible : Visibility.Collapsed;
+        // The ACC-only build has nothing else to sign in to: the card's own button is the one.
+        var otherProviders = Engine.ProviderOffered(ProviderNames.StreamBim);
+        SignInSettingsButton.Visibility = noAccount && otherProviders ? Visibility.Visible : Visibility.Collapsed;
         var settingsText = SignInSettingsText();
         if (SignInSettingsButton.Content as string != settingsText)
         {

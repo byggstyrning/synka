@@ -1,9 +1,11 @@
 # Synka packaging
 
-Synka ships as a sideloaded, self-signed MSIX, plus a zip that a recipient double-clicks. It is
-internal only: there is no public download and no public update channel. Colleagues install and
-update it through BoomerHubb, from the private release channel `VilhelmH-git/Synka-releases`. The package has two
-processes:
+Synka ships as a sideloaded, self-signed MSIX, plus a zip that a recipient double-clicks.
+Releases are published on this repository's GitHub releases (the repository is public) and,
+once the listing is approved, on Autodesk's Design and Make Marketplace (`docs/MARKETPLACE.md`).
+Byggstyrning's staff can also install and update through BoomerHubb, from the release channel
+`VilhelmH-git/Synka-releases`, or from the OneDrive share. There is no in-app update channel
+unless `update_channel` is set. The package has two processes:
 
 | Process | What | Lifetime |
 |---|---|---|
@@ -19,12 +21,12 @@ is laid out next to it and installed first.
 
 | File | Purpose |
 |---|---|
-| `build_msix.ps1` | Tests, `cargo build --release`, the Release MSIX build, verification of the package contents, optional signing of the engine and MSIX (`-Sign` from the existing certificate store key, `-PfxPath` from a file) and install (`-Install`). CI calls it too. |
+| `build_msix.ps1` | Tests, `cargo build --release`, the Release MSIX build, verification of the package contents, optional signing of the engine and MSIX (`-Sign` from the existing certificate store key, `-PfxPath` from a file) and install (`-Install`). `-AccOnly` builds the ACC-only engine (`docs/MARKETPLACE.md`). CI calls it too. |
 | `make_delivery.ps1` | Packs the signed package, the framework, `FastADC.cer` and `delivery\` into `dist\Synka-<ver>-sidladdning.zip`. CI calls it too. |
 | `assert-package-engine.ps1` | Checks the embedded engine's signing certificate and timestamp; the build also compares its SHA-256 with `target\release\synka-engine.exe`. Delivery and resumed releases use the same checks. |
 | `version.ps1` | Reads the version, or bumps it in `Cargo.toml` and `Cargo.lock` (`-Bump patch`). The one place that writes it, locally and in CI. |
 | `share_release.ps1` | Copies the sideload zip into the shared OneDrive folder `Synka` (or `-TargetFolder`). Keeps the newest 5 versions and `Synka-latest.zip`. |
-| `new_release.ps1` | Current local release route: serial tests, version bump, tag, locally timestamped signing, ZIP, release gate, private release, the same release on `VilhelmH-git/Synka-releases`, the BoomerHubb catalog entry, and optional OneDrive copy. |
+| `new_release.ps1` | Current local release route: serial tests, version bump, tag, locally timestamped signing, ZIP, release gate, the GitHub release, the same release on `VilhelmH-git/Synka-releases`, the BoomerHubb catalog entry, and optional OneDrive copy. |
 | `make_icons.py` | Draws the Synka icon. `--assets` regenerates both ICOs (engine and window) plus every MSIX tile, splash and title-bar PNG in `ui\Assets`. |
 | `FastADC.cer` | The public certificate, `CN=FastADC`. Not secret. Recipients trust it; CI refuses to sign with any other key. |
 | `delivery\` | Handwritten recipient files: `Install.cmd`, `Install.ps1`, `README.txt` (Swedish). Checked out with CRLF (`.gitattributes`). |
@@ -44,7 +46,9 @@ Unsigned, for a quick check. Tests are skipped here:
 
     powershell -NoProfile -File packaging\build_msix.ps1 -SkipTests
 
-Output: `ui\AppPackages\Synka_<ver>.0_x64_*\Synka_<ver>.0_x64.msix`, unsigned.
+Output: `ui\AppPackages\Synka_<ver>.0_x64_*\Synka_<ver>.0_x64.msix`, unsigned. Add `-AccOnly`
+for the ACC-only build (`cargo build --release --features acc-only`); it has the same file name,
+package identity and version as the default build (`docs/MARKETPLACE.md`).
 Store upload needs the Identity and Publisher that Partner Center assigns; then the
 Store signs it.
 
@@ -183,20 +187,21 @@ certificate import needs admin, and it runs in its own elevated window. The
 framework and the app are installed as the recipient, so the app lands in the
 right user profile. The app is started at the end. See `delivery\README.txt`.
 
-### Upgrading from the earlier names
+### Upgrading from an earlier package identity
 
-Earlier packages (Better Desktop Connector, FastADC) have different package identities. `Install.cmd`
-asks to remove the old package first, then installs Synka. The user's sync folder and
-database are not part of the package; see the migration steps in `docs/ROADMAP.md`.
+Earlier builds of the app were installed under other package identities (listed in
+`delivery\Install.ps1`). `Install.cmd` asks to remove such a package first, then installs Synka.
+The user's sync folder and database are not part of the package; see the migration steps in
+`docs/ROADMAP.md`.
 
 ## Local release (current route)
 
 Pushing a tag does **not** start `release.yml`; that workflow is dispatch-only.
 The signing key stays on this machine. `new_release.ps1` signs and timestamps the
 engine and MSIX locally, then publishes the same signed package, certificate and ZIP
-on the private source repository and on the private release channel
+on this (public) source repository and on the release channel
 `VilhelmH-git/Synka-releases`, then points the `synka` entry of the BoomerHubb catalog
-(`VilhelmH-git/catalog`) at it. There is no public mirror. The release gate and the catalog step
+(`VilhelmH-git/catalog`) at it. The release gate and the catalog step
 are in claude-kit (`toolselease-scan`, `tools\catalog`), cloned beside this repository or named
 by `CLAUDE_KIT`; the script stops before the version bump when either is missing, or when `gh`
 cannot write to the channel.
@@ -215,10 +220,10 @@ cannot write to the channel.
 
    The script runs `cargo test --locked -- --test-threads=1`, bumps Cargo.toml
    and Cargo.lock, commits and tags the version, pushes `main` and the tag,
-   builds the signed MSIX, packs the ZIP, publishes the private release, and
+   builds the signed MSIX, packs the ZIP, publishes the GitHub release, and
    copies the ZIP to OneDrive unless `-NoShare` is set. It never uploads an
    unsigned MSIX. If packaging fails after the tag is pushed and before the
-   private release is created, use `-OnlyPublish` from that same tagged source
+   GitHub release is created, use `-OnlyPublish` from that same tagged source
    commit after fixing the cause. Reused packages must still have a correctly
    signed and timestamped engine inside the signed MSIX.
 4. Compare the ZIP, MSIX and certificate hashes with the local artifacts. Install
@@ -236,7 +241,7 @@ It needs no developer machine, no local certificate and no `gh` login.
 | Workflow | When | What |
 |---|---|---|
 | `.github/workflows/ci.yml` | pull requests, pushes to main, by hand | `cargo test`, `cargo clippy`, `cargo build --release`, then the unsigned MSIX via `build_msix.ps1 -SkipEngineBuild`. Engine and package are kept as run artifacts for 7 days. |
-| `.github/workflows/release.yml` | **Actions -> Release -> Run workflow** | bump, tag, build, sign, zip, publish to the private repository |
+| `.github/workflows/release.yml` | **Actions -> Release -> Run workflow** | bump, tag, build, sign, zip, publish to this repository |
 
 ### Once: secrets
 

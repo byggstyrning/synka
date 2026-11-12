@@ -75,7 +75,7 @@
 
             <TextBlock Text="{loc:T Sv='Konton', En='Accounts'}"
                        Style="{StaticResource TitleTextBlockStyle}" />
-            <TextBlock Text="{loc:T Sv='Plattformar som Synka synkar från. Här loggar du in, lägger till StreamBIM-servrar och ser vilka projekt varje konto synkar.', En='The platforms Synka syncs from. Here you sign in, add StreamBIM servers and see which projects each account syncs.'}"
+            <TextBlock Text="{loc:T Sv='Plattformar som Synka synkar från. Här loggar du in och ser vilka projekt varje konto synkar.', En='The platforms Synka syncs from. Here you sign in and see which projects each account syncs.'}"
                        TextWrapping="Wrap"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
             <TextBlock x:Name="SummaryText"
@@ -199,8 +199,8 @@
                 </tk:SettingsExpander>
             </StackPanel>
 
-            <!-- StreamBIM: one account per server. "Lägg till server" opens the sign-in dialog. -->
-            <StackPanel Spacing="10" Margin="0,12,0,0">
+            <!-- StreamBIM: one account per server. "Lägg till server" opens the sign-in dialog. Hidden in the ACC-only build. -->
+            <StackPanel x:Name="StreamBimSection" Spacing="10" Margin="0,12,0,0">
                 <Grid x:Name="StreamBimHeader" ColumnSpacing="16" RowSpacing="0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
@@ -259,8 +259,8 @@
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
             </StackPanel>
 
-            <!-- Interaxo: the client id is the organisation's own; the client settings are under Avancerat. -->
-            <StackPanel Spacing="10" Margin="0,12,0,0">
+            <!-- Interaxo: the client id is the organisation's own; the client settings are under Avancerat. Hidden in the ACC-only build. -->
+            <StackPanel x:Name="InteraxoSection" Spacing="10" Margin="0,12,0,0">
                 <Grid x:Name="InteraxoHeader" ColumnSpacing="16" RowSpacing="0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />

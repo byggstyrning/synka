@@ -132,7 +132,9 @@ pub enum Command {
 pub struct IpcHub {
     events: broadcast::Sender<Arc<str>>,
     sync_root: PathBuf,
-    /// `Config::interaxo_enabled`. While false, Interaxo sign-in and `interaxo_*` settings are refused.
+    /// False in the ACC-only build: StreamBIM sign-in, codes and the region list are refused.
+    streambim_offered: bool,
+    /// `Config::interaxo_on`. While false, Interaxo sign-in and `interaxo_*` settings are refused.
     interaxo_enabled: bool,
     cache: Mutex<Cache>,
     clients: AtomicUsize,
@@ -153,14 +155,31 @@ struct Cache {
 }
 
 impl IpcHub {
+    /// A hub of the default build: StreamBIM offered, Interaxo as `interaxo_enabled`.
+    #[cfg(test)]
     pub fn new(sync_root: PathBuf, interaxo_enabled: bool) -> IpcHub {
+        IpcHub::offering(sync_root, true, interaxo_enabled)
+    }
+
+    /// A hub that offers StreamBIM and Interaxo as given (ACC always).
+    pub fn offering(sync_root: PathBuf, streambim_offered: bool, interaxo_enabled: bool) -> IpcHub {
         let (events, _) = broadcast::channel(EVENT_CAP);
         IpcHub {
             events,
             sync_root,
+            streambim_offered,
             interaxo_enabled,
             cache: Mutex::new(Cache::default()),
             clients: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether this hub takes sign-ins for a provider (`Ctx::offers`, as known at start).
+    fn offers(&self, provider: Provider) -> bool {
+        match provider {
+            Provider::Acc => true,
+            Provider::StreamBim => self.streambim_offered,
+            Provider::Interaxo => self.interaxo_enabled,
         }
     }
 
@@ -775,8 +794,8 @@ fn dispatch(
             password,
         } => {
             let provider = parse_provider(provider.as_deref().unwrap_or("acc"))?;
-            if provider == Provider::Interaxo && !hub.interaxo_enabled {
-                return Err(config::INTERAXO_OFF_TEXT.into());
+            if !hub.offers(provider) {
+                return Err(config::off_text(provider).into());
             }
             let streambim = match provider {
                 Provider::StreamBim => Some(streambim_login(region, url, username, password)?),
@@ -795,6 +814,9 @@ fn dispatch(
             let provider = parse_provider(&provider)?;
             if provider != Provider::StreamBim {
                 return Err("Engångskod används bara för StreamBIM.".into());
+            }
+            if !hub.offers(provider) {
+                return Err(config::off_text(provider).into());
             }
             let account = account
                 .filter(|account| !account.is_empty())
@@ -824,6 +846,9 @@ fn dispatch(
                 provider,
                 account: account_arg(provider, account)?,
             }
+        }
+        Command::StreamBimRegions if !hub.offers(Provider::StreamBim) => {
+            return Err(config::STREAMBIM_OFF_TEXT.into());
         }
         Command::StreamBimRegions => TrayCmd::StreamBimRegions,
         Command::TestApsClientId {
@@ -1587,6 +1612,7 @@ mod tests {
             aps_client_id_override_supported: true,
             aps_client_id_validation_supported: true,
             providers: vec!["acc", "streambim", "interaxo"],
+            build_providers: vec!["acc", "streambim", "interaxo"],
             interaxo_client_id: None,
             interaxo_redirect_uri: "http://localhost:47864/".into(),
             interaxo_redirect_uri_default: "http://localhost:47864/",
@@ -1642,6 +1668,7 @@ mod tests {
                 aps_client_id_override_supported: true,
                 aps_client_id_validation_supported: true,
                 providers: vec!["acc", "streambim", "interaxo"],
+                build_providers: vec!["acc", "streambim", "interaxo"],
                 interaxo_client_id: None,
                 interaxo_redirect_uri: "http://localhost:47864/".into(),
                 interaxo_redirect_uri_default: "http://localhost:47864/",
@@ -2352,5 +2379,66 @@ mod interaxo_off_tests {
         };
         assert_eq!(providers(false), ["acc"]);
         assert_eq!(providers(true), ["acc", "interaxo"]);
+    }
+}
+
+#[cfg(test)]
+mod acc_only_tests {
+    use super::*;
+
+    /// The ack of one command line on the ACC-only hub (main.rs builds it from `Config::acc_only`,
+    /// which also turns Interaxo off), and the command it sent (if any).
+    fn send(line: &str) -> (Value, Option<TrayCmd>) {
+        let hub = IpcHub::offering(PathBuf::from(r"C:\Synka"), false, false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = handle_line(line.as_bytes(), &hub, &tx);
+        let ack: Value = reply
+            .first()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .expect("an ack for a command with an id");
+        (ack, rx.try_recv().ok())
+    }
+
+    #[test]
+    fn streambim_and_interaxo_are_refused_and_nothing_reaches_the_engine() {
+        for (line, error) in [
+            (
+                r#"{"cmd":"sign_in","id":1,"provider":"streambim","region":"app","username":"a@b.se","password":"pw"}"#,
+                config::STREAMBIM_OFF_TEXT,
+            ),
+            (
+                r#"{"cmd":"sign_in_mfa","id":2,"provider":"streambim","account":"app","code":"123456"}"#,
+                config::STREAMBIM_OFF_TEXT,
+            ),
+            (
+                r#"{"cmd":"streambim_regions","id":3}"#,
+                config::STREAMBIM_OFF_TEXT,
+            ),
+            (
+                r#"{"cmd":"sign_in","id":4,"provider":"interaxo"}"#,
+                config::INTERAXO_OFF_TEXT,
+            ),
+        ] {
+            let (ack, cmd) = send(line);
+            assert_eq!(ack["ok"], false, "{line}: {ack}");
+            assert_eq!(ack["error"], error, "{line}");
+            assert!(
+                cmd.is_none(),
+                "a refused command reached the engine: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn acc_sign_in_still_works() {
+        let (ack, cmd) = send(r#"{"cmd":"sign_in","id":1,"provider":"acc"}"#);
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(matches!(
+            cmd,
+            Some(TrayCmd::SignIn {
+                provider: Provider::Acc,
+                streambim: None
+            })
+        ));
     }
 }

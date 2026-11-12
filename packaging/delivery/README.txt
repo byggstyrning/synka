@@ -18,8 +18,9 @@ SÅ HÄR INSTALLERAR DU
 
 Installationen startar Synka när den är klar. Appen heter "Synka" i Start-menyn.
 
-Har du Better Desktop Connector installerad tar installationen bort den först
-(efter en fråga). Se "BYTE FRÅN BETTER DESKTOP CONNECTOR" nedan.
+Har datorn en tidigare version av appen under ett äldre paketnamn tar
+installationen bort den först (efter en fråga). Se "BYTE FRÅN EN TIDIGARE
+VERSION" nedan.
 
 
 VARFÖR FRÅGAR DEN EFTER ADMINISTRATÖR?
@@ -56,21 +57,21 @@ EFTER INSTALLATIONEN
   Inloggning    Första gången du öppnar Synka loggar du in med ditt
                 Autodesk-konto i webbläsaren.
 
-  Uppdateringar Nya versioner delas via den interna OneDrive-mappen Synka. Packa
-                upp den nya zip-filen och kör Install.cmd; dina inställningar
-                behålls. Appen söker inte efter uppdateringar själv.
+  Uppdateringar Appen söker inte efter uppdateringar själv. Hämta den nya
+                zip-filen där du hämtade den här, packa upp den och kör
+                Install.cmd; dina inställningar behålls.
 
 
-BYTE FRÅN BETTER DESKTOP CONNECTOR
-----------------------------------
+BYTE FRÅN EN TIDIGARE VERSION
+-----------------------------
 
-Har datorn Better Desktop Connector (eller den äldre FastADC-versionen):
+Har datorn en tidigare version av appen, under ett äldre paketnamn:
 
   1. Kontrollera i den gamla appen att allt är synkat. Det som inte har synkats
      laddas inte upp av Synka.
   2. Kör Install.cmd. Installationen frågar om den gamla appen ska tas bort.
      Svarar du nej ändras ingenting.
-  3. Den gamla mappen %USERPROFILE%\BDC ligger kvar. Ta bort den när du har
+  3. Den gamla synkmappen %USERPROFILE%\BDC ligger kvar. Ta bort den när du har
      kontrollerat att filerna finns i %USERPROFILE%\Synka.
   4. Logga in igen med ditt Autodesk-konto.
   5. Välj projekten igen.
@@ -86,8 +87,15 @@ VIKTIGT
   - ACC är huvudkopian. Synka kopierar filer mellan ACC och den här datorn, och
     data kan gå förlorad. Kontrollera viktiga ändringar i ACC.
   - Du omfattas fortfarande av Autodesks egna villkor för ACC och ditt Autodesk-konto.
-  - Filinnehåll skickas bara mellan den här datorn och Autodesk.
-  - Synka är avsett för internt bruk av Byggstyrnings personal.
+  - Synka skickar dina filer och kontouppgifter bara mellan den här datorn och
+    den plattform de tillhör: Autodesk (APS-tjänsterna, inloggningen och
+    Autodesks fillagring), StreamBIM (servrarna i den region du loggar in på,
+    regionlistan och S3-lagringen de ger länkar till) eller Interaxo
+    (inloggningstjänsten och API-servrarna). Versionen som bara har ACC
+    kontaktar bara Autodesk. Ingen telemetri.
+  - Integritetspolicy:
+    https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md
+  - Support: info@byggstyrning.se
 
 
 KRAV

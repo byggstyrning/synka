@@ -173,14 +173,17 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>The Konton tooltip names the providers the engine offers (settings.providers): Interaxo only while it is on.</summary>
-    private void ApplyAccountsTooltip() => ToolTipService.SetToolTip(AccountsNavItem, EngineClient.Instance.ProviderOffered(ProviderNames.Interaxo)
-        ? Lang.T(
-            "Logga in på ACC, StreamBIM och Interaxo och se vilka projekt varje konto synkar.",
-            "Sign in to ACC, StreamBIM and Interaxo, and see which projects each account syncs.")
-        : Lang.T(
-            "Logga in på ACC och StreamBIM och se vilka projekt varje konto synkar.",
-            "Sign in to ACC and StreamBIM, and see which projects each account syncs."));
+    /// <summary>
+    /// The Konton tooltip names the providers the engine offers (settings.providers): Interaxo only
+    /// while it is on, ACC alone in the ACC-only build.
+    /// </summary>
+    private void ApplyAccountsTooltip()
+    {
+        var names = ProviderNames.Sentence(EngineClient.Instance.OfferedProviders);
+        ToolTipService.SetToolTip(AccountsNavItem, Lang.T(
+            $"Logga in på {names} och se vilka projekt varje konto synkar.",
+            $"Sign in to {names}, and see which projects each account syncs."));
+    }
 
     private void OnNotified(object? sender, NotifyInfo notice)
     {

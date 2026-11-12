@@ -80,8 +80,9 @@ public sealed record ProjectsInfo(bool Loading, List<HubInfo>? Hubs);
 /// is also capability-gated so older engines never show a setting they cannot apply.
 /// <c>update_channel_configured</c> is false when no update channel is set (the default):
 /// the engine never checks for updates, and the window hides the update controls.
-/// The provider fields (<c>providers</c> and the Interaxo settings) are newest: an older
-/// engine leaves them out. Interaxo settings can change only while Interaxo is signed out.
+/// The provider fields (<c>providers</c>, <c>build_providers</c> and the Interaxo settings) are newest:
+/// an older engine leaves them out. <c>build_providers</c> is what the engine's build contains
+/// (<c>["acc"]</c> in the ACC-only build). Interaxo settings can change only while Interaxo is signed out.
 /// </summary>
 public sealed record SettingsInfo(
     bool PropagateDeletes,
@@ -98,6 +99,7 @@ public sealed record SettingsInfo(
     bool? ApsClientIdValidationSupported,
     bool? UpdateChannelConfigured,
     IReadOnlyList<string>? Providers = null,
+    IReadOnlyList<string>? BuildProviders = null,
     string? InteraxoClientId = null,
     string? InteraxoRedirectUri = null,
     string? InteraxoRedirectUriDefault = null,

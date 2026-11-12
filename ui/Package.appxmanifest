@@ -8,11 +8,12 @@
 -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10" xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10" xmlns:cloudFiles2="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10/2" IgnorableNamespaces="uap desktop desktop3 rescap com cloudFiles2">
   <!-- TODO(cert): Publisher stays CN=FastADC until a new trusted signing certificate exists (packaging/README.md). -->
-  <Identity Name="Byggstyrning.Synka" Publisher="CN=FastADC" Version="0.3.4.0" />
+  <Identity Name="Byggstyrning.Synka" Publisher="CN=FastADC" Version="0.3.6.0" />
+  <!-- The descriptions name no platform: the same package text serves the default and the ACC-only build. -->
   <Properties>
     <DisplayName>Synka</DisplayName>
     <PublisherDisplayName>Byggstyrning</PublisherDisplayName>
-    <Description>Synka synkar dokument från Autodesk Construction Cloud (ACC), StreamBIM och Interaxo till en lokal mapp. Kan köras bredvid Autodesk Desktop Connector. / Synka syncs documents from Autodesk Construction Cloud (ACC), StreamBIM and Interaxo to a local folder. Can run alongside Autodesk Desktop Connector.</Description>
+    <Description>Synka synkar projektdokument till en vanlig mapp i Utforskaren. Kan köras bredvid Autodesk Desktop Connector. / Synka syncs project documents to an ordinary folder in Explorer. Can run alongside Autodesk Desktop Connector.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   <Dependencies>
@@ -25,7 +26,7 @@
   </Resources>
   <Applications>
     <Application Id="App" Executable="Synka.exe" EntryPoint="$targetentrypoint$">
-      <uap:VisualElements DisplayName="Synka" Description="Synkar dokument från ACC, StreamBIM och Interaxo till en lokal mapp. / Syncs documents from ACC, StreamBIM and Interaxo to a local folder." BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
+      <uap:VisualElements DisplayName="Synka" Description="Synkar projektdokument till en lokal mapp. / Syncs project documents to a local folder." BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
         <!-- Required for the splash image to be shown at all. -->
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
@@ -33,7 +34,7 @@
     </Application>
     <Application Id="Engine" Executable="engine\synka-engine.exe" EntryPoint="Windows.FullTrustApplication">
       <!-- Windows associates this Cloud Files extension with the Engine app identity. -->
-      <uap:VisualElements DisplayName="Synka-motor" Description="Synkroniserar dokument från ACC, StreamBIM och Interaxo i bakgrunden. / Syncs documents from ACC, StreamBIM and Interaxo in the background." BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+      <uap:VisualElements DisplayName="Synka-motor" Description="Synkroniserar projektdokument i bakgrunden. / Syncs project documents in the background." BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
       <Extensions>
         <!-- Starts the engine at sign-in. -->
         <desktop:Extension Category="windows.startupTask" Executable="engine\synka-engine.exe" EntryPoint="Windows.FullTrustApplication">

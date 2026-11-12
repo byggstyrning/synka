@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace Synka.Services;
@@ -12,6 +13,22 @@ public static class ProviderNames
     public const string Acc = "acc";
     public const string StreamBim = "streambim";
     public const string Interaxo = "interaxo";
+
+    /// <summary>
+    /// The labels of these providers in a sentence: "ACC", "ACC och StreamBIM", "ACC, StreamBIM och
+    /// Interaxo" (English "and"); with <paramref name="or"/>, "eller" ("or") instead.
+    /// </summary>
+    public static string Sentence(IReadOnlyList<string> providers, bool or = false)
+    {
+        var labels = providers.Select(Label).ToList();
+        if (labels.Count < 2)
+        {
+            return labels.FirstOrDefault() ?? string.Empty;
+        }
+
+        var last = or ? Lang.T(" eller ", " or ") : Lang.T(" och ", " and ");
+        return string.Join(", ", labels.Take(labels.Count - 1)) + last + labels[^1];
+    }
 
     /// <summary>The provider id. A hub or account without one is ACC (an older engine).</summary>
     public static string Id(string? provider) => string.IsNullOrWhiteSpace(provider) ? Acc : provider;

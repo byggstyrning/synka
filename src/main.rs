@@ -91,7 +91,8 @@ fn run() -> anyhow::Result<()> {
     cf::expose_placeholders();
 
     let mut paths = paths::resolve(None)?;
-    let cfg = Config::load(&paths.state_dir.join("settings.json"));
+    let mut cfg = Config::load(&paths.state_dir.join("settings.json"));
+    cfg.acc_only = config::ACC_ONLY;
     if cfg.sync_root.is_some() {
         paths = paths::resolve(cfg.sync_root.as_deref())?;
     }
@@ -102,6 +103,7 @@ fn run() -> anyhow::Result<()> {
     }));
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        acc_only = cfg.acc_only,
         packaged = paths.packaged,
         embedding,
         state_dir = %paths.state_dir.display(),
@@ -123,7 +125,12 @@ fn run() -> anyhow::Result<()> {
     let auth = Arc::new(Auth::new(cfg.client_id(), http.clone(), &paths.state_dir));
     let api = http::Api::new(http.clone(), auth.clone());
     // One account per StreamBIM server; each account has its own API client (streambim_auth).
-    let streambim = Arc::new(StreamBimAccounts::load(http.clone(), &paths.state_dir));
+    // The ACC-only build reads no StreamBIM session from disk.
+    let streambim = Arc::new(if cfg.acc_only {
+        StreamBimAccounts::none(http.clone(), &paths.state_dir)
+    } else {
+        StreamBimAccounts::load(http.clone(), &paths.state_dir)
+    });
     // Not configured (empty client id) until the user gives one; applying the settings at
     // runtime comes in a later step.
     let interaxo = Arc::new(Auth::interaxo(
@@ -135,9 +142,10 @@ fn run() -> anyhow::Result<()> {
 
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiMsg>();
     let main_thread_id = unsafe { GetCurrentThreadId() };
-    let hub = Arc::new(ipc::IpcHub::new(
+    let hub = Arc::new(ipc::IpcHub::offering(
         paths.sync_root.clone(),
-        cfg.interaxo_enabled,
+        !cfg.acc_only,
+        cfg.interaxo_on(),
     ));
     let ui = UiSender {
         tx: ui_tx,
