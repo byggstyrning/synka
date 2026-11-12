@@ -34,6 +34,8 @@ pub struct Ctx {
     pub interaxo: Arc<Auth>,
     pub interaxo_api: Api,
     pub ui: UiSender,
+    /// Providers paused after HTTP 429 (see `crate::sync::throttle`).
+    pub throttle: crate::sync::throttle::Throttle,
 }
 
 impl Ctx {

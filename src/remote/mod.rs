@@ -644,6 +644,7 @@ mod tests {
             interaxo: auth.clone(),
             interaxo_api: Api::new(http, auth),
             ui,
+            throttle: Default::default(),
         };
         Fixture {
             ctx,

@@ -159,6 +159,7 @@ fn run() -> anyhow::Result<()> {
         interaxo,
         interaxo_api,
         ui,
+        throttle: Default::default(),
     });
     shell::set_context(ctx.clone());
 

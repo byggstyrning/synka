@@ -5,6 +5,7 @@
 //! - Bearer token per request (never shared mutable default headers).
 //! - Retry: 429/408/500/502/503/504 and transport errors: honour Retry-After (seconds or
 //!   HTTP date, capped 60 s), else exponential backoff 1,2,4 s with ±20 % jitter, max 3 retries.
+//!   A 429 that outlasts these retries pauses the whole provider (`sync::throttle`).
 //!   Non-idempotent writes retry only explicit 429 rejection or a connection failure
 //!   before delivery. Ambiguous transport/408/5xx failures return to outbox reconciliation.
 //!   401: `source.invalidate(token)` then retry once. 403/404/400/409: no retry.

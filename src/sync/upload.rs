@@ -22,8 +22,10 @@
 //!   exists" preserves the local file as a separately uploaded conflict copy). Then store row: base_version =
 //!   remote_version = new number, LocalState::Clean; on disk the file becomes (or is re-pointed
 //!   as) an in-sync placeholder of the item, with watcher::suppress around it.
-//! Retry policy: 429/5xx/transport -> backoff 30 s * 2^attempts (max 1 h), dead after 8
-//!   attempts; 4xx other than 429 -> dead immediately (LocalState::Error, UiMsg::Notify once).
+//! Retry policy: 408/5xx -> backoff 30 s * 2^attempts (max 1 h), dead after 8 attempts; 4xx other
+//!   than 408/429 -> dead immediately (LocalState::Error, UiMsg::Notify once). Offline and 429 are
+//!   pauses, not failures: the job waits without spending an attempt. A 429 also pauses the whole
+//!   provider (`sync::throttle`), and its jobs wait until the pause ends.
 //!   Dead jobs come back with `retry_failed` or the next local change of the file.
 //! Concurrency: Semaphore(cfg.max_uploads). The engine runs a pass when a job is enqueued and
 //!   otherwise sleeps until the next job is due (`Store::next_job_due`).
@@ -46,7 +48,7 @@ use crate::http::ApiError;
 use crate::model::*;
 use crate::remote;
 use crate::store::OutboxJob;
-use crate::sync::{self, naming, sanitize_name, watcher};
+use crate::sync::{self, naming, sanitize_name, throttle, watcher};
 use anyhow::anyhow;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -230,9 +232,9 @@ pub async fn process_due_except(
 
 /// A job waits like offline work (see `handle_failure`): it is postponed without a request and
 /// without spending an attempt, when its project cannot be served (its provider is signed out, or
-/// StreamBIM is signed in to another region) or its provider has no connection (`offline`). The
-/// other providers' jobs are not affected. A job of a gone project counts as ACC's. True when it
-/// waits.
+/// StreamBIM is signed in to another region), its provider has no connection (`offline`), or its
+/// provider is paused after a 429 (`ctx.throttle`, until the pause ends). The other providers'
+/// jobs are not affected. A job of a gone project counts as ACC's. True when it waits.
 fn waits(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
     let project = ctx.store.project(job.pid).ok().flatten();
     let provider = project.as_ref().map(|p| p.provider).unwrap_or_default();
@@ -240,21 +242,50 @@ fn waits(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
         Some(p) => ctx.project_connected(p),
         None => ctx.signed_in(provider),
     };
-    let waiting = if !connected {
+    let (retry_ms, waiting) = if !connected {
         let target = match &project {
             Some(p) => ctx.sign_in_target(p),
             None => provider.label().to_string(),
         };
-        format!("Logga in på {target} för att synka.")
+        (OFFLINE_RETRY_MS, format!("Logga in på {target} för att synka."))
     } else if offline.contains(&provider) {
-        format!("Ingen anslutning till {}.", provider.label())
+        (
+            OFFLINE_RETRY_MS,
+            format!("Ingen anslutning till {}.", provider.label()),
+        )
+    } else if let Some(left) = ctx.throttle.remaining(provider) {
+        (pause_ms(left), paused_text(provider, left))
     } else {
         return false;
     };
     let _ = ctx
         .store
-        .job_postponed(job.id, now_ms() + OFFLINE_RETRY_MS, &waiting);
+        .job_postponed(job.id, now_ms() + retry_ms, &waiting);
     true
+}
+
+/// The provider of a job's project; a job of a gone project counts as ACC's.
+fn job_provider(ctx: &CtxRef, job: &OutboxJob) -> Provider {
+    ctx.store
+        .project(job.pid)
+        .ok()
+        .flatten()
+        .map(|p| p.provider)
+        .unwrap_or_default()
+}
+
+/// Milliseconds until a 429 pause of `left` ends (at least one).
+fn pause_ms(left: Duration) -> i64 {
+    i64::try_from(left.as_millis()).unwrap_or(i64::MAX).max(1)
+}
+
+/// The job's reason while its provider is paused after a 429.
+fn paused_text(provider: Provider, left: Duration) -> String {
+    format!(
+        "{} begränsar antalet anrop. Försöker igen om {}.",
+        provider.label(),
+        throttle::wait_text(left)
+    )
 }
 
 /// Returns true when the job reached a final state (done or failed), false when it was
@@ -420,6 +451,27 @@ pub(crate) fn handle_failure(ctx: &CtxRef, job: &OutboxJob, err: &anyhow::Error)
             "outbox: job {} ({}) waits for the network: {msg}",
             job.id,
             job.kind
+        );
+        return;
+    }
+    if throttle::is_429(err) {
+        // The provider asks us to slow down: pause it, and let the job wait with it. Like offline,
+        // a long throttle must not use up the job's attempts.
+        let provider = job_provider(ctx, job);
+        ctx.throttle.hit(provider);
+        let left = ctx.throttle.remaining(provider).unwrap_or_default();
+        if let Err(e) = ctx.store.job_postponed(
+            job.id,
+            now_ms() + pause_ms(left),
+            &paused_text(provider, left),
+        ) {
+            tracing::warn!("outbox: postpone {}: {e:#}", job.id);
+        }
+        tracing::debug!(
+            "outbox: job {} ({}) waits for {}: {msg}",
+            job.id,
+            job.kind,
+            provider.label()
         );
         return;
     }

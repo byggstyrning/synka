@@ -29,6 +29,9 @@
 //!     FeedError::NotSupported -> set PublicWalk. With the flag off, a project stored as
 //!     DesktopSync/Unknown is switched to PublicWalk and its feed cursor dropped first.
 //!   Then store.apply_delta -> Applied -> disk_apply (placeholders on disk).
+//!   The walk lists 4 folders at a time and stops at the first failure. A 429 that outlasts the
+//!   request's retries pauses the whole provider (throttle): its projects wait for the pause
+//!   instead of backing off one by one, and the status says so instead of reporting an error.
 //!
 //! disk_apply (Applied) — only for items whose parent folder is populated (else DB only):
 //!   created  -> create placeholder in parent dir. If a non-placeholder local file with the same
@@ -55,6 +58,7 @@ mod recovery;
 mod relocate;
 mod reset;
 mod shell_cmds;
+pub mod throttle;
 pub mod upload;
 pub mod watcher;
 
@@ -66,6 +70,8 @@ mod local_inspection_tests;
 mod provider_tests;
 #[cfg(test)]
 mod resilience_tests;
+#[cfg(test)]
+mod throttle_tests;
 
 pub use naming::sanitize_name;
 pub(crate) use relocate::check as check_new_root;
@@ -96,7 +102,7 @@ use crate::streambim_auth::{
 use crate::sync::watcher::{LocalChange, WatchHandle};
 use crate::update::{self, UpdateInfo};
 use anyhow::{anyhow, Result};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1341,13 +1347,19 @@ impl Engine {
             // A project that cannot be served (its provider is signed out, or StreamBIM is signed in
             // to another region) does not poll. It leaves the schedule and comes back when it can
             // (provider_connected).
-            let project = self.ctx.store.project(pid).ok().flatten();
-            match project {
-                Some(p) if !self.ctx.project_connected(&p) => {
+            if let Some(p) = self.ctx.store.project(pid).ok().flatten() {
+                if !self.ctx.project_connected(&p) {
                     self.st().next_due.remove(&pid);
+                    continue;
                 }
-                _ => self.spawn_poll(pid),
+                // Its provider answered 429: the project waits for the pause to end, also when a
+                // local change or "Sync now" asked for a poll right away.
+                if let Some(left) = self.ctx.throttle.remaining(p.provider) {
+                    self.st().next_due.insert(pid, now + spread(left));
+                    continue;
+                }
             }
+            self.spawn_poll(pid);
         }
         let signed_in = self.ctx.any_signed_in();
         let lost = self.connectivity_lost();
@@ -1466,9 +1478,19 @@ impl Engine {
                     st.offline.remove(&provider);
                     st.last_error = None;
                     st.last_ok_ms = Some(now_ms());
+                    self.ctx.throttle.ok(provider);
                     let (d, idle) = interval_secs(self.ctx.cfg_now().poll_active_secs, &st, pid);
                     st.idle_parked |= idle;
                     d
+                }
+                // The provider asks us to slow down. Not this project's failure: it waits with the
+                // provider's other projects for the pause to end (no error, no backoff count).
+                Err(e) if throttle::is_429(&e) || throttle::is_paused(&e) => {
+                    if throttle::is_429(&e) {
+                        self.ctx.throttle.hit(provider);
+                    }
+                    debug!("väntar på {}: {e:#}", provider.label());
+                    spread(self.ctx.throttle.remaining(provider).unwrap_or_default())
                 }
                 Err(e) => {
                     let n = {
@@ -1502,6 +1524,9 @@ impl Engine {
             .ok_or_else(|| anyhow!("projektet finns inte"))?;
         if !p.enabled || project_resetting(pid) {
             return Ok(());
+        }
+        if self.ctx.throttle.remaining(p.provider).is_some() {
+            return Err(throttle::Paused(p.provider).into());
         }
         let mut p = self.refresh_tops(p).await?;
         // The undocumented dm/v3 feed is off unless an admin enabled it in settings.json (requires
@@ -1658,12 +1683,18 @@ impl Engine {
             .filter(|f| !is_local_id(&f.id) && f.local_state != LocalState::New)
             .collect();
         let ctx = self.ctx.clone();
-        let results: Vec<Result<Delta>> = futures_util::stream::iter(folders)
+        // The first failure ends the walk: the delta would be thrown away anyway, and asking on
+        // (above all after a 429) only adds load. Folders still in flight are dropped.
+        let deltas: Vec<Delta> = futures_util::stream::iter(folders)
             .map(|f| {
                 let ctx = ctx.clone();
                 let p = p.clone();
                 let me = self.clone();
                 async move {
+                    // Another poll of this provider got 429 meanwhile: stop before asking.
+                    if ctx.throttle.remaining(p.provider).is_some() {
+                        return Err(throttle::Paused(p.provider).into());
+                    }
                     let mut remote = match remote::folder_contents(&ctx, &p, &f.id).await {
                         Ok(r) => r,
                         // Deleted or no longer visible to us: the parent's listing reports
@@ -1689,11 +1720,10 @@ impl Engine {
                 }
             })
             .buffer_unordered(4)
-            .collect()
-            .await;
+            .try_collect()
+            .await?;
         let mut out = Delta::default();
-        for r in results {
-            let d = r?;
+        for d in deltas {
             out.upserts.extend(d.upserts);
             out.deletes.extend(d.deletes);
         }
@@ -1824,12 +1854,15 @@ impl Engine {
                 }
             }
             Err(e) => {
+                let provider = ph::decode_identity(&req.identity)
+                    .map_or(Provider::Acc, |(_, pid, _)| self.provider_of(pid));
                 let status = if is_transport(&e) {
-                    let provider = ph::decode_identity(&req.identity)
-                        .map_or(Provider::Acc, |(_, pid, _)| self.provider_of(pid));
                     self.st().offline.insert(provider);
                     STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE
                 } else {
+                    if throttle::is_429(&e) {
+                        self.ctx.throttle.hit(provider);
+                    }
                     STATUS_CLOUD_FILE_UNSUCCESSFUL
                 };
                 warn!("kunde inte lista {}: {e:#}", req.path.display());
@@ -2099,6 +2132,9 @@ impl Engine {
                     self.st().offline.insert(provider);
                     STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE
                 } else {
+                    if throttle::is_429(&e) {
+                        self.ctx.throttle.hit(provider);
+                    }
                     STATUS_CLOUD_FILE_UNSUCCESSFUL
                 };
                 warn!("hämtning av {} misslyckades: {e:#}", req.path.display());
@@ -3816,6 +3852,7 @@ impl Engine {
             None
         };
         let lost = self.connectivity_lost();
+        let paused = self.ctx.throttle.paused();
         let signed: Vec<Provider> = accounts
             .iter()
             .filter(|a| a.signed_in)
@@ -3879,6 +3916,8 @@ impl Engine {
                     .min();
                 let names: Vec<&str> = signed.iter().map(|p| p.label()).collect();
                 ("offline", offline_status_text(&names, retry))
+            } else if let Some(text) = throttle::status_text(&paused, &signed) {
+                ("waiting", text)
             } else {
                 match sync_phase(
                     active,
@@ -4535,6 +4574,12 @@ fn jitter(d: Duration) -> Duration {
     let b: [u8; 4] = random_bytes();
     let f = u32::from_le_bytes(b) as f64 / u32::MAX as f64;
     d.mul_f64(0.9 + 0.2 * f)
+}
+
+/// `d` and about a tenth more: never sooner, so the projects that wait for one moment (the end of
+/// a 429 pause) do not all ask at it.
+fn spread(d: Duration) -> Duration {
+    d + jitter(d / 10)
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -10221,6 +10266,7 @@ pub(crate) mod tests {
             interaxo,
             interaxo_api,
             ui,
+            throttle: Default::default(),
         });
         let mut p = Project {
             pid: 0,
@@ -11230,6 +11276,7 @@ pub(crate) mod tests {
             interaxo: f.ctx.interaxo.clone(),
             interaxo_api: f.ctx.interaxo_api.clone(),
             ui: f.ctx.ui.clone(),
+            throttle: Default::default(),
         };
         assert_eq!(relocate::forget_old_root(&ctx2), None);
         assert!(!old.exists(), "the empty old root is removed");
