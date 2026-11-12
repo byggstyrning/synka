@@ -79,7 +79,11 @@ async fn a_429_ends_the_walk_and_pauses_the_provider_not_the_project() {
     engine.st().next_due.insert(pid, Instant::now());
     let before = Instant::now();
     engine.finish_poll(pid, Err(err));
-    let left = f.ctx.throttle.remaining(Provider::Acc).expect("ACC is paused");
+    let left = f
+        .ctx
+        .throttle
+        .remaining(Provider::Acc)
+        .expect("ACC is paused");
     assert!(left > Duration::from_secs(55), "{left:?}");
     assert!(f.ctx.throttle.remaining(Provider::StreamBim).is_none());
     let st = engine.st();
@@ -115,8 +119,15 @@ async fn a_good_walk_lists_every_folder() {
     let server = acc(200).await;
     let f = walked("throttle-good", &server);
     let engine = Engine::new(f.ctx.clone());
-    engine.poll_project(f.p.pid).await.unwrap();
-    assert_eq!(listings(&server), FOLDERS + 1, "every folder and the top folder");
+    // ACC has no per-folder tiers (only StreamBIM does): every walk lists every folder.
+    engine.walk_delta(&f.p).await.unwrap();
+    assert_eq!(listings(&server), FOLDERS + 1);
+    assert!(engine.poll_project(f.p.pid).await.unwrap(), "it asked ACC");
+    assert_eq!(
+        listings(&server),
+        2 * (FOLDERS + 1),
+        "every folder and the top folder"
+    );
     assert!(f.ctx.throttle.remaining(Provider::Acc).is_none());
 }
 

@@ -247,7 +247,10 @@ fn waits(ctx: &CtxRef, job: &OutboxJob, offline: &HashSet<Provider>) -> bool {
             Some(p) => ctx.sign_in_target(p),
             None => provider.label().to_string(),
         };
-        (OFFLINE_RETRY_MS, format!("Logga in på {target} för att synka."))
+        (
+            OFFLINE_RETRY_MS,
+            format!("Logga in på {target} för att synka."),
+        )
     } else if offline.contains(&provider) {
         (
             OFFLINE_RETRY_MS,

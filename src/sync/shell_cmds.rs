@@ -270,6 +270,7 @@ impl Engine {
             for pid in pids {
                 if let Some(due) = st.next_due.get_mut(pid) {
                     *due = now;
+                    st.hot.want_full(*pid);
                 }
             }
         }
