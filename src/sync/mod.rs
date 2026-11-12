@@ -567,6 +567,7 @@ impl Engine {
         let (pids, relayout) = tokio::task::spawn_blocking(move || ensure_all_dirs(&ctx))
             .await
             .map_err(|e| anyhow!("uppgift avbröts: {e}"))??;
+        let rebuilt = self.rebuild_reverted_projects().await;
         // Deletes and renames made while no engine listened, then edits and new files (those
         // produce no watcher events either): compare the populated folders with the DB once.
         let ctx = self.ctx.clone();
@@ -603,6 +604,30 @@ impl Engine {
                     guard,
                 };
                 me.finish_reset(set, name).await;
+            }
+            for set in rebuilt {
+                me.clone()
+                    .finish_set_aside(set, |name, saved, dest| {
+                        format!(
+                            "{name} byggs om eftersom projektmappen inte längre var kopplad till Synka. {saved} filer som inte var synkade sparades i {}.",
+                            dest.display()
+                        )
+                    })
+                    .await;
+            }
+            let ctx = me.ctx.clone();
+            let (names, saved, dest) = tokio::task::spawn_blocking(move || sweep_orphans(&ctx))
+                .await
+                .unwrap_or_default();
+            if let Some(d) = dest.filter(|_| saved > 0) {
+                crate::diag::reveal(&d);
+                let msg = format!(
+                    "{} i synkmappen hörde inte till något synkat projekt och togs bort. {saved} filer från dem sparades i {}.",
+                    names.join(", "),
+                    d.display()
+                );
+                info!("{msg}");
+                me.ctx.ui.send(UiMsg::notify(Severity::Info, msg));
             }
             for (pid, id) in pending_moves(&me.ctx) {
                 me.schedule_move(pid, id);
@@ -3008,11 +3033,41 @@ impl Engine {
             provider: hub.provider,
             meta: setup.meta,
         };
+        let id = project.id.clone();
+        let was_on = db(&self.ctx, move |s| -> Result<bool> {
+            Ok(s.projects()?
+                .iter()
+                .any(|q| q.project_id == id && q.enabled))
+        })
+        .await?;
         let pid = db(&self.ctx, move |s| s.upsert_project(&p)).await?;
         self.st().tops_at.insert(pid, Instant::now());
         let p = db(&self.ctx, move |s| s.project(pid))
             .await?
             .ok_or_else(|| anyhow!("projektet försvann"))?;
+        // A folder already at the project's path that is not its placeholder would never be
+        // filled and could not be removed at unsubscribe: set it aside so a fresh placeholder
+        // takes its place, and save its files.
+        let (ctx, p2) = (self.ctx.clone(), p.clone());
+        let stale = tokio::task::spawn_blocking(move || {
+            if stale_project_dir(&ctx, &p2) {
+                reset::set_aside_project_dir(&ctx, &p2)
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("uppgift avbröts: {e}"))?;
+        let stale = match stale {
+            Ok(stale) => stale,
+            Err(e) => {
+                // Nothing was moved. Leave the project off rather than take the folder over.
+                if !was_on {
+                    db(&self.ctx, move |s| s.delete_project(pid)).await?;
+                }
+                return Err(e);
+            }
+        };
         let ctx = self.ctx.clone();
         tokio::task::spawn_blocking(move || ensure_project_dirs(&ctx, &p))
             .await
@@ -3021,6 +3076,22 @@ impl Engine {
         self.touch(pid);
         info!("prenumererar på {}", project.name);
         self.publish();
+        if let Some(set) = stale {
+            info!(
+                "{}: en mapp som inte var synkad låg på projektets plats och flyttades undan",
+                project.name
+            );
+            let me = self.clone();
+            self.spawn_maintenance(async move {
+                me.finish_set_aside(set, |name, saved, dest| {
+                    format!(
+                        "Det fanns redan en mapp för {name} som inte var synkad. Den togs bort och {saved} filer från den sparades i {}.",
+                        dest.display()
+                    )
+                })
+                .await;
+            });
+        }
         Ok(())
     }
 
@@ -3059,7 +3130,7 @@ impl Engine {
         }
         let ctx = self.ctx.clone();
         let p3 = p.clone();
-        tokio::task::spawn_blocking(move || {
+        let leftover = tokio::task::spawn_blocking(move || {
             let root_id = p3.root_id().to_string();
             let dir = project_dir(&ctx.paths.sync_root, &p3);
             let populated = ctx
@@ -3073,15 +3144,52 @@ impl Engine {
                 let mut kept = Vec::new();
                 remove_clean(&dir, populated, &mut kept);
             }
+            // What is still there was not Synka's to delete (plain folders left by an earlier
+            // install, say). Set it aside so its files are saved and the folder does not stay.
+            let leftover = if shares_project_dir(&ctx, &p3) {
+                Ok(None)
+            } else {
+                reset::set_aside_project_dir(&ctx, &p3)
+            };
             if let Some(hub_dir) = dir.parent() {
                 let _ = std::fs::remove_dir(hub_dir);
             }
+            leftover
         })
         .await
         .map_err(|e| anyhow!("uppgift avbröts: {e}"))?;
         db(&self.ctx, move |s| s.delete_project(pid)).await?;
         info!("avslutade synk för {}", p.name);
         self.publish();
+        match leftover {
+            Ok(None) => {}
+            Ok(Some(set)) => {
+                info!(
+                    "{}: det som låg kvar i projektmappen flyttades undan",
+                    p.name
+                );
+                let me = self.clone();
+                self.spawn_maintenance(async move {
+                    me.finish_set_aside(set, |name, saved, dest| {
+                        format!(
+                            "Synken för {name} avslutades. {saved} filer i projektmappen som inte var synkade sparades i {}.",
+                            dest.display()
+                        )
+                    })
+                    .await;
+                });
+            }
+            Err(e) => {
+                warn!("{}: projektmappen kunde inte tas bort: {e:#}", p.name);
+                self.ctx.ui.send(UiMsg::notify(
+                    Severity::Warning,
+                    format!(
+                        "Synken för {} avslutades, men projektmappen kunde inte tas bort. {e:#}",
+                        p.name
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3206,6 +3314,79 @@ impl Engine {
         };
         info!("{project}: {msg}");
         self.ctx.ui.send(UiMsg::notify(Severity::Info, msg));
+    }
+
+    /// At connect, before `reconcile`: rebuild the enabled projects whose folder Windows turned
+    /// into a plain one (`rebuild_reverted`). Skipped while other work could hold their files (a
+    /// rebuild or move, transfers, listings); the next connect tries again. Returns the set-aside
+    /// copies for `finish_set_aside`.
+    async fn rebuild_reverted_projects(self: &Arc<Self>) -> Vec<reset::SetAside> {
+        {
+            let st = self.st();
+            if st.recovering
+                || st.moving
+                || st.outbox_running
+                || !st.downloads.is_empty()
+                || !st.polling.is_empty()
+            {
+                return Vec::new();
+            }
+        }
+        let ctx = self.ctx.clone();
+        let results = tokio::task::spawn_blocking(move || rebuild_reverted(&ctx))
+            .await
+            .unwrap_or_default();
+        let mut sets = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(set) => {
+                    info!("{name}: projektmappen var en vanlig mapp och byggs om");
+                    sets.push(set);
+                }
+                Err(e) => {
+                    warn!(
+                        "{name}: projektmappen är en vanlig mapp men kunde inte byggas om: {e:#}"
+                    );
+                    self.ctx.ui.send(UiMsg::notify(
+                        Severity::Warning,
+                        format!("Projektmappen för {name} är inte längre kopplad till Synka och kunde inte byggas om. {e:#}"),
+                    ));
+                    if e.is::<reset::IncompleteReset>() {
+                        self.st().incomplete_recoveries.push(e);
+                    }
+                }
+            }
+        }
+        sets
+    }
+
+    /// Phase 2 for a project folder that subscribe or unsubscribe set aside: save its files that
+    /// were not synced, remove it, and remove the hub folder if that is now empty. `saved_msg`
+    /// (name, files saved, where) words the notice; nothing saved means no notice.
+    async fn finish_set_aside(
+        self: Arc<Self>,
+        set: reset::SetAside,
+        saved_msg: impl FnOnce(&str, usize, &Path) -> String + Send + 'static,
+    ) {
+        let Some(aside) = set.aside.clone() else {
+            return;
+        };
+        let ctx = self.ctx.clone();
+        let name = set.name.clone();
+        let (saved, dest) = tokio::task::spawn_blocking(move || {
+            let r = reset::finish_with(&ctx, &aside, &name, &reset::leftover_intro(&name));
+            drop(set.guard);
+            remove_empty_hub(&ctx, &aside);
+            r
+        })
+        .await
+        .unwrap_or((0, None));
+        if let Some(d) = dest.as_deref().filter(|_| saved > 0) {
+            crate::diag::reveal(d);
+            let msg = saved_msg(&set.name, saved, d);
+            info!("{msg}");
+            self.ctx.ui.send(UiMsg::notify(Severity::Info, msg));
+        }
     }
 
     /// Rebuild every project from ACC where it is (the reset tool for everything).
@@ -5159,6 +5340,169 @@ fn project_dir_spec(p: &Project) -> PlaceholderSpec {
     }
 }
 
+/// The project's folder is there but is not its placeholder: plain folders left when an earlier
+/// install's sync root went away, or a folder made outside Synka. Synka is never asked to fill
+/// such a folder and cannot remove it at unsubscribe, so it must not be taken over. A folder
+/// another enabled project has, or one that cannot be read, is left alone.
+fn stale_project_dir(ctx: &Ctx, p: &Project) -> bool {
+    let dir = project_dir(&ctx.paths.sync_root, p);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    let ours = match ph::placeholder_info(&dir) {
+        Ok(Some(info)) => ph::decode_identity(&info.identity).is_some_and(|(kind, pid, id)| {
+            kind == Kind::ProjectRoot && pid == p.pid && id == p.root_id()
+        }),
+        Ok(None) => false,
+        Err(_) => true,
+    };
+    !ours && !shares_project_dir(ctx, p)
+}
+
+/// Another enabled project has the same folder (same hub and project names). Unknown (the
+/// projects cannot be read) counts as shared.
+fn shares_project_dir(ctx: &Ctx, p: &Project) -> bool {
+    let dir = project_dir(&ctx.paths.sync_root, p);
+    ctx.store.projects().map_or(true, |ps| {
+        ps.iter().any(|q| {
+            q.enabled
+                && q.pid != p.pid
+                && naming::same_path(&project_dir(&ctx.paths.sync_root, q), &dir)
+        })
+    })
+}
+
+/// A directory that is not a Cloud Files placeholder. Synka never makes one at hub or project
+/// level, but Windows turns populated placeholder folders into such plain ones when the sync root
+/// is unregistered (a sign-out of everything, an uninstall). False when it cannot be read.
+fn plain_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && matches!(ph::placeholder_info(path), Ok(None))
+}
+
+/// Enabled projects whose folder is a plain folder (see `plain_dir`). Such a folder is never
+/// filled, holds stale copies, and the files Windows deleted from it would look like deletes to
+/// `reconcile`. Old-layout projects are rebuilt by the relayout, and a shared folder is left alone.
+fn reverted_projects(ctx: &Ctx) -> Vec<Project> {
+    ctx.store
+        .projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.enabled && !ctx.store.old_layout(p.pid).unwrap_or(true))
+        .filter(|p| plain_dir(&project_dir(&ctx.paths.sync_root, p)) && !shares_project_dir(ctx, p))
+        .collect()
+}
+
+/// Starts a rebuild of every reverted project (`reset::begin`: the folder is set aside, the
+/// project's rows are forgotten, a fresh placeholder takes its place). Runs before `reconcile`.
+fn rebuild_reverted(ctx: &Ctx) -> Vec<(String, Result<reset::SetAside>)> {
+    reverted_projects(ctx)
+        .into_iter()
+        .map(|p| (p.name.clone(), reset::begin(ctx, &p, None)))
+        .collect()
+}
+
+/// No enabled project has `dir` as its hub folder (a folder in the sync root) or as its project
+/// folder (a folder in a hub folder).
+fn unowned(ctx: &Ctx, projects: &[Project], dir: &Path) -> bool {
+    let Some(comps) = rel_components(&ctx.paths.sync_root, dir) else {
+        return false;
+    };
+    match comps.as_slice() {
+        [hub] => !projects
+            .iter()
+            .any(|p| p.enabled && naming::matches_local(&p.hub_name, hub)),
+        [hub, name] => !projects
+            .iter()
+            .any(|p| p.enabled && project_matches(p, hub, name)),
+        _ => false,
+    }
+}
+
+/// Folders directly in `dir`, without ignored names (set-aside copies among them). Hub folders
+/// are fully populated, so listing them asks no provider for anything.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter(|e| !ignore::ignored_name(&e.file_name().to_string_lossy()))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Folders in the sync root that no enabled project has: a whole hub folder without any of
+/// them, or a project folder in a hub folder that is in use. Nothing when the projects cannot be
+/// read.
+fn orphan_dirs(ctx: &Ctx) -> Vec<PathBuf> {
+    let Ok(projects) = ctx.store.projects() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for hub in subdirs(&ctx.paths.sync_root) {
+        if unowned(ctx, &projects, &hub) {
+            out.push(hub);
+        } else {
+            out.extend(
+                subdirs(&hub)
+                    .into_iter()
+                    .filter(|d| unowned(ctx, &projects, d)),
+            );
+        }
+    }
+    out
+}
+
+/// Sets aside and removes each folder of `orphan_dirs`, saving its unsynced files first. Each is
+/// checked again right before it moves (a project may have been subscribed meanwhile). Returns
+/// the names removed, the files saved and the first place they went.
+fn sweep_orphans(ctx: &Ctx) -> (Vec<String>, usize, Option<PathBuf>) {
+    let (mut names, mut saved, mut dest) = (Vec::new(), 0, None);
+    for dir in orphan_dirs(ctx) {
+        let projects = ctx.store.projects().unwrap_or_default();
+        if !unowned(ctx, &projects, &dir) {
+            continue;
+        }
+        let set = match reset::set_aside_orphan(&dir) {
+            Ok(Some(set)) => set,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!("kunde inte städa bort {}: {e:#}", dir.display());
+                continue;
+            }
+        };
+        let Some(aside) = set.aside.clone() else {
+            continue;
+        };
+        let (n, d) = reset::finish_with(ctx, &aside, &set.name, &reset::leftover_intro(&set.name));
+        drop(set.guard);
+        remove_empty_hub(ctx, &aside);
+        info!(
+            "tog bort {} ur synkmappen; {n} filer sparades",
+            dir.display()
+        );
+        names.push(set.name);
+        if n > 0 {
+            saved += n;
+            dest = dest.or(d);
+        }
+    }
+    (names, saved, dest)
+}
+
+/// Removes the hub folder that held the set-aside copy `aside`, if it is now empty. Never the
+/// sync root itself (a whole hub folder is set aside directly in it).
+fn remove_empty_hub(ctx: &Ctx, aside: &Path) {
+    if let Some(hub_dir) = aside
+        .parent()
+        .filter(|d| !naming::same_path(d, &ctx.paths.sync_root))
+    {
+        let _ = std::fs::remove_dir(hub_dir);
+    }
+}
+
 /// Create hub and project placeholders for one project if they are missing.
 fn ensure_project_dirs(ctx: &Ctx, p: &Project) -> Result<()> {
     let root = ctx.paths.sync_root.clone();
@@ -5167,6 +5511,13 @@ fn ensure_project_dirs(ctx: &Ctx, p: &Project) -> Result<()> {
     let hub_dir = root.join(&hub_name);
     if !hub_dir.is_dir() {
         ph::create_placeholders(&root, &[hub_dir_spec(p)])?;
+    } else if plain_dir(&hub_dir) {
+        // Left as a normal folder when an earlier sync root went away. Make it a hub placeholder
+        // again (in sync, fully populated, like a new one); its contents stay as they are.
+        let identity = ph::encode_identity(Kind::Hub, 0, &p.hub_id);
+        if let Err(e) = ph::convert_to_placeholder(&hub_dir, &identity, true) {
+            warn!("kunde inte koppla {} till Synka: {e:#}", hub_dir.display());
+        }
     }
     if !project_dir(&root, p).is_dir() {
         ph::create_placeholders(&hub_dir, &[project_dir_spec(p)])?;
@@ -10486,6 +10837,185 @@ pub(crate) mod tests {
         assert!(ignore::ignored_name(
             ".synka-reset-20261016-101010-Köpmannen"
         ));
+    }
+
+    #[test]
+    fn a_plain_folder_at_the_project_path_is_stale_unless_another_project_has_it() {
+        let f = fixture("stale-dir");
+        // The fixture's project folder is a plain folder, like one left by an earlier install.
+        assert!(stale_project_dir(&f.ctx, &f.p));
+        let mut twin = f.p.clone();
+        twin.project_id = "b.twin".into();
+        twin.pid = f.ctx.store.upsert_project(&twin).unwrap();
+        assert!(
+            !stale_project_dir(&f.ctx, &f.p),
+            "another project's folder was taken over"
+        );
+        f.ctx.store.set_project_enabled(twin.pid, false).unwrap();
+        assert!(stale_project_dir(&f.ctx, &f.p));
+        std::fs::remove_dir_all(&f.pdir).unwrap();
+        assert!(!stale_project_dir(&f.ctx, &f.p), "no folder is not stale");
+    }
+
+    #[test]
+    fn a_set_aside_project_folder_frees_the_path_and_keeps_its_files() {
+        let f = fixture("set-aside-project");
+        let ifc = f.dir.join("IFC");
+        std::fs::create_dir_all(ifc.join("Slussen")).unwrap();
+        std::fs::write(ifc.join("model.ifc"), b"local model").unwrap();
+        let set = reset::set_aside_project_dir(&f.ctx, &f.p)
+            .unwrap()
+            .expect("a folder to set aside");
+        let aside = set.aside.clone().unwrap();
+        assert!(!f.pdir.exists(), "the project path is still taken");
+        assert!(aside
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(reset::ASIDE_PREFIX));
+        assert_ne!(
+            attributes_of(&aside) & 2,
+            0,
+            "the set-aside copy is not hidden"
+        );
+        let (saved, dest) =
+            reset::finish_with(&f.ctx, &aside, &set.name, &reset::leftover_intro(&set.name));
+        let dest = dest.expect("rescue folder");
+        assert_eq!(saved, 1);
+        assert_eq!(
+            std::fs::read(dest.join("Project Files").join("IFC").join("model.ifc")).unwrap(),
+            b"local model"
+        );
+        let readme = std::fs::read_to_string(dest.join("LÄS MIG.txt")).unwrap();
+        assert!(
+            readme.contains("Mappen Köpmannen i synkmappen innehöll filer som inte var synkade"),
+            "{readme}"
+        );
+        assert!(!aside.exists(), "the set-aside copy is still there");
+        drop(set);
+        assert!(reset::set_aside_project_dir(&f.ctx, &f.p)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_removes_plain_folders_left_by_an_earlier_install() {
+        let f = fixture("unsubscribe-leftover");
+        // Never opened, and holding only plain folders, like a project folder left when an earlier
+        // install's sync root went away. Unsubscribe used to leave all of it behind.
+        f.ctx
+            .store
+            .set_populated(f.p.pid, PROJECT_ROOT_ID, false)
+            .unwrap();
+        std::fs::create_dir_all(f.dir.join("IFC").join("Slussen")).unwrap();
+        std::fs::create_dir_all(f.dir.join("SHAREPOINT")).unwrap();
+        let hub_dir = f.pdir.parent().unwrap().to_path_buf();
+        let engine = Engine::new(f.ctx.clone());
+        engine.unsubscribe(&f.p.project_id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while engine.st().maintenance_running > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the set-aside folder was not finished");
+        assert!(f.ctx.store.projects().unwrap().is_empty());
+        assert!(!f.pdir.exists(), "the project folder stayed");
+        assert!(!hub_dir.exists(), "the empty hub folder stayed");
+        assert!(
+            !reset::rescue_root(&f.ctx).exists(),
+            "an empty rescue folder was made"
+        );
+    }
+
+    #[test]
+    fn orphan_folders_are_those_no_enabled_project_has() {
+        let f = fixture("orphans");
+        let root = f.ctx.paths.sync_root.clone();
+        let hub = f.pdir.parent().unwrap().to_path_buf();
+        let old_project = hub.join("Gammalt projekt");
+        let old_hub = root.join("StreamBIM");
+        std::fs::create_dir_all(&old_project).unwrap();
+        std::fs::create_dir_all(old_hub.join("Nobel Center").join("Dokument")).unwrap();
+        std::fs::create_dir_all(hub.join(".synka-reset-20261111-120000-Köpmannen")).unwrap();
+        std::fs::write(root.join("desktop.ini"), b"").unwrap();
+        let mut found = orphan_dirs(&f.ctx);
+        found.sort();
+        let mut expected = vec![old_project, old_hub];
+        expected.sort();
+        assert_eq!(found, expected);
+
+        // A project of another hub in use keeps that hub folder; only its other folders go.
+        let mut nobel = f.p.clone();
+        nobel.project_id = "s.nobel".into();
+        nobel.hub_id = "s.hub".into();
+        nobel.hub_name = "StreamBIM".into();
+        nobel.name = "Nobel Center".into();
+        f.ctx.store.upsert_project(&nobel).unwrap();
+        assert_eq!(orphan_dirs(&f.ctx), vec![hub.join("Gammalt projekt")]);
+    }
+
+    #[test]
+    fn startup_sweep_removes_unowned_folders_but_never_the_sync_root() {
+        let f = fixture("sweep");
+        let root = f.ctx.paths.sync_root.clone();
+        let old = root.join("StreamBIM").join("Nobel Center").join("Dokument");
+        std::fs::create_dir_all(old.join("IFC").join("Slussen")).unwrap();
+        std::fs::write(old.join("IFC").join("model.ifc"), b"stale copy").unwrap();
+        let (names, saved, dest) = sweep_orphans(&f.ctx);
+        assert_eq!(names, vec!["StreamBIM".to_string()]);
+        assert_eq!(saved, 1);
+        let dest = dest.expect("rescue folder");
+        assert_eq!(
+            std::fs::read(
+                dest.join("Nobel Center")
+                    .join("Dokument")
+                    .join("IFC")
+                    .join("model.ifc")
+            )
+            .unwrap(),
+            b"stale copy"
+        );
+        assert!(!root.join("StreamBIM").exists(), "the orphan hub stayed");
+        assert!(f.pdir.exists(), "a synced project's folder was swept");
+
+        // With nothing synced, everything goes, but the sync root itself stays.
+        f.ctx.store.set_project_enabled(f.p.pid, false).unwrap();
+        let (names, saved, _) = sweep_orphans(&f.ctx);
+        assert_eq!(names, vec!["Byggstyrning".to_string()]);
+        assert_eq!(saved, 0);
+        assert!(root.is_dir(), "the sync root was removed");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reverted_projects_are_enabled_projects_with_a_plain_folder() {
+        let f = fixture("reverted");
+        // Fixture folders are plain, like a populated project folder after the sync root was
+        // unregistered.
+        assert_eq!(
+            reverted_projects(&f.ctx)
+                .into_iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+            vec![f.p.pid]
+        );
+        let mut twin = f.p.clone();
+        twin.project_id = "b.twin".into();
+        twin.pid = f.ctx.store.upsert_project(&twin).unwrap();
+        assert!(
+            reverted_projects(&f.ctx).is_empty(),
+            "a shared folder was rebuilt"
+        );
+        f.ctx.store.set_project_enabled(twin.pid, false).unwrap();
+        f.ctx.store.set_project_enabled(f.p.pid, false).unwrap();
+        assert!(reverted_projects(&f.ctx).is_empty());
+        f.ctx.store.set_project_enabled(f.p.pid, true).unwrap();
+        std::fs::remove_dir_all(&f.pdir).unwrap();
+        assert!(
+            reverted_projects(&f.ctx).is_empty(),
+            "a missing folder is not a plain one"
+        );
     }
 
     #[test]

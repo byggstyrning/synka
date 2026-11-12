@@ -11,11 +11,11 @@ Until Synka is published there, admins add it under **Custom integrations** inst
 | APS app | Done. Developer Hub *Byggstyrning*, app **Synka**; Client ID `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA` (`config::DEFAULT_CLIENT_ID`); Desktop/Mobile/SPA, PKCE, callback `http://localhost:47863/` |
 | Publisher profile | Done. Publisher Corner (https://apps.autodesk.com/en/MyUploads): Jonatan Jacobsson, byggstyrning.se, support `info@byggstyrning.se`; My Page: company *Byggstyrning* |
 | Publisher Agreement | Accepted 3 November 2026 (version of 3 May 2026) |
-| Privacy policy | `docs/PRIVACY.md`, published at https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md once merged to main; the About page links to it from 0.3.6. Still a draft until counsel has read it |
-| Release | [v0.3.6](https://github.com/byggstyrning/synka/releases/tag/v0.3.6), a pre-release with `Synka-0.3.6.zip`. **Unsigned** (the release key was not available), so it cannot be installed; v0.3.5 stays the latest signed release |
+| Privacy policy | `docs/PRIVACY.md`, published at https://github.com/byggstyrning/synka/blob/main/docs/PRIVACY.md; the About page links to it from 0.3.6. Still a draft until counsel has read it |
+| Release | [v0.3.6](https://github.com/byggstyrning/synka/releases/tag/v0.3.6), a pre-release with `Synka-0.3.6.zip` (top folder `Synka-0.3.6/`, installed with `Install.cmd`). Signed with the **earlier** `CN=FastADC` key `03F6B767F3CFC690AB55333AAE6093AC0C8CF233` (valid to 2027-10-16), because the current release key was not available; the zip carries that certificate. The release gate and the BoomerHubb channel did not run |
 | Listing | App ID `3397524952584336133`, status **Pending review**. Platform is set to **Web**; it should be **Windows 64-bit** (owner changes it in the portal). The earlier draft, App ID `1478764073777710332`, no longer exists |
-| Listing file | Which file and which build (default or ACC-only, below) the listing points to: to be confirmed by the owner. The earlier draft's File link was the unsigned `Synka-0.3.6.zip` above |
-| Listing values | As entered on the earlier draft: price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration) |
+| Listing file | Which file and which build (default or ACC-only, below) the listing points to: to be confirmed by the owner. The earlier draft's File link was `Synka-0.3.6.zip` above |
+| Listing values | As saved on 3 November, with the platform set to Web: login type **Sign in with Autodesk account**; price **Free**; compatibility **Autodesk Construction Cloud → ACC**; categories **Integration**, **Construction Management**; stores US, EMEA, Australia; Forge Client Id `tFf8sYIHNWSrUiahpJPPxVujQTC3LJfAAEY3GZK3hEeLQ6jA`; data permission **Docs** only (not Account Administration); 5 captioned screenshots (Overview, Projects, Explorer, Settings, About); workflow video https://www.youtube.com/watch?v=mmGS4ut3zKE (unlisted, 4:13), time stamp 2026-11-03 09:00:38 UTC (the Autodesk sign-in in Synka's log) |
 
 ### Which build: default or ACC-only
 
@@ -53,9 +53,19 @@ The Marketplace gets the same content as the sideload zip, named without `-sidla
 it where the listing's File link points (`gh release upload v<ver> dist\Synka-<ver>.zip
 --clobber` for a file on a GitHub release), once the owner has confirmed that link.
 
+v0.3.6 was built on a machine without the release key: `packaging\FastADC.cer` was replaced, in
+the working tree only, by the public certificate of the earlier key, so `build_msix.ps1 -Sign
+-SkipEngineBuild` and `make_delivery.ps1 -SkipBuild` signed and checked with that key; the file was
+restored afterwards. The engine had been built with the committed certificate, so the updater's
+pinned certificate is unchanged.
+
 Autodesk's review checklist (shown in the form): description and usage instructions of at least
 1500 characters each, at least 4 screenshots, company URL and privacy policy URL, a binary app
 file, a three-part version number, no unhandled exceptions, and uninstall removes all files.
+
+The step 2 time stamp field takes **local** time as `MM/DD/YYYY HH:mm:ss` and converts it to UTC
+when saved; text in any other format is replaced by the current time and the save fails with
+"Missing Video Stamp".
 
 ## Publishing checklist
 
