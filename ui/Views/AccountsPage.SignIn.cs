@@ -285,7 +285,7 @@ public sealed partial class AccountsPage
             }
             else
             {
-                ShowCode(codeFor);
+                ShowCode(codeFor, _page._engine.SignInProgressFor(ProviderNames.StreamBim, codeFor)?.Error);
             }
 
             await _page.ShowDialogAsync(_dialog);
@@ -320,15 +320,17 @@ public sealed partial class AccountsPage
                 case "mfa_required":
                     if (_onCode)
                     {
-                        // Another prompt for the same attempt: the code is asked again.
+                        // Another prompt for the same attempt: the code is asked again, with the
+                        // engine's reason (a wrong code, say). The password is not typed again.
                         _codeSent = false;
                         _code.Text = string.Empty;
-                        ShowCodeError(null);
+                        ShowCodeError(ErrorDisplay.FriendlyDetail(progress.Error));
                         Refresh();
+                        _code.Focus(FocusState.Programmatic);
                     }
                     else
                     {
-                        ShowCode(key);
+                        ShowCode(key, progress.Error);
                     }
                     break;
 
@@ -472,13 +474,14 @@ public sealed partial class AccountsPage
             Refresh();
         }
 
-        private void ShowCode(string key)
+        /// <summary>The code step for the account `key`. `error` is why the engine asks again, when it does.</summary>
+        private void ShowCode(string key, string? error = null)
         {
             _attempt = key;
             _onCode = true;
             _codeSent = false;
             _code.Text = string.Empty;
-            ShowCodeError(null);
+            ShowCodeError(ErrorDisplay.FriendlyDetail(error));
             var host = _page.ServerHostFor(key);
             _dialog.Content = _codeStep;
             _dialog.Title = Lang.T(

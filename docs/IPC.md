@@ -97,7 +97,9 @@ See `docs/PROVIDERS.md`. Clarifications:
   password goes only to that server. The password is used once and never stored or logged.
   `sign_in_progress` reports `browser` (ACC/Interaxo, waiting for the browser),
   `mfa_required` (StreamBIM, send `sign_in_mfa` within five minutes), then `signed_in`, `failed`
-  (with `error`) or `cancelled`. A failed MFA code gives `failed`; the user starts over.
+  (with `error`) or `cancelled`. A wrong MFA code gives `mfa_required` again, with `error`
+  saying so; the third wrong code, and any other refusal of the code, gives `failed` and the
+  user starts over with the password.
 - **`sign_out`.** Signing out of one provider stops polling and uploading its projects; their
   folders stay. The sync root is unregistered only when no provider is signed in.
 - **Interaxo settings.** `interaxo_client_id`, `interaxo_redirect_uri` and

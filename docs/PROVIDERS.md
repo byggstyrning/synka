@@ -219,7 +219,14 @@ jobs wait as if offline) and leaves its folders in place.
   (Europe, default), `sweden`, `japan`, `australia`, `spf`. Host `https://<subdomain>.streambim.com`.
   Both `distinctiveLanguages` and the misspelled `disctintiveLanguages` are optional.
 - Login: `POST /auth/v1/login {"username","password"}` → `result` `SUCCESS` (tokens) or
-  `CHALLENGE_REQUESTED` (`session`). MFA: `POST /auth/v1/mfa/verify {"username","session","code"}`.
+  `CHALLENGE_REQUESTED` (`session`). StreamBIM sends the challenge with **HTTP 401**, so a 401
+  whose body says `CHALLENGE_REQUESTED` is the MFA step, not a wrong password (StreamBIM's web
+  app reads it that way). MFA: `POST /auth/v1/mfa/verify {"username","session","code"}`; a wrong
+  code answers `{"error": "invalidCode"}` and the same `session` takes another code (Synka: three
+  tries, then a new password step).
+- Refusals pass Cognito's error on as one string, "operation error Cognito Identity Provider:
+  <op>, https response error StatusCode: <n>, RequestID: <id>, <Exception>: <message>". Synka
+  shows `<Exception>: <message>` first; "Identity Provider" in it does not mean SSO.
 - Bearer is the **`idToken`**. Refresh: `POST /auth/v1/refresh {"token": <last idToken>,
   "refreshToken"}`; it may also answer `CHALLENGE_REQUESTED` → the user must sign in again.
 - The password is never stored or logged. It travels once over the per-user pipe.

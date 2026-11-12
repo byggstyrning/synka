@@ -41,6 +41,8 @@ fn profile_file(key: &str) -> String {
 }
 /// An MFA challenge is accepted this long after the password step.
 const CHALLENGE_TTL_SECS: i64 = 5 * 60;
+/// Wrong codes one challenge takes. The next wrong code ends it: a new password step is needed.
+const MAX_CODE_TRIES: u32 = 3;
 /// The id token is refreshed when less than this is left of its lifetime.
 const REFRESH_MARGIN_SECS: i64 = 5 * 60;
 /// Used when a reply has no `expiresIn` (undocumented; docs/specs/streambim-endpoints.md 2.2).
@@ -51,6 +53,9 @@ const JSON_API: &str = "application/vnd.api+json";
 const NOT_SIGNED_IN: &str = "Inte inloggad på StreamBIM – logga in igen.";
 const SESSION_EXPIRED: &str = "StreamBIM-sessionen har gått ut – logga in igen. (Session expired)";
 const CODE_EXPIRED: &str = "Koden har gått ut – logga in igen.";
+const WRONG_CODE: &str = "Fel kod. Ange koden som autentiseringsappen visar nu.";
+const WRONG_CODE_LAST: &str = "Fel kod för många gånger – logga in igen.";
+const MFA_SESSION_ENDED: &str = "Inloggningen hos StreamBIM har gått ut – logga in igen.";
 const REFRESH_RETRY: &str =
     "StreamBIM-sessionen kunde inte förnyas: inget giltigt svar. Försök igen.";
 const TOO_MANY_LOGINS: &str =
@@ -138,6 +143,8 @@ struct Challenge {
     session: String,
     /// Unix seconds.
     issued_at: i64,
+    /// Wrong codes so far.
+    tries: u32,
 }
 
 /// The reply of `/auth/v1/login`, `/auth/v1/mfa/verify` and `/auth/v1/refresh`. Only the fields
@@ -281,6 +288,7 @@ impl StreamBimAuth {
                         username: username.to_string(),
                         session,
                         issued_at: now_secs(),
+                        tries: 0,
                     });
                     info!("StreamBIM: MFA-kod krävs (server {})", self.key);
                     Ok(LoginOutcome::MfaRequired)
@@ -300,14 +308,15 @@ impl StreamBimAuth {
     }
 
     /// TOTP step after `login` returned `MfaRequired`. The code must be six ASCII digits and the
-    /// challenge at most five minutes old. Any definitive answer from the server (success or a
-    /// 400/401/403 rejection) ends the challenge, so a code cannot be guessed over many tries
-    /// without a new password step. A transient failure keeps it for a retry.
+    /// challenge at most five minutes old. A wrong code keeps the challenge for another code, as
+    /// StreamBIM's web app does, but only `MAX_CODE_TRIES` times: a code cannot be guessed over
+    /// many tries without a new password step. Any other definitive answer (success or a
+    /// 400/401/403 refusal) ends the challenge. A transient failure keeps it for a retry.
     pub async fn verify_mfa(&self, code: &str) -> Result<UserInfo> {
         if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
             bail!("Ange de sex siffrorna från din autentiseringsapp.");
         }
-        let challenge = match self.st().pending.take() {
+        let mut challenge = match self.st().pending.take() {
             Some(c) if now_secs() - c.issued_at < CHALLENGE_TTL_SECS => c,
             _ => bail!(CODE_EXPIRED),
         };
@@ -323,45 +332,74 @@ impl StreamBimAuth {
             challenge.session.as_str(),
             code,
         ];
-        match self.call("mfa/verify", &url, &body, &secrets).await {
-            Answer::Reply(reply) if reply.result == "SUCCESS" => {
-                let tokens = tokens_from(reply, None, now_secs()).ok_or_else(|| {
-                    anyhow!("StreamBIM-verifieringen misslyckades: svaret saknar token.")
-                })?;
-                let name = self.profile_name(&base, &tokens.id_token).await;
-                let profile = Profile {
-                    user_id: challenge.username.clone(),
-                    name: name.unwrap_or_else(|| challenge.username.clone()),
-                    email: challenge.username.clone(),
-                    region: self.key.clone(),
-                    base,
-                };
-                self.save_session(tokens, &profile)?;
-                info!("StreamBIM: MFA godkänd (server {})", self.key);
-                Ok(profile_user(&profile))
-            }
-            // Any other definitive answer ends the challenge, as a refusal does.
-            Answer::Reply(reply) => {
-                let result = clean(&reply.result, &secret_forms(&secrets), RESULT_CHARS);
-                bail!(mfa_refusal(200, "", &result))
-            }
-            Answer::Status {
-                status,
-                code: error_code,
-                reason,
-            } => {
-                let message = mfa_refusal(status, &error_code, &reason);
-                // A transient failure keeps the challenge for another try.
-                if !matches!(status, 400 | 401 | 403) {
-                    self.st().pending = Some(challenge);
+        // (the text, whether the code was wrong, whether the answer ends the challenge)
+        let (message, wrong, definitive) =
+            match self.call("mfa/verify", &url, &body, &secrets).await {
+                Answer::Reply(reply) if reply.result == "SUCCESS" => {
+                    let tokens = tokens_from(reply, None, now_secs()).ok_or_else(|| {
+                        anyhow!("StreamBIM-verifieringen misslyckades: svaret saknar token.")
+                    })?;
+                    let name = self.profile_name(&base, &tokens.id_token).await;
+                    let profile = Profile {
+                        user_id: challenge.username.clone(),
+                        name: name.unwrap_or_else(|| challenge.username.clone()),
+                        email: challenge.username.clone(),
+                        region: self.key.clone(),
+                        base,
+                    };
+                    self.save_session(tokens, &profile)?;
+                    info!("StreamBIM: MFA godkänd (server {})", self.key);
+                    return Ok(profile_user(&profile));
                 }
-                bail!(message)
+                // The server asks for a code again: the code was not accepted. A new session
+                // string, when there is one, is the one the next code goes with.
+                Answer::Reply(reply) if reply.result == "CHALLENGE_REQUESTED" => {
+                    if let Some(session) = reply.session.filter(|s| !s.is_empty()) {
+                        challenge.session = session;
+                    }
+                    (WRONG_CODE.to_string(), true, true)
+                }
+                Answer::Reply(reply) => {
+                    let result = clean(&reply.result, &secret_forms(&secrets), RESULT_CHARS);
+                    (mfa_refusal(200, "", &result), wrong_code("", &result), true)
+                }
+                Answer::Status {
+                    status,
+                    code: error_code,
+                    reason,
+                } => (
+                    mfa_refusal(status, &error_code, &reason),
+                    wrong_code(&error_code, &reason),
+                    matches!(status, 400 | 401 | 403),
+                ),
+                Answer::Failed => (
+                    "StreamBIM-verifieringen misslyckades: inget giltigt svar från servern."
+                        .to_string(),
+                    false,
+                    false,
+                ),
+            };
+        if wrong {
+            challenge.tries += 1;
+            if challenge.tries >= MAX_CODE_TRIES {
+                info!(
+                    "StreamBIM: fel MFA-kod för många gånger (server {})",
+                    self.key
+                );
+                bail!(WRONG_CODE_LAST);
             }
-            Answer::Failed => {
-                self.st().pending = Some(challenge);
-                bail!("StreamBIM-verifieringen misslyckades: inget giltigt svar från servern.")
-            }
+            info!(
+                tries = challenge.tries,
+                "StreamBIM: fel MFA-kod (server {})", self.key
+            );
+            self.st().pending = Some(challenge);
+            bail!(WRONG_CODE);
         }
+        // A transient failure keeps the challenge for another try.
+        if !definitive {
+            self.st().pending = Some(challenge);
+        }
+        bail!(message)
     }
 
     /// Forget the session: memory, token file and profile. The server has no logout endpoint.
@@ -566,10 +604,12 @@ impl StreamBimAuth {
         write_atomic(&self.token_path(), &dpapi_protect(&plain)?)
     }
 
-    /// POST a JSON body. A 2xx with a JSON body is a `Reply`. Any other status is a `Status`
-    /// with the server's code and reason. `secrets` are the values sent in this request; they are
-    /// removed from everything that is kept or logged. Each failed call is logged at WARN with
-    /// the endpoint, the status, the code and the reason.
+    /// POST a JSON body. A 2xx with a JSON body is a `Reply`, and so is a refusal whose body says
+    /// `CHALLENGE_REQUESTED`: StreamBIM asks for the MFA code with HTTP 401 (its web app reads
+    /// `result` and `session` from the 401 body). Any other status is a `Status` with the
+    /// server's code and reason. `secrets` are the values sent in this request; they are removed
+    /// from everything that is kept or logged. Each failed call is logged at WARN with the
+    /// endpoint, the status, the code and the reason.
     async fn call(&self, endpoint: &str, url: &str, body: &Value, secrets: &[&str]) -> Answer {
         let Ok(bytes) = serde_json::to_vec(body) else {
             return Answer::Failed;
@@ -593,7 +633,15 @@ impl StreamBimAuth {
         let status = resp.status().as_u16();
         debug!(endpoint, status, "StreamBIM: auth");
         if !(200..300).contains(&status) {
-            let (code, reason) = refusal_details(&read_error_body(resp).await, &forms);
+            let bytes = read_error_body(resp).await;
+            if let Some(reply) = serde_json::from_slice::<AuthReply>(&bytes)
+                .ok()
+                .filter(|reply| reply.result == "CHALLENGE_REQUESTED")
+            {
+                info!(endpoint, status, "StreamBIM: servern begär en MFA-kod");
+                return Answer::Reply(reply);
+            }
+            let (code, reason) = refusal_details(&bytes, &forms);
             warn!(endpoint, status, code = %code, reason = %reason, "StreamBIM: anropet avvisades");
             return Answer::Status {
                 status,
@@ -602,7 +650,11 @@ impl StreamBimAuth {
             };
         }
         match resp.json::<AuthReply>().await {
-            Ok(reply) => {
+            Ok(mut reply) => {
+                // Token data without a `result` is a success: the web app reads only the tokens.
+                if reply.result.is_empty() && !reply.id_token.is_empty() {
+                    reply.result = "SUCCESS".to_string();
+                }
                 if !matches!(reply.result.as_str(), "SUCCESS" | "CHALLENGE_REQUESTED") {
                     let result = clean(&reply.result, &forms, RESULT_CHARS);
                     warn!(endpoint, status, result = %result, "StreamBIM: oväntat resultat i svaret");
@@ -759,7 +811,8 @@ fn refusal_details(body: &[u8], forms: &[String]) -> (String, String) {
     (code, reason)
 }
 
-/// The first candidate that is not empty once cleaned.
+/// The first candidate that is not empty once cleaned. The secrets are removed before an AWS
+/// error is reordered (`aws_error_first`), so no reordering can split one.
 fn first_clean<'a>(
     candidates: impl IntoIterator<Item = Option<&'a str>>,
     forms: &[String],
@@ -768,9 +821,29 @@ fn first_clean<'a>(
     candidates
         .into_iter()
         .flatten()
-        .map(|raw| clean(raw, forms, cap))
+        .map(|raw| clean(&aws_error_first(&redact(raw, forms)), forms, cap))
         .find(|text| !text.is_empty())
         .unwrap_or_default()
+}
+
+/// An AWS SDK error as StreamBIM passes it on, "operation error Cognito Identity Provider:
+/// InitiateAuth, https response error StatusCode: 400, RequestID: <id>, NotAuthorizedException:
+/// Incorrect username or password.", becomes "NotAuthorizedException: Incorrect username or
+/// password. (RequestID: <id>)". What went wrong then comes first and is kept by the length caps.
+/// Other text is returned as it is.
+fn aws_error_first(text: &str) -> String {
+    const ID: &str = "RequestID: ";
+    let reordered = text
+        .trim_start()
+        .starts_with("operation error ")
+        .then(|| text.find(ID))
+        .flatten()
+        .and_then(|at| text[at + ID.len()..].split_once(", "))
+        .map(|(id, tail)| (id.trim(), tail.trim()))
+        .map(|(id, tail)| (id, tail.strip_prefix("api error ").unwrap_or(tail)))
+        .filter(|(_, tail)| !tail.is_empty())
+        .map(|(id, tail)| format!("{tail} (RequestID: {id})"));
+    reordered.unwrap_or_else(|| text.to_string())
 }
 
 /// Each secret as it can appear in a reply: as typed, and as JSON text (quotes and backslashes
@@ -884,11 +957,9 @@ fn login_refusal(key: &str, status: u16, code: &str, reason: &str) -> String {
         return "StreamBIM-kontot är inte bekräftat ännu. Bekräfta det via e-posten från StreamBIM."
             .to_string();
     }
-    if mentions(
-        code,
-        reason,
-        &["federat", "sso", "external", "identity provider"],
-    ) {
+    // Not "identity provider": every Cognito error starts "operation error Cognito Identity
+    // Provider: …", a wrong password too.
+    if mentions(code, reason, &["federat", "sso", "external"]) {
         return "Kontot loggar in via SSO (t.ex. Microsoft). Synka kan bara logga in StreamBIM-konton med lösenord ännu."
             .to_string();
     }
@@ -918,10 +989,28 @@ fn password_reset_text(key: &str) -> String {
     )
 }
 
+/// True when a refused verify_mfa call says the code was wrong. StreamBIM's web app reads
+/// `{"error": "invalidCode"}`; Cognito says `CodeMismatchException`.
+fn wrong_code(code: &str, reason: &str) -> bool {
+    mentions(code, reason, &["codemismatch", "invalid code", "incorrect"])
+}
+
 /// The Swedish text for a refused verify_mfa call.
 fn mfa_refusal(status: u16, code: &str, reason: &str) -> String {
-    if mentions(code, reason, &["codemismatch", "invalid code", "incorrect"]) {
-        return "Fel kod. Logga in igen och ange en ny kod.".to_string();
+    if wrong_code(code, reason) {
+        return WRONG_CODE.to_string();
+    }
+    if mentions(
+        code,
+        reason,
+        &[
+            "invalid session",
+            "session is expired",
+            "session expired",
+            "session can only be used once",
+        ],
+    ) {
+        return MFA_SESSION_ENDED.to_string();
     }
     if status == 429 {
         return TOO_MANY_LOGINS.to_string();
@@ -1537,14 +1626,147 @@ mod tests {
         assert_eq!(err, CODE_EXPIRED);
         assert_eq!(server.count(), 1);
 
-        // A wrong code ends the challenge: the next try needs a new password step.
+        // A wrong code keeps the challenge for another code, up to MAX_CODE_TRIES wrong codes.
+        // Then the challenge ends: the next try needs a new password step.
         auth.login("ada@example.com", "pw").await.unwrap();
+        for _ in 1..MAX_CODE_TRIES {
+            let err = auth.verify_mfa("000000").await.unwrap_err().to_string();
+            assert_eq!(err, WRONG_CODE);
+            assert!(auth.has_pending_mfa());
+        }
         let err = auth.verify_mfa("000000").await.unwrap_err().to_string();
-        assert_eq!(err, "Fel kod. Logga in igen och ange en ny kod.");
-        assert_eq!(server.count(), 3);
+        assert_eq!(err, WRONG_CODE_LAST);
+        assert!(!auth.has_pending_mfa());
+        assert_eq!(server.count(), 2 + MAX_CODE_TRIES as usize);
         let err = auth.verify_mfa("000000").await.unwrap_err().to_string();
         assert_eq!(err, CODE_EXPIRED);
-        assert_eq!(server.count(), 3);
+        assert_eq!(server.count(), 2 + MAX_CODE_TRIES as usize);
+    }
+
+    /// StreamBIM's own shape: the challenge comes with HTTP 401, and the verify reply is token
+    /// data (its web app reads no `result` from it).
+    #[tokio::test]
+    async fn a_challenge_sent_with_401_asks_for_the_code() {
+        let server = Server::new(|req, _| match req.target.as_str() {
+            "/auth/v1/login" => reply_json(
+                401,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-secret-7"}),
+            ),
+            "/auth/v1/mfa/verify" => reply_json(
+                200,
+                json!({"idToken": "id-2", "refreshToken": "rt-2", "accessToken": "at-2",
+                       "tokenType": "Bearer", "expiresIn": 3600}),
+            ),
+            t if t.starts_with("/mgw/api/v2/user-profiles") => profile_reply(),
+            _ => Fault::reply(404, "unexpected"),
+        })
+        .await;
+        let dir = TestDir::new("mfa401");
+        let auth = StreamBimAuth::for_test_key(http(), dir.path(), "sweden", &server.origin);
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        let outcome = auth.login("ada@example.com", "pw").await.unwrap();
+        assert!(matches!(outcome, LoginOutcome::MfaRequired));
+        assert!(auth.has_pending_mfa());
+        assert!(!auth.is_signed_in());
+
+        let user = auth.verify_mfa("123456").await.unwrap();
+        assert_eq!(user.name, "Ada Lovelace");
+        assert!(auth.is_signed_in());
+        let mfa = server
+            .requests()
+            .into_iter()
+            .find(|r| r.target == "/auth/v1/mfa/verify")
+            .unwrap();
+        assert_eq!(
+            body_json(&mfa),
+            json!({"username": "ada@example.com", "session": "sess-secret-7", "code": "123456"})
+        );
+        let log = logs.text();
+        assert!(!log.contains("anropet avvisades"), "{log}");
+        assert!(!log.contains("sess-secret-7"), "{log}");
+
+        // The verify reply's refresh token is the one the session refreshes with.
+        auth.invalidate().await;
+        let _ = auth.access_token().await;
+        let refresh = server
+            .requests()
+            .into_iter()
+            .find(|r| r.target == "/auth/v1/refresh")
+            .unwrap();
+        assert_eq!(
+            body_json(&refresh),
+            json!({"token": "id-2", "refreshToken": "rt-2"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_code_can_be_typed_again_with_the_same_session() {
+        let server = Server::scripted(vec![
+            reply_json(
+                401,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-1"}),
+            ),
+            reply_json(400, json!({"error": "invalidCode"})),
+            reply_json(
+                200,
+                json!({"result": "SUCCESS", "idToken": "id-2", "refreshToken": "rt-2", "expiresIn": 3600}),
+            ),
+            profile_reply(),
+        ])
+        .await;
+        let dir = TestDir::new("retrycode");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("ada@example.com", "pw").await.unwrap();
+
+        let err = auth.verify_mfa("111111").await.unwrap_err().to_string();
+        assert_eq!(err, WRONG_CODE);
+        assert!(auth.has_pending_mfa());
+        auth.verify_mfa("222222").await.unwrap();
+        assert!(auth.is_signed_in());
+        assert!(!auth.has_pending_mfa());
+
+        let sessions: Vec<Value> = server
+            .requests()
+            .iter()
+            .filter(|r| r.target == "/auth/v1/mfa/verify")
+            .map(|r| body_json(r)["session"].clone())
+            .collect();
+        assert_eq!(sessions, vec![json!("sess-1"), json!("sess-1")]);
+    }
+
+    #[tokio::test]
+    async fn a_new_challenge_from_the_verify_step_takes_the_next_code() {
+        let server = Server::scripted(vec![
+            reply_json(
+                200,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-1"}),
+            ),
+            reply_json(
+                401,
+                json!({"result": "CHALLENGE_REQUESTED", "session": "sess-2"}),
+            ),
+            reply_json(
+                200,
+                json!({"result": "SUCCESS", "idToken": "id-2", "expiresIn": 3600}),
+            ),
+            profile_reply(),
+        ])
+        .await;
+        let dir = TestDir::new("rechallenge");
+        let auth = StreamBimAuth::for_test(http(), dir.path(), &server.origin);
+        auth.login("ada@example.com", "pw").await.unwrap();
+
+        let err = auth.verify_mfa("111111").await.unwrap_err().to_string();
+        assert_eq!(err, WRONG_CODE);
+        auth.verify_mfa("222222").await.unwrap();
+        let last = server
+            .requests()
+            .into_iter()
+            .rfind(|r| r.target == "/auth/v1/mfa/verify")
+            .unwrap();
+        assert_eq!(body_json(&last)["session"], json!("sess-2"));
     }
 
     #[tokio::test]
@@ -1787,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn refusals_and_a_new_mfa_challenge_end_the_session() {
-        let answers: [(&str, Fault); 4] = [
+        let answers: [(&str, Fault); 5] = [
             ("400", Fault::reply(400, "bad")),
             ("401", Fault::reply(401, "bad")),
             ("403", Fault::reply(403, "bad")),
@@ -1795,6 +2017,13 @@ mod tests {
                 "challenge",
                 reply_json(
                     200,
+                    json!({"result": "CHALLENGE_REQUESTED", "session": "s"}),
+                ),
+            ),
+            (
+                "challenge with 401",
+                reply_json(
+                    401,
                     json!({"result": "CHALLENGE_REQUESTED", "session": "s"}),
                 ),
             ),
@@ -1959,6 +2188,51 @@ mod tests {
             err,
             "Fel e-post eller lösenord för StreamBIM (region sweden). Kontrollera också att kontot finns i den regionen."
         );
+    }
+
+    /// StreamBIM passes Cognito's error on in one string that names the "Cognito Identity
+    /// Provider" (seen live on sweden.streambim.com). That is a wrong password, not SSO.
+    #[tokio::test]
+    async fn streambims_cognito_wrong_password_text_is_a_password_error() {
+        let err = login_error_with(reply_json(
+            401,
+            json!({"error": "operation error Cognito Identity Provider: InitiateAuth, https response error StatusCode: 400, RequestID: 3d6e4fe6-7051-4e7a-b828-e4d05bd18a2b, NotAuthorizedException: Incorrect username or password."}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "Fel e-post eller lösenord för StreamBIM (region sweden). Kontrollera också att kontot finns i den regionen."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aws_error_shows_what_went_wrong_first() {
+        let err = login_error_with(reply_json(
+            400,
+            json!({"error": "operation error Cognito Identity Provider: InitiateAuth, https response error StatusCode: 400, RequestID: 3d6e4fe6-7051-4e7a-b828-e4d05bd18a2b, InternalErrorException: Something odd."}),
+        ))
+        .await;
+        assert_eq!(
+            err,
+            "StreamBIM avvisade inloggningen (HTTP 400): InternalErrorException: Something odd. (RequestID: 3d6e4fe6-7051-4e7a-b828-e4d05bd18a2b)"
+        );
+    }
+
+    #[test]
+    fn aws_error_first_shapes() {
+        assert_eq!(
+            aws_error_first("operation error X: Op, https response error StatusCode: 400, RequestID: r-1, api error CodeMismatchException: Invalid code received for user"),
+            "CodeMismatchException: Invalid code received for user (RequestID: r-1)"
+        );
+        for kept in [
+            "Incorrect username or password.",
+            "operation error X: Op, no request id here",
+            "operation error X: Op, RequestID: r-1",
+            "operation error X: Op, RequestID: r-1, ",
+            "Rejected, RequestID: r-1, something",
+        ] {
+            assert_eq!(aws_error_first(kept), kept);
+        }
     }
 
     #[tokio::test]
@@ -2215,11 +2489,24 @@ mod tests {
                 json!({"__type": "CodeMismatchException", "message": "Invalid code received for user."}),
             ))
             .await,
-            "Fel kod. Logga in igen och ange en ny kod."
+            WRONG_CODE
         );
         assert_eq!(
             mfa_error_with(reply_json(200, json!({"result": "CODE_MISMATCH"}),)).await,
-            "Fel kod. Logga in igen och ange en ny kod."
+            WRONG_CODE
+        );
+        // StreamBIM's web app reads this one.
+        assert_eq!(
+            mfa_error_with(reply_json(401, json!({"error": "invalidCode"}))).await,
+            WRONG_CODE
+        );
+        assert_eq!(
+            mfa_error_with(reply_json(
+                400,
+                json!({"error": "operation error Cognito Identity Provider: RespondToAuthChallenge, https response error StatusCode: 400, RequestID: 3d6e4fe6-7051-4e7a-b828-e4d05bd18a2b, NotAuthorizedException: Invalid session for the user, session is expired."}),
+            ))
+            .await,
+            MFA_SESSION_ENDED
         );
         assert_eq!(
             mfa_error_with(reply_json(
