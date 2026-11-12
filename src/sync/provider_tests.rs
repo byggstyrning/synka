@@ -1019,7 +1019,7 @@ fn a_lock_held_by_the_users_own_interaxo_account_is_not_read_only() {
 /// Writes the token and profile of a signed-in StreamBIM account `key` served at `base`, the way a
 /// sign-in leaves them, and adds the account to the fixture. The token is DPAPI-protected; an
 /// unreadable file would mean signed out.
-fn streambim_session(f: &Fixture, key: &str, base: &str) {
+pub(super) fn streambim_session(f: &Fixture, key: &str, base: &str) {
     let state = f.ctx.paths.state_dir.clone();
     let tokens = json!({
         "refresh_token": "test-only-refresh",

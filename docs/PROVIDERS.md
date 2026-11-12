@@ -265,3 +265,5 @@ silently truncate a folder.
   entries and links are not synced.
 - Locks on StreamBIM and Interaxo; the Explorer verbs are not active on any provider yet.
 - Delta feeds: both new providers use the listing walk of populated folders, like ACC.
+  StreamBIM's polls list only its active folders between full walks every 300 s
+  (`sync::hot`, DESIGN.md §3).

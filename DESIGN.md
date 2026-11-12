@@ -96,6 +96,21 @@ packaging/       AppxManifest, build_msix.ps1, new_release.ps1, make_delivery.ps
      **populated** locally (on-demand population makes this small), with tiered intervals.
    - Tiers: 30 s while active (callbacks or file activity in the last 10 min), 120 s, 300 s,
      720 s when the user is idle; ±10 % jitter; immediate poll after a local mutation or menu "Sync now".
+   - A walk lists 4 folders at a time and stops at the first failure.
+   - StreamBIM lists per folder (`sync::hot`). Between full walks a poll lists only the folders
+     where the user worked (opened, saved, renamed, deleted) or a poll found a remote change in
+     the last 10 min. Every populated folder is still listed at least every 300 s, after
+     "Sync now" and on the first poll. A poll that finds an item gone from an active folder
+     lists the quiet folders too, so a move into one of them stays a move. Rendra publishes no
+     limits but warns against high-frequency polling, and each StreamBIM folder costs at least
+     two requests (subfolders, then documents).
+   - HTTP 429 (after the request's own Retry-After retries) pauses the whole provider
+     (`sync::throttle`): 60 s, doubled after each further 429 up to 15 min, reset by a good poll.
+     Its projects do not poll, not even after "Sync now". Its queued jobs wait without spending
+     an attempt. The status shows "<provider> begränsar antalet anrop" instead of an error.
+     Autodesk counts its limits per client ID and endpoint across every install that shares
+     the ID (folder contents 300/min, new items 50/min), so an organisation with many users
+     should use its own `aps_client_id`.
    - An empty poll writes nothing and logs nothing.
    - Endpoints and mappings: `docs/specs/aps-endpoints.md`.
 4. **On-demand population.** Directory placeholders are created *without*

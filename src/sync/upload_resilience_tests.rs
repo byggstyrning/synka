@@ -244,8 +244,61 @@ fn resilience_extended_offline_and_auth_failures_keep_job_retryable() {
 }
 
 #[test]
+fn resilience_429_pauses_the_provider_and_never_spends_attempts() {
+    let (f, path, original) = queued_file("resilience-http-429");
+    for _ in 0..MAX_ATTEMPTS * 2 {
+        let current = f.ctx.store.due_jobs(i64::MAX, 10).unwrap().remove(0);
+        assert_eq!(current.attempts, 0);
+        let before = now_ms();
+        handle_failure(
+            &f.ctx,
+            &current,
+            &ApiError::Status {
+                status: 429,
+                body: r#"{"developerMessage":"Quota limit exceeded."}"#.into(),
+            }
+            .into(),
+        );
+        assert!(f.ctx.throttle.remaining(Provider::Acc).is_some());
+        assert!(f.ctx.store.next_job_due().unwrap().unwrap() >= before + 55_000);
+        assert_eq!(f.ctx.store.job_counts().unwrap(), (1, 0));
+    }
+    assert_eq!(
+        f.ctx
+            .store
+            .item(f.p.pid, original.item.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+            .local_state,
+        LocalState::New
+    );
+    assert_bytes(&path);
+}
+
+#[tokio::test]
+async fn resilience_jobs_of_a_paused_provider_wait_without_a_request() {
+    let (mut f, path, original) = queued_file("resilience-paused-provider");
+    client_override_signed_in(&mut f);
+    let server = crate::test_support::Server::new(|_, _| {
+        crate::test_support::Fault::reply(500, "must not be asked")
+    })
+    .await;
+    Arc::get_mut(&mut f.ctx).unwrap().api =
+        crate::http::Api::for_test(&server.origin, Duration::from_secs(2));
+    f.ctx.throttle.hit(Provider::Acc);
+    let before = now_ms();
+    let processed = process_due_except(&f.ctx, &HashSet::new()).await.unwrap();
+    assert_eq!(processed, 0);
+    assert_eq!(server.count(), 0, "no request while ACC is paused");
+    let job = f.ctx.store.due_jobs(i64::MAX, 10).unwrap().remove(0);
+    assert_eq!((job.id, job.attempts), (original.id, 0));
+    assert!(f.ctx.store.next_job_due().unwrap().unwrap() >= before + 55_000);
+    assert_bytes(&path);
+}
+
+#[test]
 fn resilience_transient_http_errors_back_off_then_allow_manual_recovery() {
-    for status in [408, 429, 500, 502, 503, 504] {
+    for status in [408, 500, 502, 503, 504] {
         let (f, path, original) = queued_file(&format!("resilience-http-{status}"));
         for attempt in 0..MAX_ATTEMPTS {
             let current = f.ctx.store.due_jobs(i64::MAX, 10).unwrap().remove(0);
