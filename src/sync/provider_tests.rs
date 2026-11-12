@@ -1646,3 +1646,89 @@ async fn status_accounts_are_one_entry_per_streambim_account_in_key_order() {
     );
     assert_eq!(accounts[0].host, None, "ACC has no host");
 }
+
+/// A wrong StreamBIM code keeps the sign-in on its code step: the window is asked for the code
+/// again, with the reason, and the password is not needed again (StreamBIM's own shape: the
+/// challenge comes with HTTP 401 and a wrong code is `{"error": "invalidCode"}`).
+#[tokio::test]
+async fn a_wrong_streambim_code_asks_for_the_code_again() {
+    use crate::test_support::{Fault, Server};
+    let f = fixture("mfa-wrong-code");
+    let reply = |status: u16, body: serde_json::Value| {
+        Fault::reply(status, body.to_string()).header("Content-Type", "application/json")
+    };
+    let server = Server::scripted(vec![
+        reply(
+            401,
+            json!({"result": "CHALLENGE_REQUESTED", "session": "sess-1"}),
+        ),
+        reply(400, json!({"error": "invalidCode"})),
+    ])
+    .await;
+    let account = f.ctx.streambim.get_or_add("app", &server.origin);
+    assert!(matches!(
+        account
+            .auth
+            .login("ada@example.com", "pw-test")
+            .await
+            .unwrap(),
+        LoginOutcome::MfaRequired
+    ));
+
+    let engine = Engine::new(f.ctx.clone());
+    let mut live = test_live();
+    let key: SignInKey = (Provider::StreamBim, Some("app".into()));
+    live.sign_ins.insert(
+        key.clone(),
+        SignInAttempt {
+            task: tokio::spawn(std::future::pending::<()>()),
+            generation: 4,
+            started_at: Instant::now(),
+            mfa_pending: true,
+        },
+    );
+    engine.st().signing_in.insert(key.clone());
+    let (itx, mut irx) = unbounded_channel();
+    engine
+        .on_cmd(
+            TrayCmd::SignInMfa {
+                provider: Provider::StreamBim,
+                account: "app".into(),
+                code: Secret("111111".into()),
+            },
+            &mut live,
+            &itx,
+        )
+        .await;
+    let checked = tokio::time::timeout(Duration::from_secs(5), irx.recv())
+        .await
+        .expect("the code was not checked");
+    let Some(Internal::SignedIn {
+        key: done,
+        generation,
+        result,
+    }) = checked
+    else {
+        panic!("no sign-in result");
+    };
+    engine
+        .on_signed_in(done, generation, result, &mut live, &itx)
+        .await;
+
+    assert!(
+        live.sign_ins
+            .get(&key)
+            .is_some_and(|attempt| attempt.mfa_pending && attempt.generation == 4),
+        "the attempt waits for a code again"
+    );
+    assert!(engine.st().signing_in.contains(&key));
+    assert!(account.auth.has_pending_mfa(), "the challenge is kept");
+    assert_eq!(
+        sign_in_progress_sent(&f),
+        vec![(
+            Some("app".to_string()),
+            "mfa_required",
+            Some("Fel kod. Ange koden som autentiseringsappen visar nu.".to_string()),
+        )]
+    );
+}
