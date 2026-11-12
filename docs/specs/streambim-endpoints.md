@@ -9,7 +9,7 @@ The repo calls itself **unofficial** documentation (`AGENTS.md:3`). Much of it w
 | Tag | Meaning |
 |---|---|
 | **[DOC]** | The docs say this. A citation follows. |
-| **[LIVE]** | I saw this on 2026-10-20 with unauthenticated read-only GETs to public StreamBIM endpoints. The docs don't say it. |
+| **[LIVE]** | I saw this on 2026-10-20 with unauthenticated read-only GETs to public StreamBIM endpoints. Entries dated 2026-11-12 come from Synka's own sign-ins against `sweden`, read from its engine log. The docs don't say it. |
 | **[INFERRED]** | My reading of the docs, examples or naming. Check it before relying on it. |
 | **[UNDOCUMENTED]** | The docs say nothing. Test it against a live server or ask Rendra (`support@rendra.io` / `cto@rendra.io`, `README.md:83`, `AGENTS.md:66`). |
 | **[GENERAL]** | General AWS, S3, Cognito or HTTP behavior. StreamBIM docs don't cover it. |
@@ -170,7 +170,7 @@ The example below is **built from the field table**. The docs contain no literal
 
 The other fields in a CHALLENGE_REQUESTED response are **[UNDOCUMENTED]**. `3600` above is a placeholder; the real `expiresIn` is undocumented.
 
-**[WEBAPP]** The challenge comes with **HTTP 401**, not 200. The web app's login form checks `401 == status && json.result === "CHALLENGE_REQUESTED"` and passes `json.session` on to its MFA page. Any other 401 is a wrong e-mail or password there. A client that treats every non-2xx as a refusal never reaches the MFA step.
+**[WEBAPP]** The challenge comes with **HTTP 401**, not 200. The web app's login form checks `401 == status && json.result === "CHALLENGE_REQUESTED"` and passes `json.session` on to its MFA page. Any other 401 is a wrong e-mail or password there. A client that treats every non-2xx as a refusal never reaches the MFA step. **[LIVE]** (2026-11-12, `sweden`) Confirmed: an account with MFA got its challenge as HTTP 401 with `CHALLENGE_REQUESTED` and a `session`.
 
 Failure responses (wrong password, unknown user, locked account, user who must use SSO) have **[UNDOCUMENTED]** status codes and body shapes. **[LIVE]** (2026-11-12, `sweden`) A wrong password gave HTTP 401 with Cognito's error passed on as one string: `operation error Cognito Identity Provider: InitiateAuth, https response error StatusCode: 400, RequestID: <id>, NotAuthorizedException: Incorrect username or password.` Every Cognito error names the "Cognito Identity Provider", so that phrase says nothing about SSO.
 
@@ -201,6 +201,8 @@ The response for a wrong code, and how long `session` stays valid, are **[UNDOCU
 - A refusal whose payload has `error: "invalidCode"` is a wrong code: the page asks for another code with the **same** `session`. Any other refusal is shown as an expired session.
 - After MFA it keeps `refreshToken` and refreshes as usual, except for `@rendra.io` staff accounts, whose `refreshToken` it deletes. So `mfa/verify` most likely returns a refresh token (still to confirm live).
 - Refresh: `POST /auth/v1/refresh` with `{refreshToken, token: <idToken>}`, 300 s before the JWT's `exp`; a 401 ends the session.
+
+**[LIVE]** (2026-11-12, `sweden`) Synka's MFA sign-in went through end to end: the 401 challenge, then `mfa/verify` with the `session` and a code from an authenticator app, accepted on the first try. Not seen yet: whether that reply carries a `refreshToken` (Synka does not log it), and the body of a wrong-code refusal.
 
 ### 2.4 Token refresh [DOC `api/authentication.md:52-87`]
 
@@ -1071,7 +1073,7 @@ Documented HTTP statuses:
 
 | # | Topic | Issue | Where |
 |---|---|---|---|
-| 1 | Login | `session` isn't listed in the login response but is needed for MFA. **[WEBAPP]** It is in the body of the **401** that carries `CHALLENGE_REQUESTED` (§2.2) | `api/authentication.md:27-37` vs `:230` |
+| 1 | Login | `session` isn't listed in the login response but is needed for MFA. **[WEBAPP]** It is in the body of the **401** that carries `CHALLENGE_REQUESTED` (§2.2); **[LIVE]** confirmed 2026-11-12 | `api/authentication.md:27-37` vs `:230` |
 | 2 | MFA | `mfa/verify` response doesn't list `refreshToken`. **[WEBAPP]** The web app keeps one after MFA (§2.3) | `api/authentication.md:235-243` |
 | 3 | Refresh | Takes the *expired* idToken; proactive refresh untested; refresh-token lifetime unknown | `api/authentication.md:54-78` |
 | 4 | SSO | Callback `/auth/v1/federation` and token hand-off undocumented; redirect URI is fixed to StreamBIM | `api/authentication.md:141-158`, §2.6 [LIVE] |

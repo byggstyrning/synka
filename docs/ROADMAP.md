@@ -40,6 +40,7 @@ StreamBIM (one account with MFA, one without; one region other than `app`):
    accept a not-yet-expired id token? The wrong-code status and body (the web app expects
    `{"error": "invalidCode"}` and retries with the same session). Known: the MFA challenge comes
    with HTTP 401, and a wrong password is a 401 with Cognito's `NotAuthorizedException` text.
+   Seen live on `sweden` (2026-11-12): an MFA account signs in with an authenticator code.
 2. Profile: shape of `/mgw/api/v2/user-profiles?filter[profile]=true` (name shown in Synka).
 3. Listing: `folders?filter[parent]=` and `documents?filter[folderId]=` return direct children
    only; `meta.total` present; folder and document ids may collide (Synka prefixes documents
