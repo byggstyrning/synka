@@ -1,6 +1,6 @@
 [package]
 name = "synka"
-version = "0.3.6"
+version = "0.3.8"
 edition = "2021"
 description = "Synka: syncs ACC Docs files to a local folder on Windows (Cloud Files API)"
 publish = false
