@@ -130,6 +130,7 @@ public static class Fmt
         "skipped" => "",
         "reset" => "",
         "restore" => "",
+        "held" => "",
         _ => "",
     };
 
@@ -152,6 +153,7 @@ public static class Fmt
         "skipped" => Lang.T("Hoppades över", "Skipped"),
         "reset" => Lang.T("Ombyggd från molnet", "Rebuilt from the cloud"),
         "restore" => Lang.T("Återställd", "Restored"),
+        "held" => Lang.T("Väntar på bekräftelse", "Waiting for confirmation"),
         _ => Lang.T("Händelse", "Event"),
     };
 

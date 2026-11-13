@@ -16,9 +16,10 @@ public sealed record TransferInfo(string? Name, string? Project, string? Directi
 
 /// <summary>
 /// A burst of local deletes the engine holds back until the user confirms it
-/// (mass-delete protection). Answered with `confirm_deletes`.
+/// (mass-delete protection, and every StreamBIM folder delete). Answered with `confirm_deletes`.
+/// Linked names the StreamBIM model and floor plan layers among them.
 /// </summary>
-public sealed record HeldDeleteInfo(string? ProjectId, string? Project, long Count);
+public sealed record HeldDeleteInfo(string? ProjectId, string? Project, long Count, List<string>? Linked = null);
 
 /// <summary>
 /// One document provider's account (docs\IPC.md, `status.accounts`). Provider is

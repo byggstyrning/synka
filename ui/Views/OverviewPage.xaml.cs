@@ -314,12 +314,9 @@ public sealed partial class OverviewPage : Page
         var accounts = Engine.Accounts.Where(account => account is { SignedIn: true }).ToList();
         if (accounts.Count > 1)
         {
-            return string.Join(" · ", accounts.Select(account =>
-            {
-                var label = ProviderNames.AccountLabel(account, Engine.StreamBimRegions);
-                var who = ProviderNames.Who(account.User);
-                return who.Length == 0 ? label : $"{label}: {who}";
-            }));
+            // Only where, not who: the names and e-mail addresses are on the Accounts page.
+            var names = string.Join(", ", accounts.Select(account => ProviderNames.AccountLabel(account, Engine.StreamBimRegions)));
+            return Lang.T($"Inloggad på {names}", $"Signed in to {names}");
         }
 
         var user = accounts.Count == 1

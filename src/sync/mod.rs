@@ -99,7 +99,7 @@ use crate::config::INTERAXO_OFF_TEXT;
 use crate::http::ApiError;
 use crate::model::*;
 use crate::remote::{self, DownloadUrl};
-use crate::store::Store;
+use crate::store::{DeleteTally, Store};
 use crate::streambim_auth::{
     project_key, server_from_region, server_from_url, LoginOutcome, StreamBimAccounts,
 };
@@ -161,6 +161,9 @@ const REFRESH_RETRY: Duration = Duration::from_secs(60);
 /// This many pending deletes (a folder counts its contents) in one project within the grace
 /// period are held until the user confirms: one stray Shift+Delete must not empty ACC.
 const MASS_DELETE: i64 = 25;
+/// A local delete of this many items, or this many folders, asks before it reaches the cloud.
+const ASK_DELETE_ITEMS: i64 = 50;
+const ASK_DELETE_FOLDERS: i64 = 5;
 
 /// Cloud Files can still report IN_SYNC while bytes appended to a previously empty
 /// placeholder remain in its local modified range. Those bytes are not safe to
@@ -1482,6 +1485,7 @@ impl Engine {
     fn finish_poll(self: &Arc<Self>, pid: Pid, r: Result<bool>) {
         let now = Instant::now();
         let provider = self.provider_of(pid);
+        let projects = self.ctx.store.projects().map_or(1, |all| all.len());
         {
             let mut st = self.st();
             st.polling.remove(&pid);
@@ -1496,7 +1500,12 @@ impl Engine {
                     if asked {
                         self.ctx.throttle.ok(provider);
                     }
-                    let (d, idle) = interval_secs(self.ctx.cfg_now().poll_active_secs, &st, pid);
+                    let (d, idle) = interval_secs(
+                        self.ctx.cfg_now().poll_active_secs,
+                        &st,
+                        pid,
+                        projects,
+                    );
                     st.idle_parked |= idle;
                     d
                 }
@@ -1592,22 +1601,23 @@ impl Engine {
         }
         let ctx = self.ctx.clone();
         let p2 = p.clone();
-        let work = tokio::task::spawn_blocking(move || -> Result<(usize, Work)> {
+        let work = tokio::task::spawn_blocking(move || -> Result<(usize, Work, String)> {
             let _guard = local_lock();
             merge_tops(&ctx.store, &p2, &mut delta)?;
             if delta.is_empty() && delta.new_cursor.is_none() {
-                return Ok((0, Work::default()));
+                return Ok((0, Work::default(), String::new()));
             }
             keep_pending_local(&ctx.store, pid, &mut delta)?;
             let applied = ctx.store.apply_delta(pid, &delta)?;
             let count = applied.changes.len();
             if count == 0 {
-                return Ok((0, Work::default()));
+                return Ok((0, Work::default(), String::new()));
             }
-            Ok((count, disk_apply(&ctx, &p2, &applied.changes)))
+            let names = change_list(&applied.changes);
+            Ok((count, disk_apply(&ctx, &p2, &applied.changes), names))
         })
         .await??;
-        let (count, work) = work;
+        let (count, work, names) = work;
         if count > 0 {
             let from = p.provider.label();
             info!("{}: {count} ändringar från {from}", p.name);
@@ -1615,7 +1625,7 @@ impl Engine {
                 "remote_change",
                 &format!("{count} ändringar från {from}"),
                 &p.name,
-                "",
+                &names,
             );
             self.after_work(work);
         }
@@ -3942,10 +3952,12 @@ impl Engine {
             .into_iter()
             .filter_map(|(pid, count)| {
                 let p = self.ctx.store.project(pid).ok()??;
+                let linked = self.ctx.store.held_linked(pid).unwrap_or_default();
                 Some(HeldDeletes {
                     project_id: p.project_id,
                     project: p.name,
                     count,
+                    linked,
                 })
             })
             .collect();
@@ -4734,16 +4746,29 @@ fn idle_ms() -> u64 {
 
 /// Poll interval tiers: idle (> 30 min) 720 s; active (activity < 10 min) poll_active_secs;
 /// recent (< 1 h) 120 s; else 300 s. The bool is true for the idle tier.
-fn interval_secs(poll_active_secs: u64, st: &St, pid: Pid) -> (Duration, bool) {
+/// With many projects the recent, quiet and idle tiers stretch (see `stretch`); a project the
+/// user works in keeps its pace.
+fn interval_secs(poll_active_secs: u64, st: &St, pid: Pid, projects: usize) -> (Duration, bool) {
     if idle_ms() > IDLE_MS {
-        return (Duration::from_secs(720), true);
+        return (Duration::from_secs(stretch(720, projects, 3600)), true);
     }
     let d = match st.activity.get(&pid).map(|t| t.elapsed()) {
         Some(e) if e < ACTIVE_WINDOW => Duration::from_secs(poll_active_secs.max(5)),
-        Some(e) if e < RECENT_WINDOW => Duration::from_secs(120),
-        _ => Duration::from_secs(300),
+        Some(e) if e < RECENT_WINDOW => Duration::from_secs(stretch(120, projects, 600)),
+        _ => Duration::from_secs(stretch(300, projects, 1800)),
     };
     (d, false)
+}
+
+/// Projects polled at the base pace. Above it every tier but "active" grows in step with the
+/// count, so the requests per minute stay about the same: 100 projects poll 4× slower.
+const POLL_BASE_PROJECTS: usize = 25;
+
+fn stretch(base_secs: u64, projects: usize, cap_secs: u64) -> u64 {
+    if projects <= POLL_BASE_PROJECTS {
+        return base_secs;
+    }
+    (base_secs * projects as u64 / POLL_BASE_PROJECTS as u64).min(cap_secs.max(base_secs))
 }
 
 /// Swedish status line for the synced state: "Senast synkad 14:32".
@@ -8054,7 +8079,7 @@ fn queue_remote_delete(ctx: &Ctx, p: &Project, id: &str, w: &mut Work) {
         if item.populated || p.change_source == ChangeSourceKind::DesktopSync {
             known
         } else {
-            known.max(MASS_DELETE)
+            known.max(ASK_DELETE_ITEMS)
         }
     } else {
         1
@@ -8080,7 +8105,9 @@ fn queue_remote_delete(ctx: &Ctx, p: &Project, id: &str, w: &mut Work) {
 }
 
 /// Hold the project's pending deletes once they add up to MASS_DELETE (and keep holding new
-/// ones while some are held), and tell the user once.
+/// ones while some are held), and ask once. The question is a desktop dialog, the same idea as
+/// OneDrive's large-delete prompt: nothing goes to the cloud until the user answers, and closing
+/// it leaves the burst held for the window.
 fn hold_mass_deletes(ctx: &Ctx, p: &Project) {
     let already = ctx
         .store
@@ -8088,21 +8115,94 @@ fn hold_mass_deletes(ctx: &Ctx, p: &Project) {
         .unwrap_or_default()
         .iter()
         .any(|(pid, _)| *pid == p.pid);
-    if !already && ctx.store.pending_delete_weight(p.pid).unwrap_or(0) < MASS_DELETE {
-        return;
+    if !already {
+        let pending = ctx.store.held_delete_tally(p.pid).unwrap_or_default();
+        if pending.weight < ASK_DELETE_ITEMS && pending.folders < ASK_DELETE_FOLDERS {
+            return;
+        }
     }
     if let Err(e) = ctx.store.hold_deletes(p.pid) {
         warn!("kunde inte hålla borttagningar: {e:#}");
         return;
     }
     if !already {
-        let n = ctx.store.pending_delete_weight(p.pid).unwrap_or(0);
-        warn!("{}: {n} borttagningar väntar på bekräftelse", p.name);
+        let tally = ctx
+            .store
+            .held_delete_tally(p.pid)
+            .unwrap_or_else(|_| DeleteTally {
+                files: ctx.store.pending_delete_weight(p.pid).unwrap_or(0),
+                ..DeleteTally::default()
+            });
+        warn!(
+            "{}: {} borttagningar väntar på bekräftelse ({} filer, {} mappar)",
+            p.name, tally.weight, tally.files, tally.folders
+        );
         ctx.ui.send(UiMsg::notify(
             Severity::Warning,
-            format!("Du tog bort {n} objekt i {}. De tas inte bort i ACC förrän du bekräftar i {APP_NAME}.", p.name),
+            format!(
+                "{} De tas inte bort i molnet förrän du bekräftar i {APP_NAME}.",
+                mass_delete_instruction(&p.name, tally)
+            ),
         ));
     }
+}
+
+/// The files behind a batch of remote changes, one per line for the activity hover:
+/// "+ new", "~ changed", "- deleted". Long batches stop at CHANGE_LIST_MAX with a count.
+const CHANGE_LIST_MAX: usize = 20;
+fn change_list(changes: &[(Option<Item>, Option<Item>)]) -> String {
+    let mut lines: Vec<String> = changes
+        .iter()
+        .take(CHANGE_LIST_MAX)
+        .filter_map(|(before, after)| match (before, after) {
+            (None, Some(a)) => Some(format!("+ {}", a.name)),
+            (Some(_), Some(a)) => Some(format!("~ {}", a.name)),
+            (Some(b), None) => Some(format!("- {}", b.name)),
+            (None, None) => None,
+        })
+        .collect();
+    if changes.len() > CHANGE_LIST_MAX {
+        lines.push(format!("… +{}", changes.len() - CHANGE_LIST_MAX));
+    }
+    lines.join("
+")
+}
+
+/// "1 fil" / "2 filer".
+fn count_sv(n: i64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// The first line of the large-delete question. A folder job's weight counts its contents;
+/// file jobs listed beside that folder are not added again, or the number would be doubled.
+fn mass_delete_instruction(project: &str, tally: DeleteTally) -> String {
+    let what = match (tally.files, tally.folders) {
+        (files, folders) if files > 0 && folders > 0 => format!(
+            "{} och {}",
+            count_sv(files, "fil", "filer"),
+            count_sv(folders, "mapp", "mappar")
+        ),
+        (0, folders) if folders > 0 => count_sv(folders, "mapp", "mappar"),
+        (files, _) if files > 0 => count_sv(files, "fil", "filer"),
+        _ => count_sv(tally.weight, "objekt", "objekt"),
+    };
+    let mut text = format!("Du tog bort {what} i {project}.");
+    if tally.files == 0 && tally.folders > 0 {
+        let extra = tally.weight.saturating_sub(tally.folders);
+        if extra > 0 {
+            let verb = if tally.folders == 1 {
+                "Den innehåller"
+            } else {
+                "De innehåller"
+            };
+            text.push_str(&format!(" {verb} {}.", count_sv(extra, "objekt", "objekt")));
+        }
+    }
+    text
 }
 
 /// The user declined held deletes: the items come back (as placeholders; content is still in
@@ -10870,9 +10970,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_large_delete_names_files_folders_and_a_folder_s_contents() {
+        let files = DeleteTally {
+            files: 30,
+            folders: 0,
+            weight: 30,
+        };
+        assert_eq!(
+            mass_delete_instruction("Nobel Center", files),
+            "Du tog bort 30 filer i Nobel Center."
+        );
+        let folder = DeleteTally {
+            files: 0,
+            folders: 1,
+            weight: 41,
+        };
+        assert_eq!(
+            mass_delete_instruction("Nobel Center", folder),
+            "Du tog bort 1 mapp i Nobel Center. Den innehåller 40 objekt."
+        );
+        let both = DeleteTally {
+            files: 12,
+            folders: 2,
+            weight: 80,
+        };
+        assert_eq!(
+            mass_delete_instruction("Nobel Center", both),
+            "Du tog bort 12 filer och 2 mappar i Nobel Center."
+        );
+    }
+
+    #[test]
     fn mass_deletes_are_held_and_can_be_restored() {
         let f = fixture("massdel");
-        for i in 0..30 {
+        for i in 0..60 {
             f.ctx
                 .store
                 .upsert_item(&row(
@@ -10894,7 +11025,7 @@ pub(crate) mod tests {
             f.ctx.store.held_deletes().unwrap().is_empty(),
             "a few deletes just wait for the grace period"
         );
-        for i in 10..30 {
+        for i in 10..60 {
             handle_delete(
                 &f.ctx,
                 &delete_req(&f, &format!("L{i}"), &f.dir.join(format!("f{i}.pdf"))),
@@ -10902,7 +11033,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             f.ctx.store.held_deletes().unwrap(),
-            vec![(f.p.pid, 30)],
+            vec![(f.p.pid, 60)],
             "every delete of the burst is held"
         );
         assert_eq!(
@@ -10912,7 +11043,7 @@ pub(crate) mod tests {
         );
 
         let n = restore_held(&f.ctx, &f.p).unwrap();
-        assert_eq!(n, 30);
+        assert_eq!(n, 60);
         assert!(f.ctx.store.held_deletes().unwrap().is_empty());
         assert!(f
             .ctx
@@ -10930,7 +11061,7 @@ pub(crate) mod tests {
             .store
             .upsert_item(&row(&f.p, "co.D", Some("co.ROOT"), "Arkiv", Kind::Folder))
             .unwrap();
-        for i in 0..40 {
+        for i in 0..60 {
             f.ctx
                 .store
                 .upsert_item(&row(
@@ -10945,8 +11076,34 @@ pub(crate) mod tests {
         let mut req = delete_req(&f, "co.D", &f.dir.join("Arkiv"));
         req.identity = ph::encode_identity(Kind::Folder, f.p.pid, "co.D");
         handle_delete(&f.ctx, &req);
-        assert_eq!(f.ctx.store.held_deletes().unwrap(), vec![(f.p.pid, 41)]);
+        assert_eq!(f.ctx.store.held_deletes().unwrap(), vec![(f.p.pid, 61)]);
         assert!(f.ctx.store.release_deletes(f.p.pid).unwrap() == 1);
+    }
+
+    #[test]
+    fn polling_slows_down_with_many_projects() {
+        assert_eq!(stretch(300, 1, 1800), 300);
+        assert_eq!(stretch(300, 25, 1800), 300);
+        assert_eq!(stretch(300, 100, 1800), 1200);
+        assert_eq!(stretch(300, 400, 1800), 1800, "capped");
+        assert_eq!(stretch(120, 50, 600), 240);
+    }
+
+    #[test]
+    fn five_deleted_folders_ask_even_when_they_are_small() {
+        let f = fixture("fivedirs");
+        for i in 0..5 {
+            let id = format!("co.F{i}");
+            f.ctx
+                .store
+                .upsert_item(&row(&f.p, &id, Some("co.ROOT"), &format!("D{i}"), Kind::Folder))
+                .unwrap();
+            let mut req = delete_req(&f, &id, &f.dir.join(format!("D{i}")));
+            req.identity = ph::encode_identity(Kind::Folder, f.p.pid, &id);
+            handle_delete(&f.ctx, &req);
+            let held = !f.ctx.store.held_deletes().unwrap().is_empty();
+            assert_eq!(held, i == 4, "held only at the fifth folder");
+        }
     }
 
     #[test]

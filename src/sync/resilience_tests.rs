@@ -389,7 +389,7 @@ async fn resilience_saves_during_finalization_reuse_the_committed_job() {
 #[test]
 fn resilience_mass_delete_hold_survives_restart_and_never_releases_itself() {
     let f = fixture("resilience-held-delete");
-    for i in 0..40 {
+    for i in 0..60 {
         let item = row(
             &f.p,
             &format!("LIN-{i}"),
@@ -402,14 +402,14 @@ fn resilience_mass_delete_hold_survives_restart_and_never_releases_itself() {
         // Duplicate callbacks must not increase the weight or create another job.
         delete(&f, &item, &f.dir.join(&item.name));
     }
-    assert_eq!(f.ctx.store.pending_delete_weight(f.p.pid).unwrap(), 40);
+    assert_eq!(f.ctx.store.pending_delete_weight(f.p.pid).unwrap(), 60);
     for _ in 0..8 {
         let reopened = Store::open(&f.ctx.paths.db_file).unwrap();
-        assert_eq!(reopened.held_deletes().unwrap(), vec![(f.p.pid, 40)]);
+        assert_eq!(reopened.held_deletes().unwrap(), vec![(f.p.pid, 60)]);
         assert_eq!(reopened.next_job_due().unwrap(), None);
         assert!(reopened.due_jobs(i64::MAX, 100).unwrap().is_empty());
     }
-    assert_eq!(restore_held(&f.ctx, &f.p).unwrap(), 40);
+    assert_eq!(restore_held(&f.ctx, &f.p).unwrap(), 60);
     assert!(f.ctx.store.held_deletes().unwrap().is_empty());
     assert!(jobs(&f).is_empty());
     assert!(f

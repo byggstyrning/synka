@@ -321,6 +321,71 @@ pub async fn folder_contents(
     ))
 }
 
+/// A document StreamBIM shows outside the folder tree: a published IFC model document (a model
+/// layer of a building) or a PDF aligned to a floor (a floor plan layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedDocument {
+    pub id: String,
+    pub parent: Option<String>,
+    pub name: String,
+    pub floor_plan: bool,
+}
+
+/// Every linked document of the project. Model layers come from `filter[publishedIfc]=true`,
+/// floor plans from PDFs whose `document-alignments` are not empty (api/documents.md).
+pub async fn linked_documents(api: &Api, p: &Project) -> Result<Vec<LinkedDocument>, ApiError> {
+    let meta = parse_meta(p.meta.as_deref())?;
+    let root = jsonapi_root(&meta);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (filter, floor_plan) in [
+        ("filter%5BpublishedIfc%5D=true", false),
+        ("filter%5BfileExtensions%5D=pdf", true),
+    ] {
+        let mut skip = 0usize;
+        for _ in 0..MAX_DOC_PAGES {
+            let url = format!(
+                "{root}/documents?{filter}&page%5Bskip%5D={skip}&page%5Blimit%5D={PAGE_LIMIT}"
+            );
+            let doc = get_json(api, &url).await?;
+            let rows = resource_list(&doc)?;
+            for row in rows {
+                if attr_flag(row, "is-deleted") || (floor_plan && !aligned(row)) {
+                    continue;
+                }
+                let Some(server_id) = res_id(row) else {
+                    continue;
+                };
+                if !seen.insert(server_id.clone()) {
+                    continue;
+                }
+                out.push(LinkedDocument {
+                    id: doc_item_id(&server_id),
+                    parent: rel_id(row, "parent"),
+                    name: attr_text(row, "filename").unwrap_or_default(),
+                    floor_plan,
+                });
+            }
+            skip += rows.len();
+            let more = match doc.pointer("/meta/total").and_then(Value::as_u64) {
+                Some(total) => !rows.is_empty() && (skip as u64) < total,
+                None => !rows.is_empty(),
+            };
+            if !more {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A PDF placed on a floor: its `document-alignments` relationship lists at least one alignment.
+fn aligned(row: &Value) -> bool {
+    row.pointer("/relationships/document-alignments/data")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+}
+
 /// A download link for the current revision. The link is relative to the project's v1 root,
 /// or absolute. The bearer token goes only to a link on the StreamBIM origin that carries no
 /// token of its own (a presigned link never gets it).
@@ -550,8 +615,11 @@ pub async fn create_folder(
     name: &str,
 ) -> Result<Item, ApiError> {
     let meta = parse_meta(p.meta.as_deref())?;
+    // The server parses data.id as an integer and then assigns the real id.
+    // "0" is the same placeholder as a new document. "new" is refused
+    // (strconv.ParseInt: parsing "new").
     let body = json!({"data": {
-        "id": "new",
+        "id": "0",
         "type": "folders",
         "attributes": {"name": name},
         "relationships": {
@@ -1943,9 +2011,49 @@ mod tests {
         );
         assert_eq!(item.parent.as_deref(), Some("7"));
         let body = body_of(&server.requests()[0]);
-        assert_eq!(body["data"]["id"], "new");
+        assert_eq!(body["data"]["id"], "0");
         assert_eq!(body["data"]["attributes"]["name"], "Nytt");
         assert_eq!(body["data"]["relationships"]["parent"]["data"]["id"], "7");
+    }
+
+    #[tokio::test]
+    async fn linked_documents_are_published_models_and_aligned_pdfs() {
+        let doc = |id: &str, name: &str, alignments: Value| {
+            json!({"id": id, "type": "documents",
+                "attributes": {"filename": name, "is-deleted": false},
+                "relationships": {
+                    "parent": {"data": {"id": "7", "type": "folders"}},
+                    "document-alignments": {"data": alignments},
+                }})
+        };
+        let server = Server::new(move |req, _| {
+            if req.target.contains("publishedIfc") {
+                reply(200, json!({"data": [doc("20", "ARK.ifc", json!([]))], "meta": {"total": 1}}))
+            } else if req.target.contains("fileExtensions") {
+                reply(
+                    200,
+                    json!({"data": [
+                        doc("30", "Plan 1.pdf", json!([{"id": "1", "type": "document-alignments"}])),
+                        doc("31", "Beskrivning.pdf", json!([])),
+                    ], "meta": {"total": 2}}),
+                )
+            } else {
+                Fault::reply(404, "unexpected")
+            }
+        })
+        .await;
+        let linked = linked_documents(&api_for(&server), &project(&server.origin))
+            .await
+            .unwrap();
+        let got: Vec<(&str, &str, bool)> = linked
+            .iter()
+            .map(|d| (d.id.as_str(), d.name.as_str(), d.floor_plan))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("d20", "ARK.ifc", false), ("d30", "Plan 1.pdf", true)]
+        );
+        assert_eq!(linked[0].parent.as_deref(), Some("7"));
     }
 
     /// The document listing of `folder 7` with `docs` as its rows; no folders.

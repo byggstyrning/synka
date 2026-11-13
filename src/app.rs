@@ -252,6 +252,8 @@ pub struct HeldDeletes {
     pub project_id: String,
     pub project: String,
     pub count: i64,
+    /// StreamBIM model and floor plan layers among the held deletes, by name.
+    pub linked: Vec<String>,
 }
 
 /// One active download or upload. `direction` is "down" or "up"; sizes in bytes.

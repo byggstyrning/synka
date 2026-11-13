@@ -64,6 +64,15 @@ pub struct OutboxJob {
 /// (kind, dead, attempts, last error) of one outbox job, for diagnostics.
 pub type JobSummary = (String, bool, i64, Option<String>);
 
+/// Held deletes in one project: how many file jobs, how many folder jobs, and their weight
+/// (a folder's weight counts what it contains).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteTally {
+    pub files: i64,
+    pub folders: i64,
+    pub weight: i64,
+}
+
 /// Upper bound on parent hops in `path_of` (cycle guard).
 const MAX_PATH_STEPS: usize = 512;
 
@@ -1246,6 +1255,73 @@ impl Store {
         Ok(n)
     }
 
+    /// Files, folders and weight of one project's held and pending deletes.
+    pub fn held_delete_tally(&self, pid: Pid) -> Result<DeleteTally> {
+        let c = self.conn()?;
+        let mut stmt = c.prepare_cached(
+            "SELECT i.kind, COALESCE(json_extract(o.payload, '$.weight'), 1) FROM outbox o \
+             LEFT JOIN item i ON i.pid = o.pid AND i.id = o.item \
+             WHERE o.pid = ?1 AND o.kind = 'delete' AND o.dead IN (0, 2)",
+        )?;
+        let rows = stmt.query_map(params![pid], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut tally = DeleteTally::default();
+        for row in rows {
+            let (kind, weight) = row?;
+            tally.weight += weight;
+            match kind
+                .and_then(|k| u8::try_from(k).ok())
+                .and_then(Kind::from_u8)
+            {
+                Some(Kind::Folder) => tally.folders += 1,
+                // The item row is gone: a weight above 1 can only be a folder's contents.
+                None if weight > 1 => tally.folders += 1,
+                _ => tally.files += 1,
+            }
+        }
+        Ok(tally)
+    }
+
+    /// Record on one delete job the linked layers it would remove (shown with the held burst).
+    pub fn set_job_linked(&self, id: i64, names: &[String]) -> Result<()> {
+        let c = self.conn()?;
+        c.prepare_cached(
+            "UPDATE outbox SET payload = json_set(COALESCE(payload, '{}'), '$.linked', json(?2)) \
+             WHERE id = ?1",
+        )?
+        .execute(params![id, serde_json::to_string(names)?])?;
+        Ok(())
+    }
+
+    /// The linked layers named by one project's held deletes, in job order.
+    pub fn held_linked(&self, pid: Pid) -> Result<Vec<String>> {
+        let c = self.conn()?;
+        let lists = collect(
+            &c,
+            "SELECT json_extract(payload, '$.linked') FROM outbox \
+             WHERE pid = ?1 AND kind = 'delete' AND dead = 2 \
+             AND json_extract(payload, '$.linked') IS NOT NULL ORDER BY id",
+            params![pid],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out: Vec<String> = Vec::new();
+        for list in lists {
+            for name in serde_json::from_str::<Vec<String>>(&list).unwrap_or_default() {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Item ids of a subtree (the root included), for checks against the provider's lists.
+    pub fn subtree_ids(&self, pid: Pid, id: &str) -> Result<Vec<String>> {
+        let c = self.conn()?;
+        Ok(subtree(&c, pid, id)?.into_iter().map(|i| i.id).collect())
+    }
+
     /// Projects with held deletes, as (pid, weight).
     pub fn held_deletes(&self) -> Result<Vec<(Pid, i64)>> {
         let c = self.conn()?;
@@ -1258,11 +1334,16 @@ impl Store {
         )
     }
 
-    /// The user confirmed: held deletes run now.
+    /// The user confirmed: held deletes run now. `confirmed` in the payload lets a delete that
+    /// was held for a linked StreamBIM layer through on its next run.
     pub fn release_deletes(&self, pid: Pid) -> Result<usize> {
         let c = self.conn()?;
         let n = c
-            .prepare_cached("UPDATE outbox SET dead = 0, next_ms = ?2 WHERE pid = ?1 AND kind = 'delete' AND dead = 2")?
+            .prepare_cached(
+                "UPDATE outbox SET dead = 0, next_ms = ?2, \
+                 payload = json_set(COALESCE(payload, '{}'), '$.confirmed', json('true')) \
+                 WHERE pid = ?1 AND kind = 'delete' AND dead = 2",
+            )?
             .execute(params![pid, now_ms()])?;
         Ok(n)
     }
@@ -2209,6 +2290,22 @@ mod tests {
             .unwrap();
         assert_eq!(store.pending_delete_weight(pid).unwrap(), 4);
         assert_eq!(store.hold_deletes(pid).unwrap(), 2);
+        let held_id: i64 = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM outbox WHERE pid = ?1 AND kind = 'delete' AND dead = 2 ORDER BY id LIMIT 1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store
+            .set_job_linked(held_id, &["Plan 1.pdf (planritning)".to_string()])
+            .unwrap();
+        assert_eq!(
+            store.held_linked(pid).unwrap(),
+            vec!["Plan 1.pdf (planritning)".to_string()]
+        );
         assert!(
             store.due_jobs(i64::MAX, 10).unwrap().is_empty(),
             "held jobs never run"
@@ -2219,6 +2316,14 @@ mod tests {
             "held is neither pending nor failed"
         );
         assert_eq!(store.held_deletes().unwrap(), vec![(pid, 4)]);
+        assert_eq!(
+            store.held_delete_tally(pid).unwrap(),
+            DeleteTally {
+                files: 1,
+                folders: 1,
+                weight: 4,
+            }
+        );
         assert_eq!(store.pending_delete_weight(pid).unwrap(), 4);
         assert_eq!(
             store.take_held_deletes(pid).unwrap(),
@@ -2229,7 +2334,12 @@ mod tests {
         store.enqueue(pid, "delete", Some("lin2"), "{}").unwrap();
         store.hold_deletes(pid).unwrap();
         assert_eq!(store.release_deletes(pid).unwrap(), 1);
-        assert_eq!(store.due_jobs(i64::MAX, 10).unwrap().len(), 1);
+        let released = store.due_jobs(i64::MAX, 10).unwrap();
+        assert_eq!(released.len(), 1);
+        assert!(
+            released[0].payload.contains("\"confirmed\":true"),
+            "a confirmed delete is not held again for its layers"
+        );
 
         // Folder reset keeps the folder, drops its contents and their jobs.
         store.set_populated(pid, "co.f", true).unwrap();

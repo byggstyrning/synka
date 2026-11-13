@@ -86,6 +86,8 @@ public sealed partial class MainWindow : Window
         // does nothing. Set in the constructor, before the window shows.
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
+        // The version always shows in the title bar, so a screenshot says which build it is.
+        AppTitleBar.Title = $"Synka {EngineClient.AppVersion}";
 
         RootGrid.Loaded += OnRootLoaded;
 
@@ -97,7 +99,7 @@ public sealed partial class MainWindow : Window
         Navigation.Loaded += (_, _) => ApplyLanguage();
         Lang.Changed += OnLanguageChanged;
 
-        Title = "Synka";
+        Title = $"Synka {EngineClient.AppVersion}";
         ApplyBadgeStyle();
 
         _frame.Navigate(typeof(OverviewPage));
@@ -362,21 +364,125 @@ public sealed partial class MainWindow : Window
                 $"Du tog bort {count} objekt i {project}. De tas inte bort i molnet förrän du bekräftar.",
                 $"You deleted {count} items in {project}. They are not deleted in the cloud until you confirm.");
 
-            if (_heldBars.TryGetValue(id, out var shown))
+            if (_heldBars.TryGetValue(id, out var shown) && shown.Message != message)
             {
-                if (shown.Message != message)
-                {
-                    shown.Message = message;
-                }
+                shown.Message = message;
+            }
+
+            _heldEntries[id] = entry;
+            if (_heldBars.ContainsKey(id))
+            {
                 continue;
             }
 
             var bar = BuildHeldDeletesBar(id, project, message);
             _heldBars[id] = bar;
             HeldDeletesPanel.Children.Add(bar);
+            _ = AskHeldDeletesAsync(id);
         }
 
         UpdateBarHost();
+    }
+
+    private bool _askingHeld;
+
+    /// <summary>The latest engine entry per held burst, for the dialog.</summary>
+    private readonly Dictionary<string, HeldDeleteInfo> _heldEntries = new();
+
+    /// <summary>
+    /// The question for a held burst, as a dialog on top of the window. Deleting in the cloud
+    /// needs the word typed, so it is not a reflex click. Closing it ("Not now") leaves the
+    /// burst held and the bar on screen.
+    /// </summary>
+    private async Task AskHeldDeletesAsync(string projectId)
+    {
+        if (_askingHeld || !RootGrid.IsLoaded || !_heldEntries.TryGetValue(projectId, out var entry))
+        {
+            return;
+        }
+
+        var project = string.IsNullOrWhiteSpace(entry.Project) ? Lang.T("projektet", "the project") : entry.Project;
+        var count = Fmt.Count(entry.Count);
+        var linked = entry.Linked ?? new List<string>();
+        var word = Lang.T("Ta bort", "Delete");
+
+        _askingHeld = true;
+        try
+        {
+            var body = new StackPanel { Spacing = 12 };
+            body.Children.Add(new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                Text = Lang.T(
+                    $"Du tog bort {count} objekt i {project}. Inget tas bort i molnet förrän du svarar.",
+                    $"You deleted {count} items in {project}. Nothing is deleted in the cloud until you answer."),
+            });
+            if (linked.Count > 0)
+            {
+                body.Children.Add(new InfoBar
+                {
+                    Severity = InfoBarSeverity.Warning,
+                    IsOpen = true,
+                    IsClosable = false,
+                    Title = Lang.T("Används i StreamBIM", "Used in StreamBIM"),
+                    Message = Lang.T(
+                        "De här filerna är modellager eller planritningar. Tas de bort försvinner de ur modellen och planerna för alla:\n",
+                        "These files are model layers or floor plans. Deleting them removes them from the model and the plans for everyone:\n")
+                        + string.Join("\n", linked.Take(12).Select(name => "• " + name))
+                        + (linked.Count > 12 ? $"\n… +{linked.Count - 12}" : string.Empty),
+                });
+            }
+
+            var typed = new TextBox
+            {
+                Header = Lang.T($"Skriv \"{word}\" för att ta bort i molnet", $"Type \"{word}\" to delete in the cloud"),
+                PlaceholderText = word,
+            };
+            body.Children.Add(typed);
+
+            var dialog = new ContentDialog
+            {
+                XamlRoot = RootGrid.XamlRoot,
+                RequestedTheme = RootGrid.RequestedTheme,
+                Title = linked.Count > 0
+                    ? Lang.T("Ta bort filer som används i StreamBIM?", "Delete files used in StreamBIM?")
+                    : Lang.T("Ta bort filer och mappar i molnet?", "Delete files and folders in the cloud?"),
+                Content = body,
+                PrimaryButtonText = Lang.T("Ta bort i molnet", "Delete in the cloud"),
+                SecondaryButtonText = Lang.T("Återställ", "Restore"),
+                CloseButtonText = Lang.T("Inte nu", "Not now"),
+                DefaultButton = ContentDialogButton.Secondary,
+                IsPrimaryButtonEnabled = false,
+            };
+            typed.TextChanged += (_, _) =>
+                dialog.IsPrimaryButtonEnabled = string.Equals(typed.Text.Trim(), word, StringComparison.OrdinalIgnoreCase);
+
+            var result = await dialog.ShowAsync();
+            if (result == ContentDialogResult.None)
+            {
+                return;
+            }
+
+            var confirm = result == ContentDialogResult.Primary;
+            var ack = await EngineClient.Instance.ConfirmDeletesAsync(projectId, confirm);
+            if (!ack.Ok)
+            {
+                ShowMessage(
+                    confirm
+                        ? Lang.T("Borttagningen gick inte att bekräfta", "The deletion could not be confirmed")
+                        : Lang.T("Filerna gick inte att återställa", "The files could not be restored"),
+                    ack.Error ?? Lang.T("Okänt fel.", "Unknown error."),
+                    InfoBarSeverity.Error);
+            }
+        }
+        catch (Exception)
+        {
+            // Another dialog was open or the window closed. The bar still offers the answer.
+        }
+        finally
+        {
+            _askingHeld = false;
+        }
     }
 
     private InfoBar BuildHeldDeletesBar(string projectId, string project, string message)
@@ -395,7 +501,8 @@ public sealed partial class MainWindow : Window
         var restore = new Button { Content = Lang.T("Återställ", "Restore") };
         AutomationProperties.SetName(restore, Lang.T($"Återställ filerna, {project}", $"Restore the files, {project}"));
 
-        delete.Click += async (_, _) => await AnswerHeldDeletesAsync(projectId, true, delete, restore);
+        // Deleting goes through the dialog and its typed word; restoring needs no extra step.
+        delete.Click += async (_, _) => await AskHeldDeletesAsync(projectId);
         restore.Click += async (_, _) => await AnswerHeldDeletesAsync(projectId, false, delete, restore);
 
         // Two answers, so they go in the bar's content (ActionButton holds one). The

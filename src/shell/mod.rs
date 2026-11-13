@@ -127,7 +127,7 @@ fn context() -> Option<&'static CtxRef> {
     CONTEXT.get()
 }
 
-fn send(cmd: TrayCmd) -> bool {
+pub(crate) fn send(cmd: TrayCmd) -> bool {
     COMMANDS.get().is_some_and(|tx| tx.send(cmd).is_ok())
 }
 

@@ -36,7 +36,13 @@ public sealed class ActivityRow : INotifyPropertyChanged
     /// <summary>The file (or "N filer"). An item without a name shows its kind instead of an empty line.</summary>
     public string Name => string.IsNullOrWhiteSpace(Item.Name) ? KindLabel : Item.Name;
 
-    public string Subtitle => Join(" · ", Item.Project, ErrorDisplay.FriendlyDetail(Item.Detail));
+    /// <summary>A multi-line detail is a file list: it goes in the hover, not on the row.</summary>
+    private bool DetailIsList => Item.Detail?.Contains('\n') == true;
+
+    public string Subtitle => Join(" · ", Item.Project, DetailIsList ? string.Empty : ErrorDisplay.FriendlyDetail(Item.Detail));
+
+    /// <summary>The hover over a row: what, where, which files (+ new, ~ changed, - deleted), and when.</summary>
+    public string RowToolTip => Join("\n", Name, Item.Project, DetailIsList ? Item.Detail! : FailureDetail.Length > 0 ? FailureDetail : ErrorDisplay.FriendlyDetail(Item.Detail), AbsoluteTime);
 
     /// <summary>The full safe reason belongs to the tooltip, not the compact visible row.</summary>
     public string FailureDetail { get; }

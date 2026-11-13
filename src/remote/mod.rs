@@ -522,6 +522,20 @@ pub async fn delete_file(ctx: &Ctx, p: &Project, id: &str) -> Result<(), ApiErro
     }
 }
 
+/// The documents StreamBIM uses as model or floor plan layers. Other providers have none.
+pub async fn linked_documents(
+    ctx: &Ctx,
+    p: &Project,
+) -> Result<Vec<streambim::LinkedDocument>, ApiError> {
+    match p.provider {
+        Provider::StreamBim => {
+            let account = streambim_account(ctx, p)?;
+            streambim::linked_documents(&account.api, p).await
+        }
+        Provider::Acc | Provider::Interaxo => Ok(Vec::new()),
+    }
+}
+
 /// Delete a folder.
 pub async fn delete_folder(ctx: &Ctx, p: &Project, folder_id: &str) -> Result<(), ApiError> {
     match p.provider {

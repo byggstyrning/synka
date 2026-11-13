@@ -1128,7 +1128,7 @@ async fn upload(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     }
     // Parent folder still has its temporary id: its mkdir job has not finished. Transient.
     if is_local_id(&loc.parent) {
-        return Err(anyhow!("parent folder is not created in ACC yet"));
+        return Err(anyhow!("parent folder is not created remotely yet"));
     }
     match open_shared(&path) {
         Ok(f) => drop(f),
@@ -1549,7 +1549,7 @@ async fn mkdir(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     }
     // The parent may itself be a just-created local folder whose job has not run yet.
     if is_local_id(&loc.parent) {
-        return Err(anyhow!("parent folder is not created in ACC yet"));
+        return Err(anyhow!("parent folder is not created remotely yet"));
     }
     let created = match remote::create_folder(ctx, p, &loc.parent, &loc.name).await {
         Ok(c) => c,
@@ -1681,7 +1681,7 @@ async fn move_item(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         .clone()
         .ok_or_else(|| perm("item has no parent"))?;
     if is_local_id(&parent) {
-        return Err(anyhow!("target folder is not created in ACC yet"));
+        return Err(anyhow!("target folder is not created remotely yet"));
     }
     if it.kind.is_dir() {
         remote::patch_folder(ctx, &p, &it.id, Some(&it.name), Some(&parent)).await?;
@@ -1748,6 +1748,15 @@ async fn delete(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
         .and_then(|pa| ctx.store.item(job.pid, pa).ok().flatten())
         .is_some_and(|pa| pa.local_state == LocalState::Deleted);
     if !parent_deleted {
+        let confirmed = v.get("confirmed").and_then(Value::as_bool).unwrap_or(false);
+        // StreamBIM: a folder always asks first; a file asks when it is a model or floor plan layer.
+        if p.provider == Provider::StreamBim && !confirmed {
+            let linked = linked_in_delete(ctx, &p, id).await?;
+            if is_dir || !linked.is_empty() {
+                hold_for_linked(ctx, job, &p, &row.name, &linked)?;
+                return Ok(Step::Locked);
+            }
+        }
         if is_dir {
             remote::delete_folder(ctx, &p, id).await?;
         } else {
@@ -1758,6 +1767,85 @@ async fn delete(ctx: &CtxRef, job: &OutboxJob) -> anyhow::Result<Step> {
     // Otherwise a LocalState::Deleted row lingers, because the walk only prunes Clean rows.
     ctx.store.delete_item(job.pid, id)?;
     Ok(Step::Done)
+}
+
+/// Extensions StreamBIM can show as a model layer or a floor plan. A delete without one of
+/// these below it asks nothing of the server.
+const LAYER_EXTENSIONS: &[&str] = &["ifc", "ifczip", "ifcxml", "dwg", "pdf"];
+
+fn could_be_layer(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| LAYER_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// Names of the StreamBIM layers a delete of `id` would remove: linked documents that are the
+/// item itself, or that sit in a folder of its subtree. Contents never listed here are found by
+/// the linked document's parent, so a folder deleted before it was opened is covered one level.
+async fn linked_in_delete(ctx: &CtxRef, p: &Project, id: &str) -> anyhow::Result<Vec<String>> {
+    let ids: HashSet<String> = ctx.store.subtree_ids(p.pid, id)?.into_iter().collect();
+    let any_candidate = ids.iter().any(|i| {
+        ctx.store
+            .item(p.pid, i)
+            .ok()
+            .flatten()
+            .is_some_and(|it| it.kind.is_dir() || could_be_layer(&it.name))
+    });
+    if !any_candidate {
+        return Ok(Vec::new());
+    }
+    let linked = remote::linked_documents(ctx, p).await?;
+    Ok(linked
+        .into_iter()
+        .filter(|d| ids.contains(&d.id) || d.parent.as_deref().is_some_and(|pa| ids.contains(pa)))
+        .map(|d| {
+            if d.floor_plan {
+                format!("{} (planritning)", d.name)
+            } else {
+                format!("{} (modell)", d.name)
+            }
+        })
+        .collect())
+}
+
+/// Hold the project's deletes (this one included) until the user answers, and say why.
+fn hold_for_linked(
+    ctx: &CtxRef,
+    job: &OutboxJob,
+    p: &Project,
+    name: &str,
+    linked: &[String],
+) -> anyhow::Result<()> {
+    ctx.store.hold_deletes(job.pid)?;
+    if !linked.is_empty() {
+        ctx.store.set_job_linked(job.id, linked)?;
+    }
+    tracing::warn!(
+        "{}: borttagning av {name} väntar på bekräftelse ({} lager i StreamBIM)",
+        p.name,
+        linked.len()
+    );
+    ctx.ui.activity("held", name, &p.name, &linked.join("\n"));
+    let text = match linked.len() {
+        0 => format!(
+            "Mappen {name} i {} tas inte bort i StreamBIM förrän du bekräftar.",
+            p.name
+        ),
+        n => {
+            let what = if n == 1 {
+                "en fil".to_string()
+            } else {
+                format!("{n} filer")
+            };
+            format!(
+                "{name} i {} innehåller {what} som används som lager i StreamBIM. Inget tas bort förrän du bekräftar.",
+                p.name
+            )
+        }
+    };
+    ctx.ui.send(UiMsg::notify(Severity::Warning, text));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2077,7 +2165,7 @@ mod tests {
         });
         assert!(!is_offline(&st), "a server error counts");
         assert!(!is_offline(&anyhow!(
-            "parent folder is not created in ACC yet"
+            "parent folder is not created remotely yet"
         )));
     }
 
@@ -2149,7 +2237,7 @@ mod tests {
         });
         assert!(!unsupported_operation(&forbidden));
         assert!(!unsupported_operation(&anyhow!(
-            "parent folder is not created in ACC yet"
+            "parent folder is not created remotely yet"
         )));
     }
 
